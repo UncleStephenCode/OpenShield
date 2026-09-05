@@ -18,7 +18,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 
-SOCKET_TIMEOUT_SECONDS = 3.0
+SOCKET_TIMEOUT_SECONDS = 5.0
 MAX_HEADER_BYTES = 64 * 1024
 MAX_BODY_BYTES = 64 * 1024
 MAX_REQUESTS = 256
@@ -150,7 +150,8 @@ class ProxySession:
         while time.monotonic() < deadline:
             try:
                 stream = socket.create_connection(
-                    (self._proxy_address, self._proxy_port), timeout=1.0
+                    (self._proxy_address, self._proxy_port),
+                    timeout=SOCKET_TIMEOUT_SECONDS,
                 )
                 stream.settimeout(SOCKET_TIMEOUT_SECONDS)
                 self._socket = stream
@@ -389,7 +390,9 @@ def allow_loopback(port: int) -> None:
     print(json.dumps(result, sort_keys=True))
 
 
-def assert_network_accept(name: str, address: str, port: int) -> None:
+def assert_network_accept(
+    name: str, address: str, port: int, *, enabled: bool = True
+) -> None:
     import ipc_client
 
     matches = []
@@ -408,7 +411,7 @@ def assert_network_accept(name: str, address: str, port: int) -> None:
         "port": {"start": port, "end": port},
         "application": None,
         "origin": "manual",
-        "enabled": True,
+        "enabled": enabled,
     }
     actual = {key: rule.get(key) for key in expected}
     # Accept is the wire-format default for backward compatibility and may be
@@ -485,9 +488,14 @@ def identity_hold(
             while ready_count < flows:
                 for future in futures:
                     if future.done():
-                        future.result()
+                        try:
+                            future.result()
+                        except Exception:
+                            release.set()
+                            raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    release.set()
                     raise TimeoutError("identity sockets did not become ready")
                 condition.wait(min(0.05, remaining))
         ready_path.write_text("ready\n", encoding="ascii")
@@ -623,6 +631,53 @@ def assert_browser_identities(
             sort_keys=True,
         )
     )
+
+
+def audit_identity_round(log_path: Path, direct_flows: int, proxy_flows: int) -> None:
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    paths: dict[str, list[dict]] = {}
+    for event in events:
+        path = event.get("path")
+        if isinstance(path, str):
+            paths.setdefault(path, []).append(event)
+
+    summary = {}
+    for prefix, flows in (
+        ("direct-one", direct_flows),
+        ("direct-two", direct_flows),
+        ("proxied", proxy_flows),
+    ):
+        connections = set()
+        for index in range(flows):
+            initial_path = f"/{prefix}-{index}-initial"
+            final_path = f"/{prefix}-{index}-final"
+            initial = paths.get(initial_path, [])
+            final = paths.get(final_path, [])
+            if len(initial) != 1 or len(final) != 1:
+                raise RuntimeError(
+                    f"identity round did not complete exactly once: "
+                    f"{initial_path}={len(initial)}, {final_path}={len(final)}"
+                )
+            if initial[0].get("connection") != final[0].get("connection"):
+                raise RuntimeError(
+                    f"identity flow did not retain its established TCP connection: "
+                    f"{prefix}-{index}"
+                )
+            connections.add(initial[0]["connection"])
+        if len(connections) != flows:
+            raise RuntimeError(
+                f"identity round did not use distinct initial TCP flows for {prefix}: "
+                f"expected {flows}, observed {len(connections)}"
+            )
+        summary[prefix] = {
+            "flows": flows,
+            "requests": flows * 2,
+            "distinct_connections": len(connections),
+        }
+    print(json.dumps(summary, sort_keys=True))
 
 
 def noise_child(
@@ -779,6 +834,9 @@ def main() -> None:
     network.add_argument("name")
     network.add_argument("address", type=checked_ipv4)
     network.add_argument("port", type=parse_port)
+    network.add_argument(
+        "state", choices=("enabled", "disabled"), nargs="?", default="enabled"
+    )
 
     nfqueue = subcommands.add_parser("assert-nfqueue-clean")
     nfqueue.add_argument("--require-denied", action="store_true")
@@ -802,6 +860,11 @@ def main() -> None:
     identities.add_argument("peer_address", type=checked_ipv4)
     identities.add_argument("peer_port", type=parse_port)
     identities.add_argument("proxy_port", type=parse_port)
+
+    identity_audit = subcommands.add_parser("audit-identity-round")
+    identity_audit.add_argument("log", type=Path)
+    identity_audit.add_argument("direct_flows", type=parse_count)
+    identity_audit.add_argument("proxy_flows", type=parse_count)
 
     noise = subcommands.add_parser("procfs-noise")
     noise.add_argument("processes", type=parse_noise_dimension)
@@ -844,7 +907,12 @@ def main() -> None:
     elif arguments.command == "allow-loopback":
         allow_loopback(arguments.port)
     elif arguments.command == "assert-network-accept":
-        assert_network_accept(arguments.name, arguments.address, arguments.port)
+        assert_network_accept(
+            arguments.name,
+            arguments.address,
+            arguments.port,
+            enabled=arguments.state == "enabled",
+        )
     elif arguments.command == "assert-nfqueue-clean":
         assert_nfqueue_clean(arguments.require_denied)
     elif arguments.command == "identity-hold":
@@ -868,6 +936,10 @@ def main() -> None:
             arguments.peer_address,
             arguments.peer_port,
             arguments.proxy_port,
+        )
+    elif arguments.command == "audit-identity-round":
+        audit_identity_round(
+            arguments.log, arguments.direct_flows, arguments.proxy_flows
         )
     elif arguments.command == "procfs-noise":
         procfs_noise(

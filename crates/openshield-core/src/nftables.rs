@@ -247,6 +247,13 @@ fn append_chain(
         }
 
         if interception != ApplicationInterception::None {
+            append_application_loopback_accept(
+                script,
+                snapshot,
+                direction,
+                accepted_counter,
+                interception,
+            );
             append_application_flow_accept(
                 script,
                 snapshot,
@@ -525,6 +532,48 @@ fn append_application_flow_accept(
             Direction::Outbound => script.push_str("original ct state established "),
         }
         script.push_str(protocol_match);
+        script.push_str(" ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_MASK);
+        script.push_str(" == 0x");
+        append_hex_u32(script, application_flow_mark(snapshot.flow_generation));
+        if direction == Direction::Outbound {
+            script.push(' ');
+            append_packet_mark_domain_set(script, APPLICATION_HANDOFF_DOMAIN);
+        }
+        script.push_str(" counter name ");
+        script.push_str(accepted_counter);
+        script.push_str(" accept\n");
+    }
+}
+
+fn append_application_loopback_accept(
+    script: &mut String,
+    snapshot: &Snapshot,
+    direction: Direction,
+    accepted_counter: &str,
+    interception: ApplicationInterception,
+) {
+    if snapshot.mode != Mode::Enforcing {
+        return;
+    }
+    let protocols: &[&str] = match interception {
+        ApplicationInterception::None => return,
+        ApplicationInterception::TcpInitial => &APPLICATION_REPLY_PROTOCOL_MATCHES[..1],
+        ApplicationInterception::PerPacket => &APPLICATION_REPLY_PROTOCOL_MATCHES,
+    };
+    for protocol in protocols {
+        // The local ORIGINAL packet has already passed OUTPUT attribution and
+        // output_authorize before it reaches INPUT. Its peer's local REPLY
+        // traverses OUTPUT as well; neither half needs a second inbound rule.
+        // Only the current authenticated application generation authorizes
+        // this local delivery, never a user-supplied packet mark or RELATED.
+        script.push_str(match direction {
+            Direction::Inbound => {
+                "    iifname \"lo\" ct direction original ct state new,established "
+            }
+            Direction::Outbound => "    oifname \"lo\" ct direction reply ct state established ",
+        });
+        script.push_str(protocol);
         script.push_str(" ct mark & 0x");
         append_hex_u32(script, APPLICATION_CONNMARK_MASK);
         script.push_str(" == 0x");
@@ -1372,12 +1421,113 @@ mod tests {
                 assert!(deny_queue < observer);
                 assert!(script.contains("counter name dropped_out reject"));
             } else {
-                assert!(!script.contains("iifname \"lo\" ct direction original"));
+                assert!(!script.contains(
+                    "iifname \"lo\" ct direction original counter name accepted_in accept"
+                ));
                 assert!(!script.contains("queue num 1338"));
                 assert!(!script.contains("limit rate 64/second"));
                 assert_eq!(script.contains(direct_accept), mode == Mode::Enforcing);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_loopback_uses_authenticated_application_generation_and_protocols()
+    -> Result<(), Box<dyn Error>> {
+        for (protocol, expected_protocols) in
+            [(TransportProtocol::Tcp, 1), (TransportProtocol::Any, 4)]
+        {
+            let mut state = State::new();
+            add_application_rule(&mut state, protocol, true)?;
+            state.set_mode(Mode::Enforcing)?;
+            let flow = application_flow_mark(state.flow_generation());
+            let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+            let incoming: Vec<_> = script
+                .lines()
+                .filter(|line| line.contains("iifname \"lo\""))
+                .collect();
+            let replies: Vec<_> = script
+                .lines()
+                .filter(|line| line.contains("oifname \"lo\""))
+                .collect();
+            assert_eq!(incoming.len(), expected_protocols);
+            assert_eq!(replies.len(), expected_protocols);
+            for line in incoming.iter().chain(&replies) {
+                assert!(line.contains(&format!("ct mark & 0x7fffffff == 0x{flow:08x}")));
+                assert!(!line.contains("related"));
+                assert!(!line.contains("sctp"));
+            }
+            assert!(
+                incoming
+                    .iter()
+                    .all(|line| line.contains("ct direction original ct state new,established"))
+            );
+            assert!(
+                replies
+                    .iter()
+                    .all(|line| line.contains("ct direction reply ct state established"))
+            );
+            assert!(
+                replies.iter().all(
+                    |line| line.contains("meta mark set (meta mark & 0x3fffffff) | 0xc0000000")
+                )
+            );
+            let invalid = script
+                .find("ct state invalid counter name dropped_in drop")
+                .ok_or("missing invalid guard")?;
+            let loopback = script
+                .find("iifname \"lo\"")
+                .ok_or("missing loopback guard")?;
+            assert!(invalid < loopback);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_loopback_preserves_denies_revocation_and_block_all() -> Result<(), Box<dyn Error>>
+    {
+        let mut state = State::new();
+        let application = add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        add_https_rule(&mut state, Direction::Outbound, "127.0.0.0/8")?;
+        let network = state
+            .rules()
+            .find(|rule| rule.spec.application.is_none())
+            .ok_or("missing network rule")?;
+        let id = network.id;
+        let mut spec = network.spec.clone();
+        spec.action = RuleAction::Drop;
+        state.update_rule(id, spec)?;
+        state.set_mode(Mode::Enforcing)?;
+        let old_flow = application_flow_mark(state.flow_generation());
+        let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+        let deny = script
+            .find(
+                "ip daddr 127.0.0.0/8 meta l4proto tcp tcp dport 443 counter name dropped_out drop",
+            )
+            .ok_or("missing explicit network deny")?;
+        let reply = script
+            .find("oifname \"lo\" ct direction reply")
+            .ok_or("missing local reply")?;
+        assert!(deny < reply);
+
+        // Every policy revocation changes the generation accepted at INPUT.
+        state.set_mode(Mode::Learning)?;
+        state.set_mode(Mode::Enforcing)?;
+        let new_flow = application_flow_mark(state.flow_generation());
+        assert_ne!(old_flow, new_flow);
+        let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+        for line in script.lines().filter(|line| line.contains("ifname \"lo\"")) {
+            assert!(line.contains(&format!("== 0x{new_flow:08x}")));
+            assert!(!line.contains(&format!("== 0x{old_flow:08x}")));
+        }
+        state.set_rule_enabled(application, false)?;
+        let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+        assert!(!script.contains("ifname \"lo\""));
+        state.set_rule_enabled(application, true)?;
+        state.set_mode(Mode::BlockAll)?;
+        let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+        assert!(!script.contains("ifname \"lo\""));
         Ok(())
     }
 

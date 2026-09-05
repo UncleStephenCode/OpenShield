@@ -259,6 +259,13 @@ fn append_input_chain(
         }
 
         if interception != ApplicationInterception::None {
+            append_application_loopback_accept(
+                script,
+                snapshot,
+                family,
+                Direction::Inbound,
+                interception,
+            );
             let flow = application_flow_mark(snapshot.flow_generation);
             let reply_protocols = application_reply_protocols(family);
             let reply_protocols: &[&str] = match interception {
@@ -400,6 +407,13 @@ fn append_output_chain(
             }
         }
         if interception != ApplicationInterception::None {
+            append_application_loopback_accept(
+                script,
+                snapshot,
+                family,
+                Direction::Outbound,
+                interception,
+            );
             let flow = application_flow_mark(snapshot.flow_generation);
             let _infallible = writeln!(
                 script,
@@ -522,6 +536,50 @@ fn append_application_chains(
         "dropped_out",
         "DROP",
     );
+}
+
+fn append_application_loopback_accept(
+    script: &mut String,
+    snapshot: &Snapshot,
+    family: AddressFamily,
+    direction: Direction,
+    interception: ApplicationInterception,
+) {
+    if snapshot.mode != Mode::Enforcing {
+        return;
+    }
+    let protocols = application_reply_protocols(family);
+    let protocols: &[&str] = match interception {
+        ApplicationInterception::None => return,
+        ApplicationInterception::TcpInitial => &protocols[..1],
+        ApplicationInterception::PerPacket => &protocols,
+    };
+    let (chain, interface, selector, counter) = match direction {
+        Direction::Inbound => (
+            IPTABLES_INPUT_CHAIN,
+            "-i lo",
+            "-m conntrack --ctstate NEW,ESTABLISHED --ctdir ORIGINAL",
+            "accepted_in",
+        ),
+        Direction::Outbound => (
+            IPTABLES_OUTPUT_CHAIN,
+            "-o lo",
+            "-m conntrack --ctstate ESTABLISHED --ctdir REPLY",
+            "accepted_out",
+        ),
+    };
+    let flow = application_flow_mark(snapshot.flow_generation);
+    for protocol in protocols {
+        // OUTPUT attribution and the application handoff set this generation
+        // before a local ORIGINAL reaches INPUT. Permit that delivery and the
+        // local peer's stateful REPLY, without a broad loopback exception.
+        // iptables-save emits interface/protocol selectors before extension
+        // matches; retain that canonical order for strict policy verification.
+        let _infallible = writeln!(
+            script,
+            "-A {chain} {interface} -p {protocol} {selector} -m connmark --mark 0x{flow:08x}/0x{APPLICATION_CONNMARK_MASK:08x} -m comment --comment openshield:{counter} -j RETURN"
+        );
+    }
 }
 
 fn application_reply_protocols(family: AddressFamily) -> [&'static str; 3] {
@@ -1454,11 +1512,124 @@ mod tests {
                         assert!(script.contains("-j REJECT"));
                     }
                 } else {
-                    assert!(!script.contains("-A OPENSHIELD_IN -i lo"));
+                    assert!(!script.contains(
+                        "-A OPENSHIELD_IN -i lo -m conntrack --ctdir ORIGINAL -m comment --comment openshield:accepted_in -j RETURN"
+                    ));
                     assert!(!script.contains("--queue-num 1338"));
                     assert!(!script.contains("--limit 64/sec"));
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_loopback_uses_authenticated_application_generation_and_protocols()
+    -> Result<(), Box<dyn Error>> {
+        for (protocol, expected_protocols) in
+            [(TransportProtocol::Tcp, 1), (TransportProtocol::Any, 3)]
+        {
+            let mut state = State::new();
+            add_application_rule(&mut state, protocol, true)?;
+            state.set_mode(Mode::Enforcing)?;
+            let flow = application_flow_mark(state.flow_generation());
+            let policy = IptablesCompiler::compile(&state.snapshot())?;
+            for script in [policy.ipv4(), policy.ipv6()] {
+                let incoming: Vec<_> = script
+                    .lines()
+                    .filter(|line| line.starts_with("-A OPENSHIELD_IN -i lo"))
+                    .collect();
+                let replies: Vec<_> = script
+                    .lines()
+                    .filter(|line| line.starts_with("-A OPENSHIELD_OUT -o lo"))
+                    .collect();
+                assert_eq!(incoming.len(), expected_protocols);
+                assert_eq!(replies.len(), expected_protocols);
+                for line in incoming.iter().chain(&replies) {
+                    assert!(line.contains(&format!("--mark 0x{flow:08x}/0x7fffffff")));
+                    assert!(!line.contains("RELATED"));
+                    assert!(!line.contains("sctp"));
+                    // Live iptables-save places -p before all -m matches;
+                    // otherwise the integrity verifier rejects this policy.
+                    let protocol = line.find(" -p ").ok_or("missing protocol selector")?;
+                    let conntrack = line
+                        .find(" -m conntrack ")
+                        .ok_or("missing conntrack selector")?;
+                    assert!(protocol < conntrack);
+                }
+                assert!(
+                    incoming
+                        .iter()
+                        .all(|line| line.contains("--ctstate NEW,ESTABLISHED --ctdir ORIGINAL"))
+                );
+                assert!(
+                    replies
+                        .iter()
+                        .all(|line| line.contains("--ctstate ESTABLISHED --ctdir REPLY"))
+                );
+                let invalid = script
+                    .find("-A OPENSHIELD_IN -m conntrack --ctstate INVALID")
+                    .ok_or("missing invalid guard")?;
+                let loopback = script
+                    .find("-A OPENSHIELD_IN -i lo")
+                    .ok_or("missing loopback guard")?;
+                assert!(invalid < loopback);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_loopback_preserves_denies_revocation_and_block_all() -> Result<(), Box<dyn Error>>
+    {
+        let mut state = State::new();
+        let application = add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        add_rule(&mut state, Direction::Outbound, "127.0.0.0/8", false)?;
+        let network = state
+            .rules()
+            .find(|rule| rule.spec.application.is_none())
+            .ok_or("missing network rule")?;
+        let id = network.id;
+        let mut spec = network.spec.clone();
+        spec.action = RuleAction::Reject;
+        state.update_rule(id, spec)?;
+        state.set_mode(Mode::Enforcing)?;
+        let old_flow = application_flow_mark(state.flow_generation());
+        let policy = IptablesCompiler::compile(&state.snapshot())?;
+        let deny = policy.ipv4().find("-A OPENSHIELD_OUT -d 127.0.0.0/8 -o eth0 -p tcp --dport 443 -m comment --comment openshield:dropped_out -j REJECT")
+            .ok_or("missing explicit network deny")?;
+        let reply = policy
+            .ipv4()
+            .find("-A OPENSHIELD_OUT -o lo")
+            .ok_or("missing local reply")?;
+        assert!(deny < reply);
+
+        state.set_mode(Mode::Learning)?;
+        state.set_mode(Mode::Enforcing)?;
+        let new_flow = application_flow_mark(state.flow_generation());
+        assert_ne!(old_flow, new_flow);
+        let policy = IptablesCompiler::compile(&state.snapshot())?;
+        for script in [policy.ipv4(), policy.ipv6()] {
+            for line in script.lines().filter(|line| {
+                line.starts_with("-A OPENSHIELD_IN -i lo")
+                    || line.starts_with("-A OPENSHIELD_OUT -o lo")
+            }) {
+                assert!(line.contains(&format!("--mark 0x{new_flow:08x}/0x7fffffff")));
+                assert!(!line.contains(&format!("--mark 0x{old_flow:08x}/0x7fffffff")));
+            }
+        }
+        state.set_rule_enabled(application, false)?;
+        let policy = IptablesCompiler::compile(&state.snapshot())?;
+        for script in [policy.ipv4(), policy.ipv6()] {
+            assert!(!script.contains("-A OPENSHIELD_IN -i lo"));
+            assert!(!script.contains("-A OPENSHIELD_OUT -o lo"));
+        }
+        state.set_rule_enabled(application, true)?;
+        state.set_mode(Mode::BlockAll)?;
+        let policy = IptablesCompiler::compile(&state.snapshot())?;
+        for script in [policy.ipv4(), policy.ipv6()] {
+            assert!(!script.contains("-A OPENSHIELD_IN -i lo"));
+            assert!(!script.contains("-A OPENSHIELD_OUT -o lo"));
         }
         Ok(())
     }

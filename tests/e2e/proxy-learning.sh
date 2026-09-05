@@ -12,6 +12,7 @@ rpm_path=$3
 diagnostic_loopback=${PROXY_E2E_ALLOW_LOOPBACK_RULE:-false}
 network_accept=${PROXY_NETWORK_ACCEPT:-false}
 browser_identity=${PROXY_BROWSER_IDENTITY:-false}
+enforcing_identity=${PROXY_ENFORCING_IDENTITY:-false}
 noise_processes=${PROXY_NOISE_PROCESSES:-16}
 noise_threads=${PROXY_NOISE_THREADS:-32}
 noise_file_descriptors=${PROXY_NOISE_FDS:-256}
@@ -20,6 +21,10 @@ case "$distribution" in bookworm|tumbleweed) ;; *) usage; exit 2 ;; esac
 case "$diagnostic_loopback" in true|false) ;; *) printf '%s\n' 'invalid PROXY_E2E_ALLOW_LOOPBACK_RULE' >&2; exit 2 ;; esac
 case "$network_accept" in true|false) ;; *) printf '%s\n' 'invalid PROXY_NETWORK_ACCEPT' >&2; exit 2 ;; esac
 case "$browser_identity" in true|false) ;; *) printf '%s\n' 'invalid PROXY_BROWSER_IDENTITY' >&2; exit 2 ;; esac
+case "$enforcing_identity" in true|false) ;; *) printf '%s\n' 'invalid PROXY_ENFORCING_IDENTITY' >&2; exit 2 ;; esac
+if [ "$enforcing_identity" = true ]; then
+    browser_identity=true
+fi
 case "$noise_processes:$noise_threads:$noise_file_descriptors" in
     *[!0-9:]*|0:*|*:0:*|*:*:0) printf '%s\n' 'invalid procfs noise dimensions' >&2; exit 2 ;;
 esac
@@ -84,6 +89,8 @@ stage=initialization
 privoxy_pid=
 privoxy_uid=
 browser_learning_elapsed_ms=not-measured
+browser_enforcing_elapsed_ms=not-measured
+browser_peer_network_rule_name=
 
 begin_stage() {
     stage=$1
@@ -107,6 +114,31 @@ wait_for_file() {
         return 0
     fi
     printf '%s did not complete within 60 seconds\n' "$description" >&2
+    return 1
+}
+
+wait_for_identity_ready() {
+    container=$1
+    ready_path=$2
+    status_path=$3
+    log_path=$4
+    description=$5
+    if docker exec "$container" /bin/sh -c '
+        ready=$1
+        status=$2
+        attempt=0
+        while [ "$attempt" -lt 600 ]; do
+            [ ! -f "$ready" ] || exit 0
+            [ ! -f "$status" ] || exit 2
+            attempt=$((attempt + 1))
+            sleep 0.1
+        done
+        exit 1
+    ' openshield-proxy-identity-wait "$ready_path" "$status_path"; then
+        return 0
+    fi
+    docker exec "$container" cat "$log_path" >&2 || true
+    printf '%s did not establish its Enforcing sockets\n' "$description" >&2
     return 1
 }
 
@@ -145,10 +177,12 @@ collect_evidence() {
         printf 'diagnostic_loopback=%s\n' "$diagnostic_loopback"
         printf 'network_accept=%s\n' "$network_accept"
         printf 'browser_identity=%s\n' "$browser_identity"
+        printf 'enforcing_identity=%s\n' "$enforcing_identity"
         printf 'noise_processes_per_uid=%s\nnoise_threads_per_process=%s\n' \
             "$noise_processes" "$noise_threads"
         printf 'noise_file_descriptors_per_process=%s\n' "$noise_file_descriptors"
         printf 'browser_learning_elapsed_ms=%s\n' "$browser_learning_elapsed_ms"
+        printf 'browser_enforcing_elapsed_ms=%s\n' "$browser_enforcing_elapsed_ms"
         printf 'expected_version=%s\n' "$expected_version"
         printf 'rpm_sha256=%s\n' "$(sha256sum "$rpm_path" | awk '{print $1}')"
         printf 'privoxy_pid=%s\nprivoxy_uid=%s\n' "$privoxy_pid" "$privoxy_uid"
@@ -166,6 +200,12 @@ collect_evidence() {
     copy_evidence_file "$client_id" /tmp/browser-direct-1.log browser-direct-1.log
     copy_evidence_file "$client_id" /tmp/browser-direct-2.log browser-direct-2.log
     copy_evidence_file "$client_id" /tmp/browser-proxy.log browser-proxy.log
+    copy_evidence_file "$client_id" /tmp/browser-direct-1-enforcing.log browser-direct-1-enforcing.log
+    copy_evidence_file "$client_id" /tmp/browser-direct-2-enforcing.log browser-direct-2-enforcing.log
+    copy_evidence_file "$client_id" /tmp/browser-proxy-enforcing.log browser-proxy-enforcing.log
+    copy_evidence_file "$client_id" /tmp/browser-enforcing-audit.json browser-enforcing-audit.json
+    copy_evidence_file "$client_id" /tmp/browser-unknown-loopback.log browser-unknown-loopback.log
+    copy_evidence_file "$client_id" /tmp/browser-unknown-peer.log browser-unknown-peer.log
     copy_evidence_file "$client_id" /tmp/noise-same.log noise-same.log
     copy_evidence_file "$client_id" /tmp/noise-other.log noise-other.log
     copy_evidence_file "$client_id" /tmp/proxy-audit.log audit.log
@@ -440,10 +480,13 @@ if [ "$network_accept" = true ]; then
 fi
 if [ "$browser_identity" = true ]; then
     if [ "$network_accept" = false ]; then
+        browser_peer_network_rule_name=openshield-browser-peer-accept
         docker exec "$client_id" python3 /opt/ipc_client.py create-network-tcp-rule \
-            openshield-browser-peer-accept "$peer_ip" 18081 accept >/dev/null
+            "$browser_peer_network_rule_name" "$peer_ip" 18081 accept >/dev/null
         docker exec "$client_id" python3 /opt/proxy-workload.py assert-network-accept \
-            openshield-browser-peer-accept "$peer_ip" 18081 >/dev/null
+            "$browser_peer_network_rule_name" "$peer_ip" 18081 >/dev/null
+    else
+        browser_peer_network_rule_name=openshield-proxy-network-accept
     fi
     docker exec "$client_id" python3 /opt/ipc_client.py create-network-tcp-rule \
         openshield-browser-loopback-accept 127.0.0.1 8118 accept >/dev/null
@@ -459,6 +502,7 @@ if [ "$browser_identity" = true ]; then
         python=$(readlink -f "$(command -v python3)")
         install -m 0755 "$python" /tmp/openshield-browser-direct
         install -m 0755 "$python" /tmp/openshield-browser-proxy
+        install -m 0755 "$python" /tmp/openshield-browser-unknown
         rm -f /tmp/browser-*.ready /tmp/browser-*.release /tmp/browser-*.status \
             /tmp/browser-*.log /tmp/browser-identities.json
         rm -f /tmp/noise-*.ready /tmp/noise-*.release /tmp/noise-*.status \
@@ -534,6 +578,123 @@ if [ "$browser_identity" = true ]; then
             exit 1
         }
     done
+    if [ "$enforcing_identity" = true ]; then
+        begin_stage 'disable network bypasses and enter Enforcing'
+        docker exec "$client_id" python3 /opt/ipc_client.py set-named-rule-enabled \
+            "$browser_peer_network_rule_name" disabled >/dev/null
+        docker exec "$client_id" python3 /opt/ipc_client.py set-named-rule-enabled \
+            openshield-browser-loopback-accept disabled >/dev/null
+        docker exec "$client_id" python3 /opt/proxy-workload.py assert-network-accept \
+            "$browser_peer_network_rule_name" "$peer_ip" 18081 disabled >/dev/null
+        docker exec "$client_id" python3 /opt/proxy-workload.py assert-network-accept \
+            openshield-browser-loopback-accept 127.0.0.1 8118 disabled >/dev/null
+        docker exec "$client_id" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+        docker exec "$client_id" python3 /opt/ipc_client.py assert-runtime \
+            enforcing "$backend" conntrack_hybrid application_tcp >/dev/null
+
+        # Clear the Learning traffic so the audit below can prove that every
+        # request crossed the application-only Enforcing policy.
+        docker exec "$peer_id" /bin/sh -c ': > /tmp/proxy-peer.log'
+        docker exec "$client_id" rm -f /tmp/browser-direct-1.ready \
+            /tmp/browser-direct-2.ready /tmp/browser-proxy.ready \
+            /tmp/browser-direct-1.release /tmp/browser-direct-2.release \
+            /tmp/browser-proxy.release /tmp/browser-direct-1.status \
+            /tmp/browser-direct-2.status /tmp/browser-proxy.status \
+            /tmp/browser-direct-1-enforcing.log \
+            /tmp/browser-direct-2-enforcing.log \
+            /tmp/browser-proxy-enforcing.log /tmp/browser-enforcing-audit.json
+
+        begin_stage 'exercise application-only Enforcing under procfs pressure'
+        browser_enforcing_started_ns=$(date +%s%N)
+        docker exec --detach "$client_id" /bin/sh -c '
+            if runuser -u proxyclient -- "$1" /opt/proxy-workload.py identity-hold \
+                "$2" 18081 "$2" 18081 direct-one 8 \
+                /tmp/browser-direct-1.ready /tmp/browser-direct-1.release \
+                >/tmp/browser-direct-1-enforcing.log 2>&1; then status=0; else status=$?; fi
+            printf "%s\n" "$status" >/tmp/browser-direct-1.status
+        ' openshield-browser-direct-1-enforcing "$browser_direct" "$peer_ip"
+        docker exec --detach "$client_id" /bin/sh -c '
+            if runuser -u proxyclient -- "$1" /opt/proxy-workload.py identity-hold \
+                "$2" 18081 "$2" 18081 direct-two 8 \
+                /tmp/browser-direct-2.ready /tmp/browser-direct-2.release \
+                >/tmp/browser-direct-2-enforcing.log 2>&1; then status=0; else status=$?; fi
+            printf "%s\n" "$status" >/tmp/browser-direct-2.status
+        ' openshield-browser-direct-2-enforcing "$browser_direct" "$peer_ip"
+        docker exec --detach "$client_id" /bin/sh -c '
+            if runuser -u proxyclient -- "$1" /opt/proxy-workload.py identity-hold \
+                127.0.0.1 8118 "$2" 18081 proxied 16 \
+                /tmp/browser-proxy.ready /tmp/browser-proxy.release \
+                >/tmp/browser-proxy-enforcing.log 2>&1; then status=0; else status=$?; fi
+            printf "%s\n" "$status" >/tmp/browser-proxy.status
+        ' openshield-browser-proxy-enforcing "$browser_proxy" "$peer_ip"
+        wait_for_identity_ready "$client_id" /tmp/browser-direct-1.ready \
+            /tmp/browser-direct-1.status /tmp/browser-direct-1-enforcing.log \
+            'first direct browser process'
+        wait_for_identity_ready "$client_id" /tmp/browser-direct-2.ready \
+            /tmp/browser-direct-2.status /tmp/browser-direct-2-enforcing.log \
+            'second direct browser process'
+        wait_for_identity_ready "$client_id" /tmp/browser-proxy.ready \
+            /tmp/browser-proxy.status /tmp/browser-proxy-enforcing.log \
+            'proxied browser process'
+        browser_enforcing_finished_ns=$(date +%s%N)
+        browser_enforcing_elapsed_ms=$(((browser_enforcing_finished_ns - browser_enforcing_started_ns) / 1000000))
+
+        docker exec "$client_id" touch /tmp/browser-direct-1.release \
+            /tmp/browser-direct-2.release /tmp/browser-proxy.release
+        wait_for_file "$client_id" /tmp/browser-direct-1.status \
+            'first Enforcing browser process exit'
+        wait_for_file "$client_id" /tmp/browser-direct-2.status \
+            'second Enforcing browser process exit'
+        wait_for_file "$client_id" /tmp/browser-proxy.status \
+            'Enforcing proxied browser process exit'
+        for identity_status in browser-direct-1 browser-direct-2 browser-proxy; do
+            [ "$(docker exec "$client_id" cat "/tmp/$identity_status.status")" = 0 ] || {
+                docker exec "$client_id" cat "/tmp/$identity_status-enforcing.log" >&2 || true
+                exit 1
+            }
+        done
+
+        sleep 0.2
+        docker exec "$peer_id" cat /tmp/proxy-peer.log \
+            > "$temporary_directory/browser-enforcing-peer.log"
+        docker cp "$temporary_directory/browser-enforcing-peer.log" \
+            "$client_id:/tmp/browser-enforcing-peer.log" >/dev/null
+        if ! docker exec "$client_id" /bin/sh -c '
+            attempt=0
+            while [ "$attempt" -lt 100 ]; do
+                python3 /opt/proxy-workload.py audit-identity-round \
+                    /tmp/browser-enforcing-peer.log 8 16 \
+                    >/tmp/browser-enforcing-audit.json 2>/tmp/browser-enforcing-audit.error \
+                    && exit 0
+                attempt=$((attempt + 1)); sleep 0.05
+            done
+            cat /tmp/browser-enforcing-audit.error >&2
+            exit 1
+        '; then
+            exit 1
+        fi
+
+        begin_stage 'verify unknown applications remain fail-closed in Enforcing'
+        browser_unknown=/tmp/openshield-browser-unknown
+        docker exec "$client_id" /bin/sh -c '
+            exec runuser -u proxyclient -- "$1" /opt/proxy-workload.py \
+                direct-blocked 127.0.0.1 8118 >/tmp/browser-unknown-loopback.log 2>&1
+        ' openshield-browser-unknown-loopback "$browser_unknown"
+        docker exec "$client_id" /bin/sh -c '
+            exec runuser -u proxyclient -- "$1" /opt/proxy-workload.py \
+                direct-blocked "$2" 18081 >/tmp/browser-unknown-peer.log 2>&1
+        ' openshield-browser-unknown-peer "$browser_unknown" "$peer_ip"
+        docker exec "$client_id" python3 /opt/ipc_client.py assert-runtime \
+            enforcing "$backend" conntrack_hybrid application_tcp >/dev/null
+        if docker exec "$client_id" grep -Eqi \
+            'fail.open|quarantine|emergency BlockAll' /tmp/openshield.log; then
+            printf '%s\n' 'daemon reported fail-open/quarantine during Enforcing identity workload' >&2
+            exit 1
+        fi
+        docker exec "$client_id" python3 /opt/proxy-workload.py \
+            assert-nfqueue-clean --require-denied >/dev/null
+    fi
+
     docker exec "$client_id" touch /tmp/noise-same.release /tmp/noise-other.release
     wait_for_file "$client_id" /tmp/noise-same.status 'same-UID noise exit'
     wait_for_file "$client_id" /tmp/noise-other.status 'different-UID noise exit'
@@ -545,8 +706,14 @@ if [ "$browser_identity" = true ]; then
     done
     docker exec "$client_id" python3 /opt/proxy-workload.py assert-nfqueue-clean >/dev/null
     begin_stage 'complete browser identity regression'
-    printf 'PASS browser identity E2E (%s/%s): shared UID, distinct executables, direct and proxied (%s ms to all learned identities)\n' \
-        "$distribution" "$backend" "$browser_learning_elapsed_ms"
+    if [ "$enforcing_identity" = true ]; then
+        printf 'PASS browser identity E2E (%s/%s): Learning %s ms; application-only Enforcing %s ms\n' \
+            "$distribution" "$backend" "$browser_learning_elapsed_ms" \
+            "$browser_enforcing_elapsed_ms"
+    else
+        printf 'PASS browser identity E2E (%s/%s): shared UID, distinct executables, direct and proxied (%s ms to all learned identities)\n' \
+            "$distribution" "$backend" "$browser_learning_elapsed_ms"
+    fi
     exit 0
 fi
 
