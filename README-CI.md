@@ -41,9 +41,10 @@ capacity remain mandatory. A single burst has no confidence claim, but its
 throughput/PPS threshold crossings are directly blocking; CPU/latency follows
 the profile's explicit action.
 Drops, retransmits, NFQUEUE errors, and fail-open behavior are immediate
-failures rather than statistical decisions.
-Explicit fail-open behavior is also proven by the separate controlled-overload
-canary. This release-only smoke is not run by
+failures rather than statistical decisions. The independent controlled-overload
+canary proves the absence of fail-open behavior: application-bound Enforcing
+traffic remains fail-closed while the queue consumer is unavailable. This
+release-only smoke is not run by
 the pull-request workflow and is not a portable benchmark or a support claim
 for every architecture.
 

@@ -1,4 +1,10 @@
 {
+  "rule_action.accept": "Accept",
+  "rule_action.drop": "Drop",
+  "rule_action.reject": "Reject",
+  "rule_action.label": "Rule action",
+  "common.template": "application template",
+  "status.learning_policy": "Learning allows outbound traffic by default and creates learned rules with Accept; enabled Drop and Reject rules take effect immediately even in Learning.",
   "compatibility.reason_emergency_block_all": "emergency fail-closed quarantine is active; the kernel blocks all traffic",
   "validation.application_fields_disabled": "Enable application matching or clear all application-specific fields",
   "rules.details_file_identity": "Executable file identity",
@@ -235,7 +241,7 @@
   "editor.field_destination": "Destination address or CIDR",
   "editor.field_source": "Source address or CIDR",
   "editor.inbound_help": "This rule permits matching inbound traffic. Specify the local port, receiving interface, protocol, and optional remote source; all other inbound traffic remains blocked.",
-  "editor.outbound_help": "This rule permits matching outbound traffic. It may be bound to a cgroup, executable path, command-line arguments, user, destination, port, protocol, and interface.",
+  "editor.outbound_help": "Enabled controls whether the rule is active; disabled rules have no effect. Rule action independently selects Accept, Drop, or Reject. Learning allows outbound traffic by default and creates learned Accept rules; enabled Drop and Reject rules are enforced immediately.",
   "editor.new_inbound_title": " New inbound allow rule ",
-  "editor.new_outbound_title": " New outbound allow rule "
+  "editor.new_outbound_title": " New outbound rule "
 }

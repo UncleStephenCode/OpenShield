@@ -2,7 +2,7 @@
 
 # OpenShield
 
-Current source release: **v0.2.0**.
+Current source release: **v0.2.1**.
 
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
@@ -25,14 +25,20 @@ workspace code.
 | Mode | Local input | Local output | Forwarding |
 | --- | --- | --- | --- |
 | `BlockAll` | drop | drop | drop |
-| `Learning` | default-drop; explicit inbound allows and replies bound to a current authorized outbound flow only | matching rules are allowed; otherwise supported traffic is allowed only after fail-closed application attribution and becomes an exact learned rule | return to the pre-existing firewall policy |
-| `Enforcing` | default-drop; explicit inbound allows and replies bound to a current authorized outbound flow only | default-drop; enabled manual and learned allow rules only | return to the pre-existing firewall policy |
+| `Learning` | default-drop for new connections; explicit inbound allows, narrow host-bootstrap/control exceptions, plus conntrack replies to locally initiated flows | allow unmatched traffic and apply enabled explicit `drop`/`reject` rules; supported attributed traffic creates enabled `accept` rules and disabled application templates | return to the pre-existing firewall policy |
+| `Enforcing` | default-drop; explicit inbound allows, narrow host-bootstrap/control exceptions, replies bound to a currently authorized outbound flow, and narrowly authenticated native `Reject` replies | default-drop; enabled outbound rules apply `accept`, silent `drop`, or active `reject` | return to the pre-existing firewall policy |
 
 A machine with no state file gets a persisted `Learning` policy. This does not
 create a fail-open startup window: every daemon start first installs a temporary
 kernel `BlockAll` quarantine. The saved policy is activated only after it has
-been validated, the NFQUEUE consumer is ready, and all required local
-prerequisites are available. An existing saved mode is preserved.
+been validated, both fixed NFQUEUE consumers are ready, and all required local
+prerequisites are available. Queue 1337 is fail-closed for `Enforcing` and for
+explicit application-bound denies in `Learning`; queue 1338 is the immediate,
+observational `Learning` queue. An existing saved mode is preserved.
+While startup `BlockAll` remains active, the first v0.2.1 load of v0.2.0 state
+adds missing disabled application-group templates within the automatic-rule,
+total-rule, and 8 MiB limits; existing learned endpoint rules are never removed
+to make room. The migrated state is persisted before policy activation.
 
 Graceful shutdown installs kernel `BlockAll` again without overwriting the saved
 mode. Service-manager pre-start and post-stop hooks provide the same quarantine
@@ -40,19 +46,35 @@ around daemon failures. A forced kill or kernel/backend failure cannot provide a
 universal persistence guarantee; operational recovery must therefore use a
 local console or independent out-of-band access.
 
-Learning applies only to supported outbound TCP, UDP, ICMP echo, and ICMPv6
-echo traffic. Missing, ambiguous, oversized, unsupported, or timed-out process
-attribution is denied. Inbound traffic is never learned automatically.
-Automatic insertion stops when the state already contains 7,500 learned rules,
-512 learned rules for one filesystem UID, or 256 for one filesystem UID and full
-executable file-version identity. These are admission budgets, not validation
+Learning attempts to attribute supported outbound TCP, UDP, ICMP echo, and
+ICMPv6 echo traffic, but it no longer uses successful observation as the
+default allow condition. Unmatched outbound traffic is allowed while the live
+policy remains `Learning`; missing, ambiguous, oversized, unsupported,
+timed-out, or queue-saturated observation creates no rule instead of blocking
+ordinary traffic. Queue 1338 therefore accepts immediately, performs attribution
+asynchronously, and has kernel bypass and fail-open queue flags. Enabled explicit
+network `drop`/`reject` rules remain active in the kernel. Traffic inside an
+enabled application-deny envelope instead enters fail-closed queue 1337; a
+matching deny is applied and an unresolved candidate is conservatively dropped,
+except that a kernel UID false-positive is admitted and deferred to best-effort
+observation. `Enforcing` never uses the observational bypass and remains
+fail-closed. Inbound traffic is never learned automatically. New inbound
+connections still require an explicit allow rule except for the built-in normal-mode
+bootstrap/control-plane set: DHCPv4 server-to-client replies only to a broadcast
+destination, DHCPv6 server-to-client replies only from a link-local source, and
+the narrowly enumerated IPv6 NDP, Router Advertisement, MLD-query, and required
+RELATED error traffic. `BlockAll` contains none of these exceptions.
+Automatic insertion stops when exact learned rules plus generated templates
+reach 7,500, when exact learned rules reach 512 for one filesystem UID, or when
+they reach 256 for one filesystem UID and full executable file-version identity.
+These are admission budgets, not validation
 invariants for a legacy or root-edited state. The 10,000-rule total normally
 leaves 2,500 count slots for root-created rules, although root can still fill the
 total manually. Budgets use the numeric filesystem UID, so distinct subordinate
 UIDs count independently and can distribute activity until the global budget.
-Traffic that reaches a learning quota is allowed
-for that Learning decision but is not persisted and is therefore denied in
-Enforcing unless another rule matches. The separate 8 MiB state limit still
+Traffic that reaches a learning quota remains allowed in Learning but is not
+persisted and is therefore denied in Enforcing unless another enabled `accept`
+rule matches. The separate 8 MiB state limit still
 applies. Reaching that byte limit or a recoverable save failure discards the
 current batch and pauses automatic persistence until a successful root mutation
 or daemon restart; otherwise eligible, successfully attributed `Learning`
@@ -86,7 +108,7 @@ path, not weaker enforcement and not a runtime fallback for the same policy:
 | ---: | --- | --- |
 | L3 | `KernelNative` | `BlockAll`, or `Enforcing` without an enabled application-bound rule; filtering is compiled directly into the selected kernel firewall backend |
 | L2 | `ConntrackHybrid` | `Enforcing` with enabled application-bound TCP rules only; the first packet is attributed through NFQUEUE and established TCP uses the current conntrack-generation fast path |
-| L1 | `Nfqueue` | `Learning`, or `Enforcing` with an enabled application-bound UDP, ICMP, ICMPv6, or `Any` rule; otherwise-unmatched packets require per-packet userspace attribution |
+| L1 | `Nfqueue` | `Learning` uses immediate asynchronous observations, while `Enforcing` with an enabled application-bound UDP, ICMP, ICMPv6, or `Any` rule requires fresh userspace attribution for otherwise-unmatched packets |
 | — | `Unknown` | a legacy status response or an unverified runtime; the UI must not present it as an accelerated path |
 
 The level is deliberately a worst-case summary. Network-only packets continue
@@ -105,9 +127,11 @@ documented recovery procedure is completed.
 Backend selection is a separate startup decision. The only automatic startup
 backend fallback is from nftables to the complete iptables/ip6tables bundle
 when nftables cannot be validated. Neither choice changes the active-path
-semantics. If the fail-closed NFQUEUE
+semantics. If the NFQUEUE
 runtime cannot be made ready, startup retains `BlockAll` and exits; it never
-continues with a network-only approximation or a fail-open queue.
+continues with a network-only approximation. Queue bypass is compiled only for
+the observational Learning queue; neither Enforcing nor the Learning
+application-deny queue enables it.
 
 This release does not enable an eBPF application data plane. It neither grants
 `CAP_BPF`, changes the boot command line, enrolls a MOK, nor requires a custom
@@ -117,9 +141,10 @@ can demonstrate the same fail-closed behavior.
 
 ## Application-bound outbound rules
 
-An application selector always includes a canonical executable path and a
-persisted file-version identity: device, inode, size, and change time in seconds
-and nanoseconds. Optional selectors constrain the filesystem UID, the exact
+An enabled application selector always includes a canonical executable path and
+a persisted file-version identity: device, inode, size, and change time in
+seconds and nanoseconds. The only unpinned form accepted in persisted state is
+an automatically generated disabled group template. Optional selectors constrain the filesystem UID, the exact
 unified-cgroup-v2 path, and an exact or prefix command line. The command line is
 represented as a JSON array of strings, so token boundaries and empty arguments
 are preserved. Every supplied application and network field is combined with
@@ -135,6 +160,19 @@ canonical path, complete file version, filesystem UID, exact tokenized argv,
 and, when available, the single unified-cgroup-v2 path. On cgroup v1 the cgroup
 field is absent while the other fields remain enforced.
 
+For each newly observed application grouping identity, Learning also creates one
+disabled `accept` template containing only the canonical executable path and,
+when available, its unified-cgroup-v2 path. It has protocol `Any` and no network,
+port, interface, argv, UID, or persisted file-version selector. Enabling that
+template is a privileged operation: immediately before committing the change,
+the daemon resolves and pins the current executable version using the same
+race-resistant path checks as a manually created rule. The template is inert
+until enabled and then deliberately grants that application unrestricted
+outbound network access. Disabling an unchanged template restores its canonical
+unpinned skeleton, and every later enable repins the then-current file. A
+Template edited into a non-skeleton rule and other disabled rules retain their
+complete specification and pin.
+
 Exact argv can contain credentials, tokens, or other secrets. Learning persists
 it in the root-owned `0600` `/var/lib/openshield/state.json`; non-root observation
 redacts application selectors. Protect the state file and its backups. A change
@@ -146,24 +184,34 @@ The daemon attributes a queued packet from the kernel-reported UID and network
 tuple, requires one unambiguous socket inode and process owner, and performs
 bounded repeated checks of `/proc` metadata. It enumerates descriptor tables
 only for tasks whose filesystem UID equals the kernel socket UID, groups matching
-holders by process, and denies on incomplete candidate scans, multiple process
-owners, changing identity, or exhausted bounds. NFQUEUE number 1337 has no
-fail-open bypass flag. TCP authorization is tied to a persisted 30-bit policy
+holders by process. In Enforcing, incomplete candidate scans, multiple process
+owners, changing identity, or exhausted bounds deny the packet. The same
+failures in an ordinary Learning observation skip rule creation without delaying
+or denying the packet. Learning application-deny candidates are a deliberate
+exception: they use fail-closed NFQUEUE 1337 and deny on unresolved attribution
+inside the candidate envelope, apart from a kernel-UID mismatch that is accepted
+and deferred to best-effort observation. The separate Learning NFQUEUE 1338
+accepts packets immediately and hands bounded attribution to an asynchronous
+worker; it has queue bypass and an accept-on-overflow policy. TCP authorization
+in Enforcing is tied to a persisted 30-bit policy
 generation that increases by one and is not reused before exhaustion; UDP and
 ICMP are re-attributed for every otherwise-unmatched outbound packet.
 
-Since v0.1.32, OpenShield can drain at most 32 already-ready NFQUEUE packets into one
-bounded attribution batch; it never waits to fill a batch. Each packet still
-gets an independent `SOCK_DIAG` socket lookup. Only the complete procfs owner
+Since v0.1.32, fail-closed decisions and asynchronous Learning observations can
+be attributed in bounded batches of at most 32 already-ready items; neither path
+waits to fill a batch. Each item still gets an independent `SOCK_DIAG` socket
+lookup. Only the complete procfs owner
 enumerations are shared: one snapshot before identity capture and one after it.
 The entire batch has one absolute 250 ms deadline, and each shared snapshot has
 a global cap of 131,072 owner records across all targets. An identity may be
 reused only inside that batch for the same socket
 inode, socket UID, and capture requirements, and duplicate requests must agree
 on PID, process start time, executable path and complete file version, and UID.
-A typed timeout remains visible in NFQUEUE counters. Any ambiguity, changed
-owner snapshot, missed deadline, or exceeded bound denies the affected packet;
-there is no cross-batch identity or authorization cache, so unmatched UDP/ICMP
+A typed timeout remains visible in NFQUEUE counters. In Enforcing, and inside a
+Learning application-deny envelope, ambiguity, a changed owner snapshot, a missed
+deadline, or an exceeded bound denies the affected packet. On observational
+queue 1338 it prevents persistence but cannot revoke the already returned
+`NF_ACCEPT`. There is no cross-batch identity or authorization cache, so unmatched UDP/ICMP
 traffic is attributed again in every later batch.
 
 These selectors identify observed process metadata, not all code executing in
@@ -177,9 +225,33 @@ recreate affected rules from a protected console.
 See the [threat model](docs/THREAT_MODEL.md) before relying on application rules
 as a security boundary.
 
-Rules are allow-only. A broad network-only rule is evaluated before an
-application rule and can authorize the same traffic without process matching.
-Avoid overlapping broad rules when application identity must be mandatory.
+Activation and action are independent fields. `enabled: false` makes a rule
+inert. In either normal mode, an enabled outbound rule can `accept`, silently
+`drop`, or actively `reject` matching traffic using the selected backend.
+`Learning` supplies a default allow for unmatched traffic and creates successful
+learned endpoint rules with `accept`, but it does not override enabled explicit
+`drop` or `reject` rules. Inbound
+rules remain accept-only. When v0.2.1 reads a rule without `action`, it uses
+`accept` and omits that default from canonical JSON.
+The backend uses a deterministic deny-before-allow order so a broad accept rule
+cannot override a matching drop or reject rule.
+
+The native response generated by `reject` is admitted through default-deny only
+for an exact RELATED/REPLY TCP RST, ICMP port-unreachable, or ICMPv6
+port-unreachable carrying the current generation-bound OpenShield connmark.
+Policy-generation changes invalidate stale attestations; other RELATED traffic
+gets no exception. Before a broader network accept, application envelopes also
+drop matching UNTRACKED current tuples and, for destination/port constraints,
+matching conntrack-original tuples after local DNAT while retaining the final
+output-interface constraint. The conservative guard may deny a translated flow
+rather than bypass application attribution.
+
+State and IPC compatibility is forward-only from v0.2.0 to v0.2.1. The new
+reader accepts an absent `action` as `accept`, but v0.2.0 cannot parse v0.2.1
+`drop`/`reject` actions or the `template` origin. Mixed daemon/TUI versions and
+an in-place downgrade after v0.2.1 has written state are unsupported. Perform
+upgrade or rollback from a protected console with kernel `BlockAll` active, a
+reviewed state backup, and a distribution-tested procedure.
 
 ## Local access control
 
@@ -231,20 +303,25 @@ the first available identity in this fixed priority order:
 
 Only that one value is the group key. The right pane retains the individual
 rules and shows their protocol, destination, port or range, interface, command
-line, UID, executable file-version identity, origin, enabled state, UUID, and
+line, UID, executable file-version identity, origin, action, enabled state, UUID, and
 timestamps. Grouping is a presentation operation only: it never combines
 rules, changes their AND matching semantics, or turns a single-rule action into
 a group-wide policy change. `Up`/`Down` select a group and `Left`/`Right`
 select an individual rule in that group. `PageUp`/`PageDown` scroll the full
 detail pane without truncating bounded selectors. `n` creates a rule for the current
 direction, `e` edits the selected rule, `d` deletes it, and `Space` toggles only
-that selected rule.
+that selected rule. A disabled application template is shown in the same group;
+review it carefully before enabling its intentionally unrestricted outbound
+`accept` action.
 
 The Inbound tab is intentionally separate. It creates explicit inbound allow
 rules scoped by source network, local port or range, interface, and protocol;
-application selectors are not valid for inbound rules. Outside Block All,
-traffic not matched by an enabled inbound allow remains denied; Block All
-overrides every rule. `m` opens the mode selector from any
+application selectors are not valid for inbound rules. Outside Block All, new
+inbound traffic not matched by an enabled inbound allow or an exact built-in
+host-bootstrap/control exception remains denied; Block All overrides every rule
+and contains no such exception. Stateful replies follow the policy-mode rules above,
+including only the narrowly authenticated native `Reject` replies in
+`Enforcing`. `m` opens the mode selector from any
 tab. Mode changes and every rule mutation require root. A non-root member of
 the `openshield` group can use the same navigation for read-only monitoring,
 but receives server-redacted application identity and cannot mutate policy.
@@ -308,7 +385,7 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. Under the current v0.2.0 CI policy, relative DUT-cgroup CPU
+confidence bound. Under the current v0.2.1 CI policy, relative DUT-cgroup CPU
 and request/connect-latency crossings are explicitly advisory;
 relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
 p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
@@ -319,7 +396,7 @@ explicit action. The
 retained full v0.1.31 run was structurally valid but failed its performance
 gate. The retained full local v0.1.32 run passed its authenticated performance
 gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
-and report and is not silently promoted to v0.2.0.
+and report and is not silently promoted to v0.2.1.
 
 ## Installation and init systems
 
@@ -374,8 +451,9 @@ exact-path label checks and denial diagnostics.
 
 ### Safe first activation on a remote server
 
-> **Warning:** `Learning` still denies all new inbound traffic unless an
-> explicit inbound allow rule matches. Starting OpenShield over the only SSH or
+> **Warning:** `Learning` still denies new inbound application traffic unless an
+> explicit inbound allow rule matches. Narrow built-in bootstrap/control-plane
+> exceptions do not admit SSH or VPN. Starting OpenShield over the only SSH or
 > VPN path can immediately lock out the operator.
 
 Use a local console or independently tested out-of-band management for the
@@ -410,9 +488,13 @@ console using a distribution-specific, tested rollback procedure.
 nftables is preferred. It uses the dedicated `inet openshield` table and
 validates a complete replacement before an atomic nftables transaction.
 
-The compatibility backend creates only `OPENSHIELD_*` chains and places
-dispatch jumps first in the built-in IPv4 and IPv6 INPUT, OUTPUT, and FORWARD
-chains. It uses `iptables-restore`/`ip6tables-restore` with `--noflush`; it does
+The compatibility backend creates only `OPENSHIELD_*` chains. Filter dispatch
+jumps remain first in the built-in IPv4 and IPv6 INPUT, OUTPUT, and FORWARD
+chains. In mangle OUTPUT, the reserved-mark sanitizer is first and the
+Learning observation dispatcher is exactly once and last, after pre-existing
+host marking, QoS, and policy-routing rules. Consequently queue bypass,
+accept-on-overflow, and an ordinary Learning verdict cannot skip those rules.
+It uses `iptables-restore`/`ip6tables-restore` with `--noflush`; it does
 not flush a system table or change a built-in chain policy. Because xtables has
 no transaction spanning both address families, policy replacement first places
 both families in `BlockAll`, then applies IPv4 and IPv6. A transition can cause
@@ -441,14 +523,20 @@ comparison.
 
 Compatibility claims are intentionally scoped:
 
-- the current v0.2.0 source resolves all four workspace crates and their exact
-  internal dependency pins as `0.2.0`. The locked all-target Rust suite passed
-  350 tests with six environment-dependent live tests explicitly ignored;
-  formatting, all-target Clippy with warnings denied, and the release build
-  passed. Both local release executables report version `0.2.0`, and the release
-  matrix validates 43 binary builds, 43 packages, 86 declared platforms, 37
-  package-install jobs, and 74 firewall jobs. The GitHub release workflow for
-  v0.2.0 has not yet run;
+- the current v0.2.1 source resolves all four workspace crates and their exact
+  internal dependency pins as `0.2.1`. In the pinned Rust 1.98.0 container, the
+  locked all-target suite passed 377 tests while the normal run ignored six
+  environment-dependent tests; a separate invocation passed all six. Formatting,
+  all-target Clippy with warnings denied, and the static-PIE musl release build
+  passed. The performance-harness unit suite passed 219 tests with 11 intentional
+  environment-dependent skips. Both local release executables report `0.2.1`.
+  The locally built Tumbleweed x86-64 RPM (SHA-256
+  `fa638b0503447a7c85815a5a51d6add653330b92e2d5e05e854eb1dc1602d373`)
+  passed package installation and the complete disposable-container E2E with
+  nftables and the iptables fallback; neither run touched the host firewall.
+  The release matrix validates 43 binary builds, 43 packages, 86 declared
+  platforms, 37 package-install jobs, and 74 firewall jobs. The GitHub release
+  workflow for v0.2.1 has not yet run;
 - local v0.1.32 verification on Rust 1.98.0 passed
   `cargo fmt --all -- --check` and locked
   workspace all-target clippy with warnings denied. The complete Rust suite in
@@ -540,8 +628,10 @@ native technical review.
 
 ## Important limits
 
-- New inbound traffic is default-deny in every mode; IPv6 operation can require
-  explicit, interface- and network-scoped ICMPv6 permissions.
+- New inbound traffic is default-deny in both normal modes except for exact
+  built-in DHCP bootstrap and IPv6 control-plane traffic; `BlockAll` has no
+  exception. Services still require explicit, interface- and network-scoped
+  inbound rules.
 - The filter covers host IPv4/IPv6, not Ethernet/ARP or direct frame injection
   by an already privileged `AF_PACKET`/`CAP_NET_RAW` process.
 - Learning is a bounded operator-controlled trust window, not a verdict that a

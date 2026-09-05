@@ -19,8 +19,8 @@ use nix::sys::socket::{
 };
 use openshield_core::{
     ApplicationIdentity, ApplicationPath, CgroupPath, CommandArgument, ExecutableFileId,
-    InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule, RuleSpec, Snapshot,
-    TransportProtocol,
+    InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule, RuleAction, RuleSpec,
+    Snapshot, TransportProtocol,
 };
 
 const MAX_PROC_ENTRIES: usize = 131_072;
@@ -210,7 +210,8 @@ pub fn matching_application_rule<'a>(
     snapshot
         .rules
         .iter()
-        .find(|rule| application_rule_matches(rule, connection, identity))
+        .filter(|rule| application_rule_matches(rule, connection, identity))
+        .min_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id))
 }
 
 /// Immutable, indexed subset of policy used by the NFQUEUE decision path.
@@ -223,29 +224,38 @@ pub fn matching_application_rule<'a>(
 pub struct ApplicationDecisionPolicy {
     snapshot: Snapshot,
     rules_by_executable: HashMap<ExecutableFileId, Vec<usize>>,
+    network_accept_rules: Vec<usize>,
 }
 
 impl ApplicationDecisionPolicy {
     #[must_use]
     pub fn new(snapshot: Snapshot) -> Self {
         let mut rules_by_executable = HashMap::<ExecutableFileId, Vec<usize>>::new();
+        let mut network_accept_rules = Vec::new();
         for (index, rule) in snapshot.rules.iter().enumerate() {
-            let Some(file) = rule
-                .spec
-                .application
-                .as_ref()
-                .and_then(|selector| selector.executable_file)
-            else {
-                // State validation rejects unpinned application rules. If an
-                // internal caller violates that invariant, omitting the rule
-                // from the decision index is fail-closed.
-                continue;
-            };
-            rules_by_executable.entry(file).or_default().push(index);
+            match rule.spec.application.as_ref() {
+                Some(selector) => {
+                    let Some(file) = selector.executable_file else {
+                        // State validation rejects enabled unpinned
+                        // application rules. If an internal caller violates
+                        // that invariant, omitting it is fail-closed.
+                        continue;
+                    };
+                    rules_by_executable.entry(file).or_default().push(index);
+                }
+                None if rule.spec.enabled
+                    && rule.spec.direction == openshield_core::Direction::Outbound
+                    && rule.spec.action == RuleAction::Accept =>
+                {
+                    network_accept_rules.push(index);
+                }
+                None => {}
+            }
         }
         Self {
             snapshot,
             rules_by_executable,
+            network_accept_rules,
         }
     }
 
@@ -255,11 +265,46 @@ impl ApplicationDecisionPolicy {
         connection: &OutboundConnection,
         identity: &ApplicationIdentity,
     ) -> Option<&Rule> {
+        let application_match = self
+            .rules_by_executable
+            .get(&identity.executable_file)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.snapshot.rules.get(*index))
+            .filter(|rule| application_rule_matches(rule, connection, identity))
+            .min_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id));
+        application_match.or_else(|| self.matching_network_accept(connection))
+    }
+
+    /// Finds only an explicit application-bound deny. Learning uses this
+    /// narrower lookup so an Accept rule can never be mistaken for either an
+    /// enforcement decision or a fail-closed attribution error.
+    #[must_use]
+    pub(crate) fn matching_deny_rule(
+        &self,
+        connection: &OutboundConnection,
+        identity: &ApplicationIdentity,
+    ) -> Option<&Rule> {
         self.rules_by_executable
-            .get(&identity.executable_file)?
+            .get(&identity.executable_file)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.snapshot.rules.get(*index))
+            .filter(|rule| matches!(rule.spec.action, RuleAction::Drop | RuleAction::Reject))
+            .filter(|rule| application_rule_matches(rule, connection, identity))
+            .min_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id))
+    }
+
+    /// Finds the deterministic network-only Accept fallback for a packet
+    /// whose application envelope reached NFQUEUE but whose attributed
+    /// identity did not match an application rule.
+    #[must_use]
+    pub(crate) fn matching_network_accept(&self, connection: &OutboundConnection) -> Option<&Rule> {
+        self.network_accept_rules
             .iter()
             .filter_map(|index| self.snapshot.rules.get(*index))
-            .find(|rule| application_rule_matches(rule, connection, identity))
+            .filter(|rule| outbound_network_rule_matches(rule, connection))
+            .min_by_key(|rule| rule.id)
     }
 
     /// Returns the optional process fields required by application rules whose
@@ -284,6 +329,31 @@ impl ApplicationDecisionPolicy {
             let Some(selector) = rule.spec.application.as_ref() else {
                 // The predicate above already rejects this case. Keep the
                 // decision fail-closed if an internal invariant is broken.
+                continue;
+            };
+            candidate_found = true;
+            requirements.command_line |= selector.command_line.is_some();
+            requirements.cgroups |= selector.cgroup.is_some();
+        }
+        candidate_found.then_some(requirements)
+    }
+
+    /// Returns capture requirements only for application Drop/Reject
+    /// envelopes. This is the sole synchronous attribution path in Learning.
+    #[must_use]
+    pub(crate) fn deny_capture_requirements(
+        &self,
+        connection: &OutboundConnection,
+    ) -> Option<IdentityCaptureRequirements> {
+        let mut requirements = IdentityCaptureRequirements::minimal();
+        let mut candidate_found = false;
+        for rule in &self.snapshot.rules {
+            if !matches!(rule.spec.action, RuleAction::Drop | RuleAction::Reject)
+                || !application_rule_network_and_uid_matches(rule, connection)
+            {
+                continue;
+            }
+            let Some(selector) = rule.spec.application.as_ref() else {
                 continue;
             };
             candidate_found = true;
@@ -350,7 +420,30 @@ fn application_rule_matches(
             .is_some_and(|selector| selector.matches(identity))
 }
 
+const fn rule_action_priority(action: RuleAction) -> u8 {
+    match action {
+        RuleAction::Drop => 0,
+        RuleAction::Reject => 1,
+        RuleAction::Accept => 2,
+    }
+}
+
 fn application_rule_network_and_uid_matches(rule: &Rule, connection: &OutboundConnection) -> bool {
+    outbound_network_selectors_match(rule, connection)
+        && rule.spec.application.as_ref().is_some_and(|selector| {
+            selector
+                .uid
+                .is_none_or(|expected| expected == connection.socket_uid)
+        })
+}
+
+fn outbound_network_rule_matches(rule: &Rule, connection: &OutboundConnection) -> bool {
+    rule.spec.application.is_none()
+        && rule.spec.action == RuleAction::Accept
+        && outbound_network_selectors_match(rule, connection)
+}
+
+fn outbound_network_selectors_match(rule: &Rule, connection: &OutboundConnection) -> bool {
     rule.spec.enabled
         && rule.spec.direction == openshield_core::Direction::Outbound
         && (rule.spec.protocol == TransportProtocol::Any
@@ -369,11 +462,6 @@ fn application_rule_network_and_uid_matches(rule: &Rule, connection: &OutboundCo
             .interface
             .as_ref()
             .is_none_or(|interface| interface == &connection.output_interface)
-        && rule.spec.application.as_ref().is_some_and(|selector| {
-            selector
-                .uid
-                .is_none_or(|expected| expected == connection.socket_uid)
-        })
 }
 
 #[derive(Debug)]
@@ -3410,6 +3498,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn application_rule_requires_every_network_and_process_selector() -> Result<(), Box<dyn Error>>
     {
         let interface = InterfaceName::new("eth0")?;
@@ -3446,6 +3535,7 @@ mod tests {
             None,
         )?);
         spec.validate()?;
+        let base_spec = spec.clone();
         let mut state = State::new();
         state.set_mode(Mode::Enforcing)?;
         state.create_rule(spec)?;
@@ -3468,6 +3558,23 @@ mod tests {
             Some(IdentityCaptureRequirements::minimal())
         );
 
+        // Overlapping application rules use deny-overrides independently of
+        // random UUID ordering: Drop, then Reject, then Accept.
+        let mut reject = base_spec.clone();
+        reject.action = RuleAction::Reject;
+        state.create_rule(reject)?;
+        let mut drop_rule = base_spec;
+        drop_rule.action = RuleAction::Drop;
+        state.create_rule(drop_rule)?;
+        let deny_overrides = ApplicationDecisionPolicy::new(state.snapshot());
+        assert_eq!(deny_overrides.candidate_count(identity.executable_file), 3);
+        assert_eq!(
+            deny_overrides
+                .matching_rule(&connection, &identity)
+                .map(|rule| rule.spec.action),
+            Some(RuleAction::Drop)
+        );
+
         let mut wrong_uid = connection.clone();
         wrong_uid.socket_uid += 1;
         assert!(
@@ -3483,6 +3590,33 @@ mod tests {
             indexed
                 .matching_rule(&connection, &unrelated_binary)
                 .is_none()
+        );
+
+        let network_accept = RuleSpec::new(
+            RuleName::new("network fallback")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.0/24".parse()?),
+            Some(PortRange::single(443)?),
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?;
+        state.create_rule(network_accept)?;
+        let with_network_fallback = ApplicationDecisionPolicy::new(state.snapshot());
+        assert_eq!(
+            with_network_fallback
+                .matching_rule(&connection, &identity)
+                .map(|rule| rule.spec.action),
+            Some(RuleAction::Drop),
+            "an application deny must override an overlapping network accept"
+        );
+        assert_eq!(
+            with_network_fallback
+                .matching_rule(&connection, &unrelated_binary)
+                .map(|rule| rule.spec.action),
+            Some(RuleAction::Accept),
+            "an unrelated application must retain the matching network allow"
         );
 
         let mut wrong_destination = connection;

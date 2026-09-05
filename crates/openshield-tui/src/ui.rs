@@ -2,7 +2,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use openshield_core::{
-    CounterValue, Direction, Event, EventKind, Mode, Rule, RuleOrigin, TransportProtocol,
+    CounterValue, Direction, Event, EventKind, Mode, Rule, RuleAction, RuleOrigin,
+    TransportProtocol,
 };
 use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 use ratatui::{
@@ -116,6 +117,10 @@ fn draw_status(
         .snapshot
         .as_ref()
         .map_or_else(Style::default, |snapshot| mode_style(snapshot.mode));
+    let learning = app
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.mode == Mode::Learning);
     let revision = revision.to_string();
     let rule_count = rule_count.to_string();
     let inbound_count = inbound_count.to_string();
@@ -154,6 +159,12 @@ fn draw_status(
             ),
         ]),
     ];
+    if learning {
+        lines.push(Line::from(Span::styled(
+            i18n.tr("status.learning_policy"),
+            Style::default().fg(Color::Green),
+        )));
+    }
     // The compact 80x24 layout keeps the attested backend, mode, level and
     // reason ahead of all optional detail. The explanatory scope is omitted
     // there because it can wrap to several rows in translated interfaces.
@@ -382,9 +393,9 @@ fn draw_outbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
         members,
         (!members.is_empty()).then_some(app.selected_outbound_member_index()),
         i18n.tr("rules.outbound_members_title"),
-        i18n.tr("editor.field_destination"),
         right[0],
         i18n,
+        true,
     );
     let selected = members.get(app.selected_outbound_member_index()).copied();
     draw_rule_details(
@@ -408,9 +419,9 @@ fn draw_inbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
         &rules,
         (!rules.is_empty()).then_some(app.selected_inbound_rule_index()),
         i18n.tr("rules.inbound_title"),
-        i18n.tr("editor.field_source"),
         areas[0],
         i18n,
+        false,
     );
     draw_rule_details(
         frame,
@@ -426,49 +437,64 @@ fn draw_rule_table(
     rules: &[&Rule],
     selected: Option<usize>,
     title: &str,
-    peer_header: &str,
     area: Rect,
     i18n: &I18n,
+    show_action: bool,
 ) {
     let rows = rules
         .iter()
-        .map(|rule| rule_row(rule, i18n))
+        .map(|rule| rule_row(rule, i18n, show_action))
         .collect::<Vec<_>>();
-    let header = styled_header([
-        i18n.tr("rules.column_enabled"),
+    let mut header = vec![i18n.tr("rules.column_enabled")];
+    let mut widths = vec![Constraint::Length(4)];
+    if show_action {
+        header.push(i18n.tr("rule_action.label"));
+        widths.push(Constraint::Length(9));
+    }
+    let peer_header = i18n.tr(if show_action {
+        "editor.field_destination"
+    } else {
+        "editor.field_source"
+    });
+    header.extend([
         i18n.tr("rules.column_protocol"),
         peer_header,
         i18n.tr("rules.column_port"),
         i18n.tr("rules.column_interface"),
         i18n.tr("rules.column_name"),
     ]);
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(7),
-            Constraint::Min(15),
-            Constraint::Length(11),
-            Constraint::Length(12),
-            Constraint::Min(14),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title(title))
-    .row_highlight_style(selected_style())
-    .highlight_symbol("▶ ");
+    widths.extend([
+        Constraint::Length(7),
+        Constraint::Min(15),
+        Constraint::Length(11),
+        Constraint::Length(12),
+        Constraint::Min(14),
+    ]);
+    let header = Row::new(header).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(selected_style())
+        .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn rule_row(rule: &Rule, i18n: &I18n) -> Row<'static> {
+fn rule_row(rule: &Rule, i18n: &I18n, show_action: bool) -> Row<'static> {
     let style = if rule.spec.enabled {
         Style::default()
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Row::new([
-        Cell::from(if rule.spec.enabled { "●" } else { "○" }),
+    let mut cells = vec![Cell::from(if rule.spec.enabled { "●" } else { "○" })];
+    if show_action {
+        cells.push(Cell::from(action_label(rule.spec.action, i18n).to_owned()));
+    }
+    cells.extend([
         Cell::from(protocol_label(rule.spec.protocol, i18n).to_owned()),
         Cell::from(peer_label(rule, i18n)),
         Cell::from(port_label(rule)),
@@ -479,8 +505,8 @@ fn rule_row(rule: &Rule, i18n: &I18n) -> Row<'static> {
                 .map_or_else(|| "—".to_owned(), ToString::to_string),
         ),
         Cell::from(rule.spec.name.to_string()),
-    ])
-    .style(style)
+    ]);
+    Row::new(cells).style(style)
 }
 
 fn draw_rule_details(
@@ -524,6 +550,7 @@ fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
     let origin = match rule.spec.origin {
         RuleOrigin::Manual => i18n.tr("common.manual"),
         RuleOrigin::Learned => i18n.tr("common.learned"),
+        RuleOrigin::Template => i18n.tr("common.template"),
     };
     let mut lines = vec![
         detail_line(i18n.tr("rules.details_uuid"), rule.id.to_string()),
@@ -536,6 +563,10 @@ fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
                 } else {
                     "common.no"
                 }),
+            ),
+            (
+                i18n.tr("rule_action.label"),
+                action_label(rule.spec.action, i18n),
             ),
             (i18n.tr("rules.details_origin"), origin),
             (
@@ -902,12 +933,19 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
 fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
     let area = centered_rect(86, 29, frame.area());
     frame.render_widget(Clear, area);
-    let mut fields = vec![
-        (
-            FormField::Name,
-            i18n.tr("editor.field_name"),
-            form.name.clone(),
-        ),
+    let mut fields = vec![(
+        FormField::Name,
+        i18n.tr("editor.field_name"),
+        form.name.clone(),
+    )];
+    if form.direction() == Direction::Outbound {
+        fields.push((
+            FormField::Action,
+            i18n.tr("rule_action.label"),
+            action_label(form.action, i18n).to_owned(),
+        ));
+    }
+    fields.extend([
         (
             FormField::Protocol,
             i18n.tr("editor.field_protocol"),
@@ -932,7 +970,7 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             i18n.tr("editor.field_interface"),
             form.interface.clone(),
         ),
-    ];
+    ]);
     if form.direction() == Direction::Outbound {
         fields.extend([
             (
@@ -989,6 +1027,7 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             match form.origin {
                 RuleOrigin::Manual => i18n.tr("common.manual"),
                 RuleOrigin::Learned => i18n.tr("common.learned_immutable"),
+                RuleOrigin::Template => i18n.tr("common.template"),
             },
             Style::default().fg(Color::DarkGray),
         ),
@@ -1293,6 +1332,14 @@ pub fn protocol_label(protocol: TransportProtocol, i18n: &I18n) -> &str {
     }
 }
 
+fn action_label(action: RuleAction, i18n: &I18n) -> &str {
+    match action {
+        RuleAction::Accept => i18n.tr("rule_action.accept"),
+        RuleAction::Drop => i18n.tr("rule_action.drop"),
+        RuleAction::Reject => i18n.tr("rule_action.reject"),
+    }
+}
+
 fn command_mode_label(mode: CommandMode, i18n: &I18n) -> &str {
     match mode {
         CommandMode::Any => i18n.tr("editor.command_any"),
@@ -1421,6 +1468,11 @@ mod tests {
             screen.contains("network-only packets always stay in the kernel"),
             "{screen}"
         );
+        assert!(
+            screen.contains("Learning allows outbound traffic by default"),
+            "{screen}"
+        );
+        assert!(screen.contains("enabled Drop and Reject"), "{screen}");
         assert!(!screen.contains("Compatibility level:"), "{screen}");
         assert!(!screen.to_ascii_lowercase().contains("ebpf"), "{screen}");
         assert!(!screen.to_ascii_lowercase().contains("subscription"));
@@ -1548,6 +1600,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut outbound_form = RuleForm::default();
         outbound_form.name = "package updater".to_owned();
+        outbound_form.action = RuleAction::Reject;
         outbound_form.protocol = TransportProtocol::Tcp;
         outbound_form.peer_network = "203.0.113.0/24".to_owned();
         outbound_form.port = "443".to_owned();
@@ -1606,6 +1659,7 @@ mod tests {
             "--channel=stable",
             "12345 B",
             "1000",
+            "Reject",
         ] {
             assert!(
                 outbound_screen.contains(expected),
@@ -1625,6 +1679,50 @@ mod tests {
             );
         }
         assert!(!inbound_screen.contains("/usr/bin/updater"));
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_application_template_is_visible_in_its_application_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut form = RuleForm::default();
+        form.name = "application access template".to_owned();
+        form.origin = RuleOrigin::Template;
+        form.enabled = false;
+        form.bind_application = true;
+        form.executable = "/usr/bin/example-client".to_owned();
+        form.cgroup = "/system.slice/example.service".to_owned();
+        let template = Rule::new(
+            form.to_rule_spec(&I18n::test_english())
+                .map_err(std::io::Error::other)?,
+        )?;
+
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![template],
+        });
+        let groups = app.outbound_groups();
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].key, OutboundGroupKey::Cgroup(_)));
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 36))?;
+        terminal.draw(|frame| {
+            draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+        })?;
+        let screen = buffer_text(terminal.backend());
+        for expected in [
+            "application access template",
+            "application template",
+            "Accept",
+            "/usr/bin/example-client",
+            "/system.slice/example.service",
+        ] {
+            assert!(screen.contains(expected), "missing {expected}: {screen}");
+        }
         Ok(())
     }
 

@@ -56,7 +56,12 @@ admission run under the engine mutex, while atomic save and file/directory
 `fsync` run after releasing it. Storage latency is therefore part of the
 workload without intentionally stalling packet verdicts on that mutex; exact
 observations covered by the in-flight candidate are deduplicated. The harness
-does not relax fail-closed, NFQUEUE-error, drop, or latency gates during a write.
+does not relax NFQUEUE-error, drop, validity, or latency gates during a write.
+In OpenShield 0.2.1, the ordinary Learning path intentionally allows unmatched
+outbound traffic: observational attribution or persistence pressure may lose
+evidence but may not deny that packet. Enabled explicit denies are outside these
+capacity scenarios and remain enforceable. The performance gate still reports and rejects such lost evidence;
+the controlled fail-closed overload proof remains scoped to `Enforcing`.
 
 TCP clients use ordinary nonblocking sockets and complete HTTP/1.1 or bounded
 framed request/response exchanges. UDP clients use persistent ordinary UDP
@@ -83,7 +88,7 @@ the pristine baseline DUT. The cases are:
 | `application_tcp` | The first packet of every new TCP connection is attributed through NFQUEUE; established traffic must use the current conntrack generation fast-path |
 | `application_udp` | Every otherwise-unmatched outbound datagram clears the reusable conntrack generation and is attributed again |
 
-For OpenShield 0.1.31, `StatusV2` classifies the worst-case active policy path.
+Since OpenShield 0.1.31, `StatusV2` classifies the worst-case active policy path.
 An `Enforcing` `network_only` case is L3 `KernelNative`; an `Enforcing`
 `application_tcp` case is L2 `ConntrackHybrid`; every `Learning` case and an
 `application_udp` case is L1 `Nfqueue`. Network-only packets remain in the
@@ -92,15 +97,17 @@ about which OpenShield path was measured. The backend name is recorded
 separately because the nftables-to-iptables startup fallback does not change
 these levels.
 
-These names do not describe an eBPF data plane. Version 0.1.31 exercises the
+These names do not describe an eBPF data plane. Version 0.2.1 exercises the
 existing nftables/iptables, conntrack, NFQUEUE, and procfs paths and introduces
 no `CAP_BPF`, kernel module, boot-parameter, or MOK requirement. The controlled
 NFQUEUE overload case is therefore still the relevant fail-closed saturation
 proof for application attribution.
 
 `network_only` runs in both `Enforcing` and `Learning`. Application cases run
-with a privileged manual executable rule in `Enforcing` and as real learned
-rules in `Learning`. The `known_endpoint` learning variant keeps the client's
+with a privileged manual executable rule in `Enforcing`; in `Learning`, offered
+traffic without an explicit deny is admitted while successful observations create
+real enabled `accept` endpoint rules plus disabled path/cgroup templates. The
+`known_endpoint` learning variant keeps the client's
 argv stable while changing only the owner-controlled JSON configuration file.
 The optional `discovery_churn` variant deliberately changes that argv path at
 every phase and load point to measure repeated first-seen learning.
@@ -364,8 +371,11 @@ Every phase records:
   the configured relative threshold accounting invalidates the evidence.
   Daemon children and firewall/kernel work remain included;
 - host-wide NET_RX/NET_TX softirq deltas;
-- NFQUEUE 1337 depth, wrap-safe packet-sequence delta, and exact kernel/user
-  drop deltas from `/proc/net/netfilter/nfnetlink_queue`;
+- mode-selected NFQUEUE depth, wrap-safe packet-sequence delta, and exact
+  kernel/user drop deltas from `/proc/net/netfilter/nfnetlink_queue`: queue
+  1337 for baseline and `Enforcing`, queue 1338 for observational `Learning`.
+  The selected number is retained in every DUT metric document and is checked
+  independently against the scenario mode;
 - process-lifetime monotonic deltas from the typed
   `status.data.nfqueue` counters: `queue_overflow`, `attribution_timeout`,
   `terminal_queue_error`, and `denied`; these status deltas are authoritative
@@ -444,9 +454,10 @@ relative CPU/latency crossings follow the explicit advisory setting (observe in
 CI smoke, fail in production-like). Burst validity, configured capacity
 ceilings, and fail-closed safety also remain mandatory and blocking. Safety is
 never deferred to statistical confirmation:
-application loss/errors, TCP retransmits, NIC drops/errors, NFQUEUE errors or
-drops, a failed identity probe, or any fail-open behavior fails the affected
-ordinary window immediately. The only intentional exception is
+application loss/errors, TCP retransmits, NIC drops/errors, or NFQUEUE errors or
+drops fail the affected ordinary window immediately. Any unexpected allow in
+`Enforcing` is fail-open and fails immediately; Learning's declared outbound
+allow is not classified as fail-open. The only intentional exception is
 the separately reported controlled-overload proof: there NFQUEUE drops prove
 that saturation actually occurred, an exactly accounted DUT UDP send-buffer
 error may record local fail-closed backpressure before the pressure process is
@@ -465,7 +476,9 @@ capacity point.
 The separate `overload` configuration is a destructive stress test of the
 disposable namespace, not a capacity point. For each backend it installs an
 exact outbound application rule in `Enforcing`, flushes conntrack, and runs both
-real short-connection TCP and real UDP workloads. The pressure client first
+real short-connection TCP and real UDP workloads. This proof deliberately
+remains on the fail-closed enforcing queue 1337; it never targets observational
+Learning queue 1338. The pressure client first
 validates its configuration and allocates bounded resources, emits an explicit ready event, and
 waits at a start barrier. Only then does the harness stop the authenticated
 daemon process with `SIGSTOP`, send the client its `start` command, and poll direct NFQUEUE
@@ -530,7 +543,8 @@ Each JSON controlled-overload record uses `openshield.perf.overload.v2`; this
 version adds the mandatory, gap-free split between the controlled
 pressure/resume-transition and clean post-resume DUT metric windows. Metric
 documents use `openshield.perf.metrics.v3`; this version makes raw, bracketed
-collector, and adjusted cgroup CPU explicit. Synchronized collectors acknowledge the exact
+collector, and adjusted cgroup CPU explicit. Its `nfqueue.queue_number` field
+records the queue selected before the collector starts. Synchronized collectors acknowledge the exact
 initial boundary before workload or overload activity can begin.
 
 `report.json.baseline_pairing` uses

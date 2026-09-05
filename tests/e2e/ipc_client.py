@@ -108,6 +108,34 @@ def control(payload: dict) -> dict:
     return response["data"]
 
 
+def matching_application_template(executable: str) -> dict | None:
+    for rule in all_rules():
+        spec = rule.get("spec", {})
+        application = spec.get("application") or {}
+        if (
+            spec.get("origin") == "template"
+            and spec.get("direction") == "outbound"
+            and spec.get("action", "accept") == "accept"
+            and spec.get("protocol") == "any"
+            and spec.get("peer_network") is None
+            and spec.get("port") is None
+            and spec.get("interface") is None
+            and application.get("executable") == executable
+            and application.get("command_line") is None
+            and application.get("uid") is None
+            and application.get("metadata_redacted") is False
+            and (
+                application.get("cgroup") is None
+                or (
+                    isinstance(application.get("cgroup"), str)
+                    and application["cgroup"].startswith("/")
+                )
+            )
+        ):
+            return rule
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -138,6 +166,32 @@ def main() -> int:
     learned.add_argument("address")
     learned.add_argument("port", type=int)
     learned.add_argument("protocol", choices=("tcp", "udp"))
+    no_learned = subcommands.add_parser("assert-no-learned")
+    no_learned.add_argument("executable")
+    no_learned.add_argument("address")
+    no_learned.add_argument("port", type=int)
+    no_learned.add_argument("protocol", choices=("tcp", "udp"))
+    template = subcommands.add_parser("assert-template")
+    template.add_argument("executable")
+    template.add_argument("state", choices=("enabled", "disabled"))
+    enable_template = subcommands.add_parser("enable-template")
+    enable_template.add_argument("executable")
+    disable_template = subcommands.add_parser("disable-template")
+    disable_template.add_argument("executable")
+    application_rule = subcommands.add_parser("create-app-tcp-rule")
+    application_rule.add_argument("name")
+    application_rule.add_argument("executable")
+    application_rule.add_argument("address")
+    application_rule.add_argument("port", type=int)
+    application_rule.add_argument("action", choices=("accept", "drop", "reject"))
+    network_rule = subcommands.add_parser("create-network-tcp-rule")
+    network_rule.add_argument("name")
+    network_rule.add_argument("address")
+    network_rule.add_argument("port", type=int)
+    network_rule.add_argument("action", choices=("accept", "drop", "reject"))
+    named_rule = subcommands.add_parser("set-named-rule-enabled")
+    named_rule.add_argument("name")
+    named_rule.add_argument("state", choices=("enabled", "disabled"))
     arguments = parser.parse_args()
 
     if arguments.command == "status":
@@ -193,6 +247,7 @@ def main() -> int:
             "interface": "eth0",
             "application": None,
             "origin": "manual",
+            "action": "accept",
             "enabled": True,
         }
         print(
@@ -217,6 +272,8 @@ def main() -> int:
             port = spec.get("port") or {}
             if (
                 spec.get("origin") == "learned"
+                and spec.get("enabled") is True
+                and spec.get("action", "accept") == "accept"
                 and spec.get("protocol") == arguments.protocol
                 and application.get("executable") == arguments.executable
                 and application.get("uid") is not None
@@ -241,6 +298,179 @@ def main() -> int:
             ):
                 return 0
         raise RuntimeError("expected learned application rule was not found")
+    elif arguments.command == "assert-no-learned":
+        for rule in all_rules():
+            spec = rule.get("spec", {})
+            application = spec.get("application") or {}
+            port = spec.get("port") or {}
+            if (
+                spec.get("origin") == "learned"
+                and spec.get("protocol") == arguments.protocol
+                and application.get("executable") == arguments.executable
+                and spec.get("peer_network")
+                in (arguments.address, f"{arguments.address}/32")
+                and port.get("start") == arguments.port
+                and port.get("end") == arguments.port
+            ):
+                raise RuntimeError(
+                    "an attribution failure unexpectedly created a learned rule"
+                )
+    elif arguments.command == "assert-template":
+        rule = matching_application_template(arguments.executable)
+        if rule is None:
+            raise RuntimeError("expected application-group template was not found")
+        spec = rule["spec"]
+        expected_enabled = arguments.state == "enabled"
+        if spec.get("enabled") is not expected_enabled:
+            raise RuntimeError(
+                f"template enabled state is not {expected_enabled}: {spec}"
+            )
+        executable_file = (spec.get("application") or {}).get("executable_file")
+        if expected_enabled:
+            if not isinstance(executable_file, dict) or not all(
+                field in executable_file
+                for field in (
+                    "device",
+                    "inode",
+                    "size",
+                    "ctime_seconds",
+                    "ctime_nanoseconds",
+                )
+            ):
+                raise RuntimeError("enabled template has no complete executable pin")
+        elif executable_file is not None:
+            raise RuntimeError("disabled template unexpectedly has an executable pin")
+    elif arguments.command == "enable-template":
+        rule = matching_application_template(arguments.executable)
+        if rule is None:
+            raise RuntimeError("application-group template was not found")
+        if rule.get("spec", {}).get("enabled") is not False:
+            raise RuntimeError("application-group template is not disabled")
+        current = status()
+        print(
+            json.dumps(
+                control(
+                    {
+                        "type": "set_rule_enabled",
+                        "data": {
+                            "expected_revision": current["revision"],
+                            "id": rule["id"],
+                            "enabled": True,
+                        },
+                    }
+                ),
+                sort_keys=True,
+            )
+        )
+    elif arguments.command == "disable-template":
+        rule = matching_application_template(arguments.executable)
+        if rule is None:
+            raise RuntimeError("application-group template was not found")
+        if rule.get("spec", {}).get("enabled") is not True:
+            raise RuntimeError("application-group template is not enabled")
+        current = status()
+        print(
+            json.dumps(
+                control(
+                    {
+                        "type": "set_rule_enabled",
+                        "data": {
+                            "expected_revision": current["revision"],
+                            "id": rule["id"],
+                            "enabled": False,
+                        },
+                    }
+                ),
+                sort_keys=True,
+            )
+        )
+    elif arguments.command == "create-app-tcp-rule":
+        if not 1 <= arguments.port <= 65535:
+            raise RuntimeError("port is outside 1..65535")
+        current = status()
+        rule = {
+            "name": arguments.name,
+            "direction": "outbound",
+            "action": arguments.action,
+            "protocol": "tcp",
+            "peer_network": f"{arguments.address}/32",
+            "port": {"start": arguments.port, "end": arguments.port},
+            "interface": None,
+            "application": {
+                "executable": arguments.executable,
+                "executable_file": None,
+                "command_line": None,
+                "uid": None,
+                "cgroup": None,
+                "metadata_redacted": False,
+            },
+            "origin": "manual",
+            "enabled": True,
+        }
+        print(
+            json.dumps(
+                control(
+                    {
+                        "type": "create_rule",
+                        "data": {"expected_revision": current["revision"], "rule": rule},
+                    }
+                ),
+                sort_keys=True,
+            )
+        )
+    elif arguments.command == "create-network-tcp-rule":
+        if not 1 <= arguments.port <= 65535:
+            raise RuntimeError("port is outside 1..65535")
+        current = status()
+        rule = {
+            "name": arguments.name,
+            "direction": "outbound",
+            "action": arguments.action,
+            "protocol": "tcp",
+            "peer_network": f"{arguments.address}/32",
+            "port": {"start": arguments.port, "end": arguments.port},
+            "interface": None,
+            "application": None,
+            "origin": "manual",
+            "enabled": True,
+        }
+        print(
+            json.dumps(
+                control(
+                    {
+                        "type": "create_rule",
+                        "data": {"expected_revision": current["revision"], "rule": rule},
+                    }
+                ),
+                sort_keys=True,
+            )
+        )
+    elif arguments.command == "set-named-rule-enabled":
+        matches = [
+            rule
+            for rule in all_rules()
+            if rule.get("spec", {}).get("name") == arguments.name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected one rule named {arguments.name!r}, found {len(matches)}"
+            )
+        current = status()
+        print(
+            json.dumps(
+                control(
+                    {
+                        "type": "set_rule_enabled",
+                        "data": {
+                            "expected_revision": current["revision"],
+                            "id": matches[0]["id"],
+                            "enabled": arguments.state == "enabled",
+                        },
+                    }
+                ),
+                sort_keys=True,
+            )
+        )
     return 0
 
 

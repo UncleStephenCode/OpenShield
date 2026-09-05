@@ -81,11 +81,12 @@ after and requires
 `openshield-daemon --install-fail-closed` action. The long-running daemon repeats
 the kernel `BlockAll` bootstrap before reading or activating policy. On a fresh
 installation it persists `Learning`; an existing saved mode remains unchanged.
-The saved policy is activated only after validation and a fail-closed NFQUEUE
-consumer are available.
+The saved policy is activated only after validation and both fixed NFQUEUE
+consumers are available: fail-closed queue 1337 for Enforcing and Learning
+application denies, plus immediate observational Learning queue 1338.
 
 The main process uses `Type=notify` and sends `READY=1` only after the policy,
-NFQUEUE consumer, and verified IPC sockets are active. `ExecStopPost` installs
+both NFQUEUE consumers, and verified IPC sockets are active. `ExecStopPost` installs
 kernel `BlockAll` after the main process releases its singleton lock. Graceful
 shutdown inside the daemon also installs this quarantine without changing the
 persisted mode.
@@ -168,7 +169,17 @@ Fresh state is `Learning`, but inbound traffic is default-drop in every mode.
 First activation can terminate the only SSH or VPN session. Use a local console
 or independent out-of-band access, create a narrowly scoped inbound management
 rule, verify a second session, review learned outbound rules, and only then move
-to `Enforcing`.
+to `Enforcing`. `Learning` permits unmatched locally originated outbound
+traffic while enabled explicit `drop`/`reject` rules remain active;
+successfully attributed endpoints become enabled `accept` rules. It also creates
+one disabled template with a path and, when available, cgroup per application
+group. Enabling that broad template is a root-only change and pins the executable
+version at that moment. Disabling an unchanged template restores its canonical
+unpinned skeleton, so each later enable repins the current file; edited
+non-skeleton templates retain their full specification and pin while disabled.
+In either normal mode, enabled outbound rules apply `accept`, `drop`, or
+`reject`; `enabled: false` makes any rule inert. Learning's default allow does
+not override an enabled explicit deny. Inbound rules remain accept-only.
 
 Do not run another privileged firewall manager unless chain ordering, the upper
 two packet-mark bits, and OpenShield's low 31 conntrack-mark bits have been

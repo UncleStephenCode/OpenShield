@@ -435,7 +435,8 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
         KeyCode::Right | KeyCode::Char(' ')
             if matches!(
                 form.active_field,
-                FormField::Protocol
+                FormField::Action
+                    | FormField::Protocol
                     | FormField::Application
                     | FormField::CommandMode
                     | FormField::Enabled

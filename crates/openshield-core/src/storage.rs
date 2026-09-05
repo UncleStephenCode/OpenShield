@@ -414,6 +414,86 @@ mod tests {
     }
 
     #[test]
+    fn legacy_accept_state_near_byte_limit_does_not_expand_during_upgrade()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("state.json");
+        let store = AtomicStateStore::for_owner(&path, owner(directory.path())?);
+        let executable = format!("/{}", "\"".repeat(MAX_APPLICATION_PATH_BYTES - 1));
+        let cgroup = format!("/{}", "\"".repeat(MAX_CGROUP_PATH_BYTES - 1));
+        let argument_size = MAX_COMMAND_ARGUMENT_BYTES - 1;
+        let argument_count = MAX_COMMAND_LINE_BYTES / (argument_size + 1);
+        let arguments = (0..argument_count)
+            .map(|_| CommandArgument::new("\"".repeat(argument_size)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut specification = RuleSpec::new(
+            RuleName::new("x".repeat(MAX_RULE_NAME_BYTES))?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.1/32".parse()?),
+            Some(PortRange::single(443)?),
+            Some(InterfaceName::new("abcdefghijklmno")?),
+            RuleOrigin::Manual,
+            true,
+        )?;
+        specification.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new(executable)?),
+            Some(ExecutableFileId {
+                device: 1,
+                inode: 1,
+                size: 1,
+                ctime_seconds: 1,
+                ctime_nanoseconds: 1,
+            }),
+            Some(CommandLineSelector::new(
+                CommandLineMatch::Exact,
+                arguments,
+            )?),
+            Some(1_000),
+            Some(CgroupPath::new(cgroup)?),
+        )?);
+        specification.validate()?;
+
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let mut near_limit = Vec::new();
+        for index in 0..MAX_RULES {
+            state.create_rule(specification.clone())?;
+            if index % 4 != 3 {
+                continue;
+            }
+            let candidate = serde_json::to_vec(&state)?;
+            if candidate.len() > MAX_STATE_BYTES {
+                break;
+            }
+            near_limit = candidate;
+        }
+        assert!(
+            near_limit.len() > MAX_STATE_BYTES - 512 * 1_024,
+            "legacy fixture is not close enough to the state limit: {} bytes",
+            near_limit.len()
+        );
+        assert!(
+            !near_limit
+                .windows(b"\"action\":".len())
+                .any(|window| window == b"\"action\":"),
+            "default Accept must retain the compact legacy representation"
+        );
+
+        fs::write(&path, &near_limit)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let loaded = store.load()?.ok_or("legacy state did not load")?;
+        assert!(
+            loaded
+                .rules()
+                .all(|rule| rule.spec.action == crate::RuleAction::Accept)
+        );
+        store.save(&loaded)?;
+        assert!(fs::metadata(&path)?.len() <= u64::try_from(MAX_STATE_BYTES)?);
+        Ok(())
+    }
+
+    #[test]
     fn oversized_application_state_is_rejected_by_the_semantic_invariant()
     -> Result<(), Box<dyn Error>> {
         let directory = tempdir()?;

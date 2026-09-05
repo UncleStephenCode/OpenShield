@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static void usage(const char *program) {
@@ -81,6 +82,20 @@ static int wait_for_socket(int descriptor, short events, int timeout_ms) {
     }
     errno = EIO;
     return -1;
+}
+
+static int retain_socket_for_attribution(void) {
+    struct timespec delay = {
+        .tv_sec = 1,
+        .tv_nsec = 0,
+    };
+
+    while (nanosleep(&delay, &delay) != 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int connect_with_timeout(int descriptor,
@@ -168,6 +183,10 @@ static int run_tcp(const char *address_text, unsigned long port,
         }
         goto finished;
     }
+    if (retain_socket_for_attribution() != 0) {
+        perror("tcp attribution hold");
+        goto finished;
+    }
     status = 0;
 
 finished:
@@ -223,6 +242,10 @@ static int run_udp(const char *address_text, unsigned long port,
         } else {
             fprintf(stderr, "unexpected UDP response\n");
         }
+        goto finished;
+    }
+    if (retain_socket_for_attribution() != 0) {
+        perror("udp attribution hold");
         goto finished;
     }
     if (fwrite(response, 1, (size_t)received, stdout) != (size_t)received ||

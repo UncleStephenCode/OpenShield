@@ -15,8 +15,9 @@ use nix::sys::socket::{
     socket,
 };
 use openshield_core::{
-    APPLICATION_QUEUE_NUMBER, InterfaceName, LearnedApplicationEndpoint, LearnedEndpoint, Mode,
-    TransportProtocol, application_handoff_mark, application_pending_mark,
+    APPLICATION_LEARNING_QUEUE_NUMBER, APPLICATION_QUEUE_NUMBER, InterfaceName,
+    LearnedApplicationEndpoint, LearnedEndpoint, Mode, RuleAction, TransportProtocol,
+    application_handoff_mark, application_pending_mark, application_reject_mark,
 };
 use tracing::{error, info, warn};
 
@@ -45,6 +46,7 @@ const NFQA_CFG_PARAMS: u16 = 2;
 const NFQA_CFG_QUEUE_MAXLEN: u16 = 3;
 const NFQA_CFG_MASK: u16 = 4;
 const NFQA_CFG_FLAGS: u16 = 5;
+const NFQA_CFG_F_FAIL_OPEN: u32 = 1;
 const NFQA_CFG_F_UID_GID: u32 = 1 << 3;
 const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
@@ -69,7 +71,8 @@ const MAX_PACKET_BATCH_SIZE: usize = MAX_ATTRIBUTION_BATCH_SIZE;
 
 #[derive(Debug)]
 pub struct QueueRuntime {
-    packet_thread: JoinHandle<()>,
+    packet_threads: Vec<JoinHandle<()>>,
+    attribution_thread: JoinHandle<()>,
     learning_thread: JoinHandle<()>,
     counters: Arc<NfqueueRuntimeCounters>,
 }
@@ -77,13 +80,18 @@ pub struct QueueRuntime {
 impl QueueRuntime {
     pub fn join(self) -> Result<()> {
         let Self {
-            packet_thread,
+            packet_threads,
+            attribution_thread,
             learning_thread,
             counters,
         } = self;
-        let packet = packet_thread.join();
+        let mut packet_panicked = false;
+        for packet_thread in packet_threads {
+            packet_panicked |= packet_thread.join().is_err();
+        }
+        let attribution = attribution_thread.join();
         let learning = learning_thread.join();
-        if packet.is_err() || learning.is_err() {
+        if packet_panicked || attribution.is_err() || learning.is_err() {
             counters.record_terminal_queue_error();
             bail!("application quarantine worker terminated unexpectedly");
         }
@@ -91,6 +99,7 @@ impl QueueRuntime {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn spawn(
     engine: &SharedEngine,
     shutdown: &Arc<AtomicBool>,
@@ -100,9 +109,16 @@ pub fn spawn(
         .lock()
         .map_err(|_| anyhow!("policy engine mutex is poisoned during NFQUEUE startup"))?
         .nfqueue_counters();
-    let queue = QueueSocket::open(APPLICATION_QUEUE_NUMBER)
+    // Separate fixed queues make overflow semantics a property of the policy
+    // mode without a racy userspace reconfiguration window. Enforcing only
+    // references the fail-closed queue; Learning only references the queue
+    // whose kernel overflow verdict is Accept.
+    let enforcing_queue = QueueSocket::open(APPLICATION_QUEUE_NUMBER, false)
         .context("cannot bind the fail-closed application packet queue")?;
+    let learning_queue = QueueSocket::open(APPLICATION_LEARNING_QUEUE_NUMBER, true)
+        .context("cannot bind the fail-open Learning observation queue")?;
     let (learning_sender, learning_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+    let (attribution_sender, attribution_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
     let learning_engine = Arc::clone(engine);
     let learning_shutdown = Arc::clone(shutdown);
     let learning_counters = Arc::clone(&counters);
@@ -129,42 +145,104 @@ pub fn spawn(
         })
         .context("cannot spawn bounded application-learning worker")?;
 
-    let packet_engine = Arc::clone(engine);
-    let packet_shutdown = Arc::clone(shutdown);
-    let packet_counters = Arc::clone(&counters);
-    let packet_thread = match thread::Builder::new()
-        .name("openshield-nfqueue".to_owned())
+    let attribution_engine = Arc::clone(engine);
+    let attribution_shutdown = Arc::clone(shutdown);
+    let attribution_counters = Arc::clone(&counters);
+    let attribution_learning_sender = learning_sender.clone();
+    let attribution_thread = match thread::Builder::new()
+        .name("openshield-learning-attribution".to_owned())
         .spawn(move || {
-            packet_loop(
-                queue,
-                &packet_engine,
-                &packet_shutdown,
-                &learning_sender,
-                verdict_strategy,
-                &packet_counters,
+            learning_attribution_loop(
+                &attribution_receiver,
+                &attribution_learning_sender,
+                &attribution_engine,
+                &attribution_shutdown,
+                &attribution_counters,
             );
         }) {
         Ok(thread) => thread,
         Err(error) => {
             shutdown.store(true, Ordering::Release);
+            drop(attribution_sender);
+            drop(learning_sender);
             let _ignored = learning_thread.join();
-            return Err(error).context("cannot spawn application quarantine worker");
+            return Err(error).context("cannot spawn asynchronous Learning attribution worker");
         }
     };
 
+    let mut packet_threads = Vec::with_capacity(2);
+    for (name, queue, queue_verdict_strategy, role) in [
+        (
+            "openshield-nfqueue-enforcing",
+            enforcing_queue,
+            verdict_strategy,
+            QueueRole::Enforcing,
+        ),
+        (
+            "openshield-nfqueue-learning",
+            learning_queue,
+            QueueVerdictStrategy::Accept,
+            QueueRole::Learning,
+        ),
+    ] {
+        let packet_engine = Arc::clone(engine);
+        let packet_shutdown = Arc::clone(shutdown);
+        let packet_counters = Arc::clone(&counters);
+        let packet_learning_sender = learning_sender.clone();
+        let packet_attribution_sender = attribution_sender.clone();
+        let packet_thread = thread::Builder::new().name(name.to_owned()).spawn(move || {
+            packet_loop(
+                queue,
+                &packet_engine,
+                &packet_shutdown,
+                &packet_learning_sender,
+                &packet_attribution_sender,
+                queue_verdict_strategy,
+                role,
+                &packet_counters,
+            );
+        });
+        match packet_thread {
+            Ok(thread) => packet_threads.push(thread),
+            Err(error) => {
+                shutdown.store(true, Ordering::Release);
+                for thread in packet_threads {
+                    let _ignored = thread.join();
+                }
+                drop(attribution_sender);
+                drop(learning_sender);
+                let _ignored = attribution_thread.join();
+                let _ignored = learning_thread.join();
+                return Err(error).context("cannot spawn application packet worker");
+            }
+        }
+    }
+    drop(attribution_sender);
+    drop(learning_sender);
+
     Ok(QueueRuntime {
-        packet_thread,
+        packet_threads,
+        attribution_thread,
         learning_thread,
         counters,
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueRole {
+    Enforcing,
+    Learning,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn packet_loop(
     mut queue: QueueSocket,
     engine: &SharedEngine,
     shutdown: &AtomicBool,
     learning: &SyncSender<LearningObservation>,
+    attribution: &SyncSender<LearningAttributionWork>,
     verdict_strategy: QueueVerdictStrategy,
+    role: QueueRole,
     counters: &NfqueueRuntimeCounters,
 ) {
     let resolver = ProcfsResolver::new();
@@ -175,35 +253,38 @@ fn packet_loop(
         match queue.receive(&mut receive_buffer) {
             Ok(QueueReceive::Idle) => {}
             Ok(QueueReceive::Overflow) => {
-                // The kernel has already dropped the datagrams that no longer
-                // fit the netlink socket. nftables has no queue bypass flag,
-                // so affected traffic remains fail-closed. Keep serving later
-                // packets instead of turning transient pressure into a global
-                // daemon quarantine/restart loop.
                 counters.record_queue_overflow();
-                errors.report("application packet queue overflowed; affected packets were denied");
+                errors.report(queue.overflow_message());
             }
             Ok(QueueReceive::Datagram(size)) => {
                 let mut batch = Vec::with_capacity(MAX_PACKET_BATCH_SIZE);
                 let collected = append_packet_datagram(&receive_buffer[..size], &mut batch);
                 if let Err(error) = collected {
-                    counters.record_terminal_queue_error();
-                    errors.report(&format!("invalid netfilter netlink message: {error:#}"));
-                    quarantine_engine(engine);
-                    shutdown.store(true, Ordering::Release);
+                    handle_packet_queue_failure(
+                        role,
+                        engine,
+                        shutdown,
+                        counters,
+                        &mut errors,
+                        &format!("invalid netfilter netlink message: {error:#}"),
+                    );
                     return;
                 }
                 let mut drained_datagrams = 1_usize;
-                while batch.len() < MAX_PACKET_BATCH_SIZE
+                // Enforcing amortizes the bounded procfs scan across a packet
+                // batch. Learning must return its observational verdict before
+                // doing any attribution, so do not delay the first packet to
+                // drain a continuously busy queue here; its separate worker
+                // performs batching after the verdict.
+                while role == QueueRole::Enforcing
+                    && batch.len() < MAX_PACKET_BATCH_SIZE
                     && drained_datagrams < MAX_PACKET_BATCH_SIZE
                 {
                     match queue.receive_ready(&mut receive_buffer) {
                         Ok(QueueReceive::Idle) => break,
                         Ok(QueueReceive::Overflow) => {
                             counters.record_queue_overflow();
-                            errors.report(
-                                "application packet queue overflowed; affected packets were denied",
-                            );
+                            errors.report(queue.overflow_message());
                             drained_datagrams += 1;
                         }
                         Ok(QueueReceive::Datagram(ready_size)) => {
@@ -211,68 +292,243 @@ fn packet_loop(
                             if let Err(error) =
                                 append_packet_datagram(&receive_buffer[..ready_size], &mut batch)
                             {
-                                counters.record_terminal_queue_error();
-                                errors.report(&format!(
-                                    "invalid netfilter netlink message: {error:#}"
-                                ));
-                                quarantine_engine(engine);
-                                shutdown.store(true, Ordering::Release);
+                                handle_packet_queue_failure(
+                                    role,
+                                    engine,
+                                    shutdown,
+                                    counters,
+                                    &mut errors,
+                                    &format!("invalid netfilter netlink message: {error:#}"),
+                                );
                                 return;
                             }
                         }
                         Err(error) => {
-                            counters.record_terminal_queue_error();
-                            errors.report(&format!(
-                                "application packet queue failed while forming a batch: {error:#}"
-                            ));
-                            quarantine_engine(engine);
-                            shutdown.store(true, Ordering::Release);
+                            handle_packet_queue_failure(
+                                role,
+                                engine,
+                                shutdown,
+                                counters,
+                                &mut errors,
+                                &format!(
+                                    "application packet queue failed while forming a batch: {error:#}"
+                                ),
+                            );
                             return;
                         }
                     }
                 }
 
-                let decisions = decide_packet_batch(&batch, engine, &resolver, learning);
-                for (packet, decision) in batch.into_iter().zip(decisions) {
-                    if decision.as_ref().is_err_and(is_attribution_timeout) {
-                        counters.record_attribution_timeout();
-                    }
-                    let returned = return_packet_verdict(
+                let result = match role {
+                    QueueRole::Enforcing => return_batch_verdicts(
                         &mut queue,
-                        packet.packet_id,
-                        decision,
+                        batch,
                         engine,
+                        shutdown,
+                        &resolver,
+                        learning,
+                        attribution,
                         verdict_strategy,
+                        counters,
+                        &mut errors,
+                    ),
+                    QueueRole::Learning => return_learning_batch_verdicts(
+                        &mut queue,
+                        batch,
+                        engine,
+                        shutdown,
+                        attribution,
+                        counters,
+                        &mut errors,
+                    ),
+                };
+                if let Err(error) = result {
+                    handle_packet_queue_failure(
+                        role,
+                        engine,
+                        shutdown,
+                        counters,
+                        &mut errors,
+                        &format!("cannot return packet verdict: {error:#}"),
                     );
-                    let (accepted, decision_error) = match returned {
-                        Ok(returned) => returned,
-                        Err(error) => {
-                            counters.record_terminal_queue_error();
-                            errors.report(&format!(
-                                "cannot return fail-closed packet verdict: {error:#}"
-                            ));
-                            quarantine_engine(engine);
-                            shutdown.store(true, Ordering::Release);
-                            return;
-                        }
-                    };
-                    if !accepted {
-                        counters.record_denied();
-                        if let Some(error) = decision_error {
-                            errors.report(&format!("application packet denied: {error:#}"));
-                        }
-                    }
+                    return;
                 }
             }
             Err(error) => {
-                counters.record_terminal_queue_error();
-                errors.report(&format!("application packet queue failed: {error:#}"));
-                quarantine_engine(engine);
-                shutdown.store(true, Ordering::Release);
+                handle_packet_queue_failure(
+                    role,
+                    engine,
+                    shutdown,
+                    counters,
+                    &mut errors,
+                    &format!("application packet queue failed: {error:#}"),
+                );
                 return;
             }
         }
     }
+}
+
+fn handle_packet_queue_failure(
+    role: QueueRole,
+    engine: &SharedEngine,
+    shutdown: &AtomicBool,
+    counters: &NfqueueRuntimeCounters,
+    errors: &mut ErrorThrottle,
+    message: &str,
+) {
+    counters.record_terminal_queue_error();
+    errors.report(message);
+    if role == QueueRole::Enforcing {
+        quarantine_engine(engine);
+        shutdown.store(true, Ordering::Release);
+    } else {
+        // Queue 1338 is observational and both nftables and iptables install
+        // it with kernel bypass/fail-open semantics. Dropping only this socket
+        // disables further attribution while leaving Learning traffic on the
+        // declared allow path. Enforcing queue 1337 remains fail-closed.
+        warn!(
+            "Learning observation queue stopped; outbound traffic remains allowed by kernel bypass"
+        );
+    }
+}
+
+fn return_learning_batch_verdicts(
+    queue: &mut QueueSocket,
+    batch: Vec<QueuedPacketWork>,
+    engine: &SharedEngine,
+    shutdown: &AtomicBool,
+    attribution: &SyncSender<LearningAttributionWork>,
+    counters: &NfqueueRuntimeCounters,
+    errors: &mut ErrorThrottle,
+) -> Result<()> {
+    for work in batch {
+        // Recheck only the policy identity needed to authorize the explicitly
+        // permissive Learning verdict. No packet parsing, /proc scan, or
+        // persistence operation is allowed before this sendto(2).
+        let Ok(guard) = engine.lock() else {
+            quarantine_engine(engine);
+            shutdown.store(true, Ordering::Release);
+            bail!("policy engine mutex is poisoned during Learning verdict");
+        };
+        let (mode, flow_generation) = match guard.application_decision_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(guard);
+                quarantine_engine(engine);
+                shutdown.store(true, Ordering::Release);
+                bail!(error.message);
+            }
+        };
+        if mode != Mode::Learning {
+            queue.verdict(work.packet_id, NF_DROP)?;
+            counters.record_denied();
+            continue;
+        }
+        queue.verdict(work.packet_id, NF_ACCEPT)?;
+        drop(guard);
+        enqueue_learning_attribution(work.packet, flow_generation, attribution, counters, errors);
+    }
+    Ok(())
+}
+
+fn enqueue_learning_attribution(
+    packet: std::result::Result<QueuedPacket, String>,
+    flow_generation: u32,
+    attribution: &SyncSender<LearningAttributionWork>,
+    counters: &NfqueueRuntimeCounters,
+    errors: &mut ErrorThrottle,
+) {
+    let packet = match packet {
+        Ok(packet) => packet,
+        Err(error) => {
+            errors.report(&format!(
+                "Learning admitted packet but could not parse its observation: {error}"
+            ));
+            return;
+        }
+    };
+    let observation = LearningAttributionWork {
+        flow_generation,
+        packet,
+    };
+    match attribution.try_send(observation) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            counters.record_queue_overflow();
+            errors.report("Learning admitted packet but the bounded attribution backlog was full");
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            errors.report(
+                "Learning admitted packet but the asynchronous attribution worker was unavailable",
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn return_batch_verdicts(
+    queue: &mut QueueSocket,
+    batch: Vec<QueuedPacketWork>,
+    engine: &SharedEngine,
+    shutdown: &AtomicBool,
+    resolver: &ProcfsResolver,
+    learning: &SyncSender<LearningObservation>,
+    attribution: &SyncSender<LearningAttributionWork>,
+    verdict_strategy: QueueVerdictStrategy,
+    counters: &NfqueueRuntimeCounters,
+    errors: &mut ErrorThrottle,
+) -> Result<()> {
+    let decisions = decide_packet_batch(&batch, engine, shutdown, resolver, learning);
+    for (packet, decision) in batch.into_iter().zip(decisions) {
+        let deferred_learning = decision
+            .as_ref()
+            .ok()
+            .filter(|authorization| authorization.defer_learning_attribution)
+            .map(|authorization| authorization.flow_generation);
+        let deferred_packet = deferred_learning.and_then(|_| packet.packet.as_ref().ok().cloned());
+        let attribution_timed_out = match &decision {
+            Ok(authorization) => authorization
+                .observation_error
+                .as_ref()
+                .is_some_and(is_attribution_timeout),
+            Err(error) => is_attribution_timeout(error),
+        };
+        if attribution_timed_out {
+            counters.record_attribution_timeout();
+        }
+        let (accepted, decision_error) = return_packet_verdict(
+            queue,
+            packet.packet_id,
+            decision,
+            engine,
+            shutdown,
+            verdict_strategy,
+        )?;
+        if !accepted {
+            counters.record_denied();
+        }
+        if let Some(error) = decision_error {
+            let context = if accepted {
+                "Learning admitted packet but skipped its observation"
+            } else {
+                "application packet denied"
+            };
+            errors.report(&format!("{context}: {error:#}"));
+        }
+        if accepted
+            && let (Some(flow_generation), Some(packet)) = (deferred_learning, deferred_packet)
+        {
+            enqueue_learning_attribution(
+                Ok(packet),
+                flow_generation,
+                attribution,
+                counters,
+                errors,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn return_packet_verdict(
@@ -280,6 +536,7 @@ fn return_packet_verdict(
     packet_id: u32,
     decision: Result<PacketAuthorization>,
     engine: &SharedEngine,
+    shutdown: &AtomicBool,
     verdict_strategy: QueueVerdictStrategy,
 ) -> Result<(bool, Option<anyhow::Error>)> {
     let authorization = match decision {
@@ -291,6 +548,8 @@ fn return_packet_verdict(
     };
     let Ok(guard) = engine.lock() else {
         let error = anyhow!("policy engine mutex is poisoned during decision recheck");
+        quarantine_engine(engine);
+        shutdown.store(true, Ordering::Release);
         queue.verdict(packet_id, NF_DROP)?;
         return Ok((false, Some(error)));
     };
@@ -298,13 +557,13 @@ fn return_packet_verdict(
         Ok(current) => current,
         Err(error) => {
             drop(guard);
+            quarantine_engine(engine);
+            shutdown.store(true, Ordering::Release);
             queue.verdict(packet_id, NF_DROP)?;
             return Ok((false, Some(anyhow!(error.message))));
         }
     };
-    if current_mode != authorization.mode
-        || current_flow_generation != authorization.flow_generation
-    {
+    if !authorization_remains_valid(&authorization, current_mode, current_flow_generation) {
         drop(guard);
         queue.verdict(packet_id, NF_DROP)?;
         return Ok((
@@ -320,20 +579,50 @@ fn return_packet_verdict(
     // an atomic policy reload between this final recheck and the kernel
     // authorization path. nftables continues in its later base chain after
     // NF_ACCEPT and deliberately keeps the pending mark unchanged. iptables
-    // NF_ACCEPT would terminate the filter hook, so that backend uses
-    // NF_REPEAT plus a kernel verdict mark; its first repeated filter rule
-    // consumes the handoff after mangle/OUTPUT has already sanitized SO_MARK.
-    let verdict = match verdict_strategy {
-        QueueVerdictStrategy::Accept => queue.verdict(packet_id, NF_ACCEPT),
-        QueueVerdictStrategy::RepeatWithHandoffMark => queue.verdict_with_mark(
-            packet_id,
-            NF_REPEAT,
-            application_handoff_mark(authorization.packet_mark),
-        ),
+    // queues from the last mangle/OUTPUT rule and attaches a kernel verdict
+    // mark to NF_ACCEPT; its first filter rule then consumes that mark.
+    let (verdict_code, verdict_mark) = authorization_verdict(
+        authorization.action,
+        verdict_strategy,
+        authorization.packet_mark,
+    );
+    let accepted = authorization.action == RuleAction::Accept;
+    let observation_error = authorization.observation_error;
+    let verdict = match verdict_mark {
+        Some(mark) => queue.verdict_with_mark(packet_id, verdict_code, mark),
+        None => queue.verdict(packet_id, verdict_code),
     };
     drop(guard);
     verdict?;
-    Ok((true, None))
+    Ok((accepted, observation_error))
+}
+
+fn authorization_remains_valid(
+    authorization: &PacketAuthorization,
+    current_mode: Mode,
+    current_flow_generation: u32,
+) -> bool {
+    current_mode == authorization.mode && current_flow_generation == authorization.flow_generation
+}
+
+fn authorization_verdict(
+    action: RuleAction,
+    strategy: QueueVerdictStrategy,
+    packet_mark: u32,
+) -> (u32, Option<u32>) {
+    match (action, strategy) {
+        (RuleAction::Accept, QueueVerdictStrategy::Accept) => (NF_ACCEPT, None),
+        (RuleAction::Accept, QueueVerdictStrategy::RepeatWithHandoffMark) => {
+            (NF_REPEAT, Some(application_handoff_mark(packet_mark)))
+        }
+        (RuleAction::Drop, _) => (NF_DROP, None),
+        (RuleAction::Reject, QueueVerdictStrategy::Accept) => {
+            (NF_ACCEPT, Some(application_reject_mark(packet_mark)))
+        }
+        (RuleAction::Reject, QueueVerdictStrategy::RepeatWithHandoffMark) => {
+            (NF_REPEAT, Some(application_reject_mark(packet_mark)))
+        }
+    }
 }
 
 fn append_packet_datagram(bytes: &[u8], batch: &mut Vec<QueuedPacketWork>) -> Result<()> {
@@ -359,6 +648,7 @@ fn append_packet_datagram(bytes: &[u8], batch: &mut Vec<QueuedPacketWork>) -> Re
 fn decide_packet_batch(
     batch: &[QueuedPacketWork],
     engine: &SharedEngine,
+    shutdown: &AtomicBool,
     resolver: &ProcfsResolver,
     learning: &SyncSender<LearningObservation>,
 ) -> Vec<Result<PacketAuthorization>> {
@@ -373,6 +663,8 @@ fn decide_packet_batch(
     let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            quarantine_engine(engine);
+            shutdown.store(true, Ordering::Release);
             let message = format!("{error:#}");
             return batch
                 .iter()
@@ -394,33 +686,34 @@ fn decide_packet_batch(
                 continue;
             }
         };
-        let requirements = (|| {
-            ensure!(
-                snapshot.mode != Mode::BlockAll,
-                "BlockAll denies queued traffic"
-            );
-            ensure!(
-                packet.packet_mark == application_pending_mark(packet.packet_mark),
-                "queued packet does not carry the kernel pending-mark domain"
-            );
-            match snapshot.mode {
-                Mode::BlockAll => Err(anyhow!("BlockAll denies queued traffic")),
-                Mode::Enforcing => snapshot
-                    .enforcement_capture_requirements(&packet.connection)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "no enabled application rule matches the queued network endpoint and socket UID"
-                        )
-                    }),
-                Mode::Learning => Ok(IdentityCaptureRequirements::full()),
-            }
-        })();
-        match requirements {
-            Ok(requirements) => {
+        match packet_attribution_plan(&snapshot, packet) {
+            Ok(PacketAttributionPlan::Resolve(requirements)) => {
                 request_indexes.push(index);
                 requests.push((&packet.connection, requirements));
             }
-            Err(error) => decisions[index] = Some(Err(error)),
+            Ok(PacketAttributionPlan::AcceptNetworkFallback) => {
+                decisions[index] = Some(Ok(PacketAuthorization {
+                    mode: snapshot.mode,
+                    flow_generation: snapshot.flow_generation,
+                    packet_mark: packet.packet_mark,
+                    action: RuleAction::Accept,
+                    observation_error: None,
+                    defer_learning_attribution: false,
+                }));
+            }
+            Ok(PacketAttributionPlan::AcceptAndObserveLearning) => {
+                decisions[index] = Some(Ok(PacketAuthorization {
+                    mode: snapshot.mode,
+                    flow_generation: snapshot.flow_generation,
+                    packet_mark: packet.packet_mark,
+                    action: RuleAction::Accept,
+                    observation_error: None,
+                    defer_learning_attribution: true,
+                }));
+            }
+            Err(error) => {
+                decisions[index] = Some(Err(error));
+            }
         }
     }
 
@@ -431,9 +724,9 @@ fn decide_packet_batch(
             .as_ref()
             .map_err(|error| anyhow!(error.clone()));
         decisions[index] = Some(match (packet, identity) {
-            (Ok(packet), Ok(identity)) => {
-                authorize_attributed_packet(&snapshot, packet, &identity, engine, learning)
-            }
+            (Ok(packet), Ok(identity)) => authorize_attributed_packet(
+                &snapshot, packet, &identity, engine, shutdown, learning,
+            ),
             (Err(error), _) => Err(error),
             (_, Err(error)) => Err(error.context("cannot establish race-checked process identity")),
         });
@@ -447,72 +740,271 @@ fn decide_packet_batch(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketAttributionPlan {
+    Resolve(IdentityCaptureRequirements),
+    AcceptNetworkFallback,
+    AcceptAndObserveLearning,
+}
+
+fn packet_attribution_plan(
+    snapshot: &ApplicationDecisionPolicy,
+    packet: &QueuedPacket,
+) -> Result<PacketAttributionPlan> {
+    if packet.packet_mark != application_pending_mark(packet.packet_mark) {
+        bail!("queued packet does not carry the kernel pending-mark domain");
+    }
+    match snapshot.mode {
+        Mode::BlockAll => bail!("BlockAll denies queued traffic"),
+        Mode::Learning => Ok(snapshot
+            .deny_capture_requirements(&packet.connection)
+            .map_or(PacketAttributionPlan::AcceptAndObserveLearning, |requirements| {
+                PacketAttributionPlan::Resolve(requirements)
+            })),
+        Mode::Enforcing => snapshot
+            .enforcement_capture_requirements(&packet.connection)
+            .map(PacketAttributionPlan::Resolve)
+            .or_else(|| {
+                snapshot
+                    .matching_network_accept(&packet.connection)
+                    .map(|_| PacketAttributionPlan::AcceptNetworkFallback)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "no enabled application rule or network fallback matches the queued endpoint and socket UID"
+                )
+            }),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn authorize_attributed_packet(
     snapshot: &ApplicationDecisionPolicy,
     packet: &QueuedPacket,
     identity: &openshield_core::ApplicationIdentity,
     engine: &SharedEngine,
+    shutdown: &AtomicBool,
     learning: &SyncSender<LearningObservation>,
 ) -> Result<PacketAuthorization> {
-    let accepted = match snapshot.mode {
-        Mode::BlockAll => false,
+    let action = match snapshot.mode {
+        Mode::BlockAll => bail!("BlockAll denies queued traffic"),
         Mode::Enforcing => snapshot
             .matching_rule(&packet.connection, identity)
-            .is_some(),
+            .map(|rule| rule.spec.action)
+            .ok_or_else(|| anyhow!("no enabled application rule matched"))?,
         Mode::Learning => {
-            let selector = identity
-                .learned_selector()
-                .context("cannot create a stable learned application selector")?;
-            let endpoint = LearnedEndpoint {
-                address: packet.connection.destination_address,
-                protocol: packet.connection.protocol,
-                port: packet
-                    .connection
-                    .destination_port
-                    .map(openshield_core::PortRange::single)
-                    .transpose()?,
-                interface: Some(packet.connection.output_interface.clone()),
-            };
-            let learned = LearnedApplicationEndpoint {
-                endpoint,
-                application: selector,
-            };
-            learned.validate()?;
-            let admission = engine
-                .lock()
-                .map_err(|_| anyhow!("policy engine mutex is poisoned during learning admission"))?
-                .application_learning_queue_admission(
-                    snapshot.mode,
-                    snapshot.flow_generation,
-                    &learned,
-                )
-                .map_err(|error| anyhow!(error.message))?;
-            match admission {
-                LearningQueueAdmission::Enqueue => {
-                    let observation = LearningObservation {
-                        flow_generation: snapshot.flow_generation,
-                        endpoint: learned,
-                    };
-                    match learning.try_send(observation) {
-                        Ok(()) => true,
-                        Err(TrySendError::Full(_)) => bail!("bounded learning queue is full"),
-                        Err(TrySendError::Disconnected(_)) => {
-                            bail!("application-learning worker is unavailable")
-                        }
-                    }
-                }
-                LearningQueueAdmission::AlreadyKnown
-                | LearningQueueAdmission::Saturated
-                | LearningQueueAdmission::PersistencePaused => true,
+            if let Some(rule) = snapshot.matching_deny_rule(&packet.connection, identity) {
+                return Ok(PacketAuthorization {
+                    mode: snapshot.mode,
+                    flow_generation: snapshot.flow_generation,
+                    packet_mark: packet.packet_mark,
+                    action: rule.spec.action,
+                    observation_error: None,
+                    defer_learning_attribution: false,
+                });
             }
+
+            // A different, successfully identified process may share the
+            // explicit deny's network envelope. It remains allowed and is
+            // learned from this already resolved identity. Parse, ambiguity,
+            // and attribution failures never reach this branch and remain
+            // fail-closed for the explicit deny envelope.
+            let learned = (|| -> Result<LearnedApplicationEndpoint> {
+                let selector = identity
+                    .learned_selector()
+                    .context("cannot create a stable learned application selector")?;
+                let endpoint = LearnedEndpoint {
+                    address: packet.connection.destination_address,
+                    protocol: packet.connection.protocol,
+                    port: packet
+                        .connection
+                        .destination_port
+                        .map(openshield_core::PortRange::single)
+                        .transpose()?,
+                    interface: Some(packet.connection.output_interface.clone()),
+                };
+                let learned = LearnedApplicationEndpoint {
+                    endpoint,
+                    application: selector,
+                };
+                learned.validate()?;
+                Ok(learned)
+            })();
+            let observation_error = match learned {
+                Err(error) => Some(error),
+                Ok(learned) => {
+                    let Ok(guard) = engine.lock() else {
+                        quarantine_engine(engine);
+                        shutdown.store(true, Ordering::Release);
+                        bail!("policy engine mutex is poisoned during learning admission");
+                    };
+                    let admission = guard.application_learning_queue_admission(
+                        snapshot.mode,
+                        snapshot.flow_generation,
+                        &learned,
+                    );
+                    drop(guard);
+                    let admission = match admission {
+                        Ok(admission) => admission,
+                        Err(error) if error.code == openshield_protocol::ErrorCode::Conflict => {
+                            return Ok(PacketAuthorization::learning(
+                                snapshot,
+                                packet.packet_mark,
+                                Some(anyhow!(error.message)),
+                            ));
+                        }
+                        Err(error) => {
+                            quarantine_engine(engine);
+                            shutdown.store(true, Ordering::Release);
+                            bail!(error.message);
+                        }
+                    };
+                    (|| -> Result<()> {
+                        match admission {
+                            LearningQueueAdmission::Enqueue => {
+                                let observation = LearningObservation {
+                                    flow_generation: snapshot.flow_generation,
+                                    endpoint: learned,
+                                };
+                                match learning.try_send(observation) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        bail!("bounded application-learning queue is full");
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        bail!("application-learning worker is unavailable");
+                                    }
+                                }
+                            }
+                            LearningQueueAdmission::PersistencePaused => {
+                                bail!("application learning persistence is paused");
+                            }
+                            LearningQueueAdmission::AlreadyKnown
+                            | LearningQueueAdmission::Saturated => {}
+                        }
+                        Ok(())
+                    })()
+                    .err()
+                }
+            };
+            return Ok(PacketAuthorization::learning(
+                snapshot,
+                packet.packet_mark,
+                observation_error,
+            ));
         }
     };
-    ensure!(accepted, "no enabled application rule matched");
     Ok(PacketAuthorization {
         mode: snapshot.mode,
         flow_generation: snapshot.flow_generation,
         packet_mark: packet.packet_mark,
+        action,
+        observation_error: None,
+        defer_learning_attribution: false,
     })
+}
+
+fn learning_attribution_loop(
+    receiver: &Receiver<LearningAttributionWork>,
+    learning: &SyncSender<LearningObservation>,
+    engine: &SharedEngine,
+    shutdown: &AtomicBool,
+    counters: &NfqueueRuntimeCounters,
+) {
+    let resolver = ProcfsResolver::new();
+    let mut errors = ErrorThrottle::default();
+    while !shutdown.load(Ordering::Acquire) {
+        let first = match receiver.recv_timeout(Duration::from_millis(RECEIVE_POLL_MILLIS.into())) {
+            Ok(work) => work,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let (flow_generation, batch) = collect_learning_attribution_batch(first, receiver);
+        let Ok(guard) = engine.lock() else {
+            quarantine_engine(engine);
+            shutdown.store(true, Ordering::Release);
+            return;
+        };
+        let snapshot = match guard.application_decision_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                drop(guard);
+                errors.report(&format!(
+                    "Learning attribution detected an unsafe engine state: {}",
+                    error.message
+                ));
+                quarantine_engine(engine);
+                shutdown.store(true, Ordering::Release);
+                return;
+            }
+        };
+        drop(guard);
+        if snapshot.mode != Mode::Learning || snapshot.flow_generation != flow_generation {
+            continue;
+        }
+        let requests = batch
+            .iter()
+            .map(|work| (&work.packet.connection, IdentityCaptureRequirements::full()))
+            .collect::<Vec<_>>();
+        let identities = resolver.resolve_batch_for_enforcement(&requests);
+        for (work, identity) in batch.into_iter().zip(identities) {
+            match identity {
+                Ok(identity) => {
+                    match authorize_attributed_packet(
+                        &snapshot,
+                        &work.packet,
+                        &identity,
+                        engine,
+                        shutdown,
+                        learning,
+                    ) {
+                        Ok(authorization) => {
+                            if let Some(error) = authorization.observation_error {
+                                if is_attribution_timeout(&error) {
+                                    counters.record_attribution_timeout();
+                                }
+                                errors.report(&format!(
+                                    "Learning admitted packet but skipped its observation: {error:#}"
+                                ));
+                            }
+                        }
+                        Err(error) => errors.report(&format!(
+                            "Learning observation failed after attribution: {error:#}"
+                        )),
+                    }
+                }
+                Err(error) => {
+                    if is_attribution_timeout(&error) {
+                        counters.record_attribution_timeout();
+                    }
+                    errors.report(&format!(
+                        "Learning admitted packet but attribution failed: {error:#}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn collect_learning_attribution_batch(
+    first: LearningAttributionWork,
+    receiver: &Receiver<LearningAttributionWork>,
+) -> (u32, Vec<LearningAttributionWork>) {
+    let flow_generation = first.flow_generation;
+    let mut batch = vec![first];
+    let mut drained = 1_usize;
+    while drained < MAX_ATTRIBUTION_BATCH_SIZE {
+        match receiver.try_recv() {
+            Ok(work) => {
+                drained += 1;
+                if work.flow_generation == flow_generation {
+                    batch.push(work);
+                }
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    (flow_generation, batch)
 }
 
 fn learning_loop(
@@ -613,11 +1105,42 @@ struct LearningObservation {
     endpoint: LearnedApplicationEndpoint,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct LearningAttributionWork {
+    flow_generation: u32,
+    packet: QueuedPacket,
+}
+
+#[derive(Debug)]
 struct PacketAuthorization {
     mode: Mode,
     flow_generation: u32,
     packet_mark: u32,
+    action: RuleAction,
+    /// Best-effort Learning failure retained for telemetry without changing
+    /// the explicitly permissive packet verdict.
+    observation_error: Option<anyhow::Error>,
+    /// A Learning q1337 false-positive envelope (for example a different
+    /// trusted `NFQA_UID`) is admitted immediately and attributed by the same
+    /// bounded worker as q1338 after the verdict has reached the kernel.
+    defer_learning_attribution: bool,
+}
+
+impl PacketAuthorization {
+    fn learning(
+        snapshot: &ApplicationDecisionPolicy,
+        packet_mark: u32,
+        observation_error: Option<anyhow::Error>,
+    ) -> Self {
+        Self {
+            mode: snapshot.mode,
+            flow_generation: snapshot.flow_generation,
+            packet_mark,
+            action: RuleAction::Accept,
+            observation_error,
+            defer_learning_attribution: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -656,7 +1179,13 @@ fn parse_queued_packet(payload: &[u8]) -> Result<QueuedPacket> {
     let socket_uid = uid.ok_or_else(|| anyhow!("queued packet has no kernel socket uid"))?;
     let output_index =
         output_index.ok_or_else(|| anyhow!("queued packet has no output interface"))?;
-    let packet_mark = mark.ok_or_else(|| anyhow!("queued packet has no kernel packet mark"))?;
+    // Linux omits NFQA_MARK when the packet mark is zero. Learning's
+    // observation queue deliberately does not use a private pending mark, so
+    // an absent attribute is its canonical representation rather than a
+    // malformed packet. Enforcing remains fail-closed: its attribution plan
+    // below requires the non-zero pending-mark domain before any application
+    // decision can be made.
+    let packet_mark = mark.unwrap_or_default();
     let output_interface = interface_for_index(output_index)?;
     let parsed = parse_ip_packet(packet_payload)?;
     let connection = OutboundConnection {
@@ -861,6 +1390,7 @@ fn interface_for_index(index: u32) -> Result<InterfaceName> {
 struct QueueSocket {
     socket: OwnedFd,
     queue_number: u16,
+    fail_open: bool,
     sequence: u32,
 }
 
@@ -872,7 +1402,7 @@ enum QueueReceive {
 }
 
 impl QueueSocket {
-    fn open(queue_number: u16) -> Result<Self> {
+    fn open(queue_number: u16, fail_open: bool) -> Result<Self> {
         let socket = socket(
             AddressFamily::Netlink,
             SockType::Raw,
@@ -891,11 +1421,20 @@ impl QueueSocket {
         let mut queue = Self {
             socket,
             queue_number,
+            fail_open,
             sequence: 0,
         };
         queue.configure_command(NFQNL_CFG_CMD_BIND)?;
-        queue.configure_parameters()?;
+        queue.configure_parameters(fail_open)?;
         Ok(queue)
+    }
+
+    fn overflow_message(&self) -> &'static str {
+        if self.fail_open {
+            "Learning observation queue overflowed; kernel fail-open admitted affected packets"
+        } else {
+            "application decision queue overflowed; affected Enforcing packets were denied"
+        }
     }
 
     fn configure_command(&mut self, command: u8) -> Result<()> {
@@ -903,13 +1442,14 @@ impl QueueSocket {
         self.configuration(&[(NFQA_CFG_CMD, payload.as_slice())])
     }
 
-    fn configure_parameters(&mut self) -> Result<()> {
+    fn configure_parameters(&mut self, fail_open: bool) -> Result<()> {
         let mut parameters = Vec::with_capacity(5);
         parameters.extend_from_slice(&COPY_RANGE.to_be_bytes());
         parameters.push(NFQNL_COPY_PACKET);
         let queue_length = QUEUE_MAX_LENGTH.to_be_bytes();
-        let flags = NFQA_CFG_F_UID_GID.to_be_bytes();
-        let mask = NFQA_CFG_F_UID_GID.to_be_bytes();
+        let (flags, mask) = queue_configuration_flags(fail_open);
+        let flags = flags.to_be_bytes();
+        let mask = mask.to_be_bytes();
         self.configuration(&[
             (NFQA_CFG_PARAMS, parameters.as_slice()),
             (NFQA_CFG_QUEUE_MAXLEN, queue_length.as_slice()),
@@ -1078,6 +1618,11 @@ impl QueueSocket {
     fn next_sequence(&mut self) -> u32 {
         advance_netlink_sequence(&mut self.sequence)
     }
+}
+
+const fn queue_configuration_flags(fail_open: bool) -> (u32, u32) {
+    let flags = NFQA_CFG_F_UID_GID | if fail_open { NFQA_CFG_F_FAIL_OPEN } else { 0 };
+    (flags, NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN)
 }
 
 fn validate_received_datagram_size(size: usize, capacity: usize) -> Result<usize> {
@@ -1361,10 +1906,17 @@ impl ErrorThrottle {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Arc, Mutex};
 
-    use openshield_core::{ApplicationPath, ApplicationSelector, ExecutableFileId, PortRange};
+    use openshield_core::{
+        ApplicationPath, ApplicationSelector, AtomicStateStore, Direction, ExecutableFileId,
+        PortRange, RuleName, RuleOrigin, RuleSpec, State, StateStore,
+    };
 
     use super::*;
+    use crate::backend::MemoryBackend;
+    use crate::engine::{Engine, EventBus};
 
     fn learning_observation(generation: u32, address_offset: u32) -> Result<LearningObservation> {
         Ok(LearningObservation {
@@ -1389,6 +1941,30 @@ mod tests {
                     Some(1_000),
                     None,
                 )?,
+            },
+        })
+    }
+
+    fn learning_attribution_work(
+        generation: u32,
+        address_offset: u32,
+    ) -> Result<LearningAttributionWork> {
+        Ok(LearningAttributionWork {
+            flow_generation: generation,
+            packet: QueuedPacket {
+                connection: OutboundConnection {
+                    source_address: "192.0.2.1".parse()?,
+                    source_port: Some(40_000_u16.saturating_add(u16::try_from(address_offset)?)),
+                    destination_address: std::net::Ipv4Addr::from(
+                        0xcb00_7101_u32.saturating_add(address_offset),
+                    )
+                    .into(),
+                    destination_port: Some(443),
+                    protocol: TransportProtocol::Tcp,
+                    output_interface: InterfaceName::new("eth0")?,
+                    socket_uid: 1_000,
+                },
+                packet_mark: 0,
             },
         })
     }
@@ -1435,6 +2011,201 @@ mod tests {
         let (_generation, endpoints) = collect_learning_batch(first, &receiver);
         assert_eq!(endpoints.len(), 1);
         assert!(receiver.try_recv().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn asynchronous_attribution_backlog_is_split_into_resolver_sized_batches()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+        let total = MAX_ATTRIBUTION_BATCH_SIZE + 5;
+        let first = learning_attribution_work(7, 0)?;
+        for offset in 1..total {
+            sender.try_send(learning_attribution_work(7, u32::try_from(offset)?)?)?;
+        }
+
+        let (generation, first_batch) = collect_learning_attribution_batch(first, &receiver);
+        assert_eq!(generation, 7);
+        assert_eq!(first_batch.len(), MAX_ATTRIBUTION_BATCH_SIZE);
+        let next = receiver.try_recv()?;
+        let (generation, second_batch) = collect_learning_attribution_batch(next, &receiver);
+        assert_eq!(generation, 7);
+        assert_eq!(first_batch.len() + second_batch.len(), total);
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn learning_deny_queue_drops_parse_errors_but_defers_no_candidate_observation()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let owner = std::fs::metadata(directory.path())?.uid();
+        let store = AtomicStateStore::for_owner(directory.path().join("state.json"), owner);
+        let interface = InterfaceName::new("eth0")?;
+        let mut deny = RuleSpec::new(
+            RuleName::new("uid-scoped application deny")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.7/32".parse()?),
+            Some(PortRange::single(443)?),
+            Some(interface.clone()),
+            RuleOrigin::Manual,
+            true,
+        )?;
+        deny.action = RuleAction::Drop;
+        deny.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new("/usr/bin/curl")?),
+            Some(ExecutableFileId {
+                device: 8,
+                inode: 9,
+                size: 10,
+                ctime_seconds: 11,
+                ctime_nanoseconds: 12,
+            }),
+            None,
+            Some(1_000),
+            None,
+        )?);
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        state.create_rule(deny)?;
+        store.save(&state)?;
+        let engine = Engine::load(
+            Box::new(MemoryBackend::default()),
+            Box::new(store),
+            EventBus::new(),
+        )?;
+        let (mode, _generation) = engine
+            .application_decision_identity()
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(mode, Mode::Learning);
+        let engine = Arc::new(Mutex::new(engine));
+        let resolver = ProcfsResolver::at(directory.path().join("empty-proc"));
+        let (learning_sender, receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+        let uid_mismatch = QueuedPacket {
+            connection: OutboundConnection {
+                source_address: "192.0.2.1".parse()?,
+                source_port: Some(50_000),
+                destination_address: "203.0.113.7".parse()?,
+                destination_port: Some(443),
+                protocol: TransportProtocol::Tcp,
+                output_interface: interface,
+                socket_uid: 1_001,
+            },
+            packet_mark: application_pending_mark(7),
+        };
+        let mut matching_uid = uid_mismatch.clone();
+        matching_uid.connection.socket_uid = 1_000;
+        let batch = vec![
+            QueuedPacketWork {
+                packet_id: 1,
+                packet: Err("unsupported packet shape".to_owned()),
+            },
+            QueuedPacketWork {
+                packet_id: 2,
+                packet: Ok(uid_mismatch),
+            },
+            QueuedPacketWork {
+                packet_id: 3,
+                packet: Ok(matching_uid),
+            },
+        ];
+        let shutdown = AtomicBool::new(false);
+        let decisions =
+            decide_packet_batch(&batch, &engine, &shutdown, &resolver, &learning_sender);
+        assert_eq!(decisions.len(), 3);
+        assert!(decisions[0].is_err());
+        let fallback = decisions[1]
+            .as_ref()
+            .map_err(|error| format!("{error:#}"))?;
+        assert_eq!(fallback.action, RuleAction::Accept);
+        assert!(fallback.defer_learning_attribution);
+        assert!(decisions[2].is_err());
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn queued_uid_mismatch_uses_matching_network_accept_without_procfs_attribution()
+    -> Result<(), Box<dyn Error>> {
+        let interface = InterfaceName::new("eth0")?;
+        let mut application_rule = RuleSpec::new(
+            RuleName::new("application deny")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.7/32".parse()?),
+            Some(PortRange::single(443)?),
+            Some(interface.clone()),
+            RuleOrigin::Manual,
+            true,
+        )?;
+        application_rule.action = RuleAction::Drop;
+        application_rule.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new("/usr/bin/curl")?),
+            Some(ExecutableFileId {
+                device: 8,
+                inode: 9,
+                size: 10,
+                ctime_seconds: 11,
+                ctime_nanoseconds: 12,
+            }),
+            None,
+            Some(1_000),
+            None,
+        )?);
+        let network_accept = RuleSpec::new(
+            RuleName::new("network accept")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.0/24".parse()?),
+            Some(PortRange::single(443)?),
+            Some(interface.clone()),
+            RuleOrigin::Manual,
+            true,
+        )?;
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        state.create_rule(application_rule)?;
+        state.create_rule(network_accept)?;
+
+        let directory = tempfile::tempdir()?;
+        let owner = std::fs::metadata(directory.path())?.uid();
+        let store = AtomicStateStore::for_owner(directory.path().join("state.json"), owner);
+        store.save(&state)?;
+        let engine = Arc::new(Mutex::new(Engine::load(
+            Box::new(MemoryBackend::default()),
+            Box::new(store),
+            EventBus::new(),
+        )?));
+        let packet = QueuedPacket {
+            connection: OutboundConnection {
+                source_address: "192.0.2.1".parse()?,
+                source_port: Some(50_000),
+                destination_address: "203.0.113.7".parse()?,
+                destination_port: Some(443),
+                protocol: TransportProtocol::Tcp,
+                output_interface: interface,
+                socket_uid: 1_001,
+            },
+            packet_mark: application_pending_mark(0),
+        };
+        let batch = [QueuedPacketWork {
+            packet_id: 1,
+            packet: Ok(packet),
+        }];
+        let (learning_sender, _learning_receiver) = mpsc::sync_channel(1);
+        let shutdown = AtomicBool::new(false);
+        let decisions = decide_packet_batch(
+            &batch,
+            &engine,
+            &shutdown,
+            &ProcfsResolver::at(directory.path().join("empty-proc")),
+            &learning_sender,
+        );
+        let authorization = decisions.into_iter().next().ok_or("missing decision")??;
+        assert_eq!(authorization.mode, Mode::Enforcing);
+        assert_eq!(authorization.action, RuleAction::Accept);
+        assert!(authorization.observation_error.is_none());
         Ok(())
     }
 
@@ -1612,6 +2383,40 @@ mod tests {
     }
 
     #[test]
+    fn learning_packet_without_nfqa_mark_parses_as_unmarked() -> Result<(), Box<dyn Error>> {
+        let mut packet = vec![0_u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[203, 0, 113, 7]);
+        packet[20..22].copy_from_slice(&50_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        let uid = 1_000_u32.to_be_bytes();
+        let output_index = nix::net::if_::if_nametoindex("lo")?.to_be_bytes();
+        let message = build_message(
+            queue_message_type(NFQNL_MSG_PACKET),
+            0,
+            1,
+            NFNETLINK_FAMILY_UNSPEC,
+            APPLICATION_LEARNING_QUEUE_NUMBER,
+            &[
+                (NFQA_PAYLOAD, packet.as_slice()),
+                (NFQA_UID, uid.as_slice()),
+                (NFQA_IFINDEX_OUTDEV, output_index.as_slice()),
+            ],
+        )?;
+        let payload = NetlinkMessages::new(&message)
+            .next()
+            .ok_or("missing packet message")??
+            .payload;
+        let queued = parse_queued_packet(payload)?;
+        assert_eq!(queued.packet_mark, 0);
+        assert_eq!(queued.connection.socket_uid, 1_000);
+        assert_eq!(queued.connection.output_interface.as_str(), "lo");
+        Ok(())
+    }
+
+    #[test]
     fn parses_only_attributable_icmp_echo_identifiers() -> Result<(), Box<dyn Error>> {
         let mut packet = vec![0_u8; 28];
         packet[0] = 0x45;
@@ -1674,9 +2479,9 @@ mod tests {
     }
 
     #[test]
-    fn iptables_repeat_verdict_carries_the_handoff_mark() -> Result<(), Box<dyn Error>> {
+    fn iptables_accept_verdict_carries_the_handoff_mark() -> Result<(), Box<dyn Error>> {
         let mark = application_handoff_mark(0x0012_3456);
-        let message = build_verdict_message(1, APPLICATION_QUEUE_NUMBER, 7, NF_REPEAT, Some(mark))?;
+        let message = build_verdict_message(1, APPLICATION_QUEUE_NUMBER, 7, NF_ACCEPT, Some(mark))?;
         let netlink = NetlinkMessages::new(&message)
             .next()
             .ok_or("missing verdict message")??;
@@ -1686,7 +2491,7 @@ mod tests {
             .iter()
             .find(|attribute| attribute.kind == NFQA_VERDICT_HDR)
             .ok_or("missing verdict header")?;
-        assert_eq!(network_u32(&header.payload[..4])?, NF_REPEAT);
+        assert_eq!(network_u32(&header.payload[..4])?, NF_ACCEPT);
         assert_eq!(network_u32(&header.payload[4..])?, 7);
         let returned_mark = attributes
             .iter()
@@ -1694,6 +2499,98 @@ mod tests {
             .ok_or("missing verdict mark")?;
         assert_eq!(network_u32(returned_mark.payload)?, mark);
         Ok(())
+    }
+
+    #[test]
+    fn application_actions_map_to_backend_safe_nfqueue_verdicts() {
+        let original_mark = 0x0012_3456;
+        assert_eq!(
+            authorization_verdict(
+                RuleAction::Accept,
+                QueueVerdictStrategy::Accept,
+                original_mark
+            ),
+            (NF_ACCEPT, None)
+        );
+        assert_eq!(
+            authorization_verdict(
+                RuleAction::Accept,
+                QueueVerdictStrategy::RepeatWithHandoffMark,
+                original_mark
+            ),
+            (NF_REPEAT, Some(application_handoff_mark(original_mark)))
+        );
+        for strategy in [
+            QueueVerdictStrategy::Accept,
+            QueueVerdictStrategy::RepeatWithHandoffMark,
+        ] {
+            assert_eq!(
+                authorization_verdict(RuleAction::Drop, strategy, original_mark),
+                (NF_DROP, None)
+            );
+        }
+        assert_eq!(
+            authorization_verdict(
+                RuleAction::Reject,
+                QueueVerdictStrategy::Accept,
+                original_mark
+            ),
+            (NF_ACCEPT, Some(application_reject_mark(original_mark)))
+        );
+        assert_eq!(
+            authorization_verdict(
+                RuleAction::Reject,
+                QueueVerdictStrategy::RepeatWithHandoffMark,
+                original_mark
+            ),
+            (NF_REPEAT, Some(application_reject_mark(original_mark)))
+        );
+    }
+
+    #[test]
+    fn queued_decisions_require_an_exact_mode_and_generation_recheck() {
+        let learning = PacketAuthorization {
+            mode: Mode::Learning,
+            flow_generation: 7,
+            packet_mark: application_pending_mark(0),
+            action: RuleAction::Accept,
+            observation_error: None,
+            defer_learning_attribution: false,
+        };
+        assert!(authorization_remains_valid(&learning, Mode::Learning, 7));
+        assert!(!authorization_remains_valid(&learning, Mode::Learning, 8));
+        assert!(!authorization_remains_valid(&learning, Mode::Enforcing, 8));
+        assert!(!authorization_remains_valid(&learning, Mode::BlockAll, 8));
+
+        let enforcing = PacketAuthorization {
+            mode: Mode::Enforcing,
+            flow_generation: 8,
+            packet_mark: application_pending_mark(0),
+            action: RuleAction::Accept,
+            observation_error: None,
+            defer_learning_attribution: false,
+        };
+        assert!(authorization_remains_valid(&enforcing, Mode::Enforcing, 8));
+        assert!(!authorization_remains_valid(&enforcing, Mode::Enforcing, 9));
+    }
+
+    #[test]
+    fn only_learning_queue_enables_kernel_overflow_acceptance() {
+        assert_eq!(
+            queue_configuration_flags(false),
+            (
+                NFQA_CFG_F_UID_GID,
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN
+            )
+        );
+        assert_eq!(
+            queue_configuration_flags(true),
+            (
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN,
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN
+            )
+        );
+        assert_ne!(APPLICATION_QUEUE_NUMBER, APPLICATION_LEARNING_QUEUE_NUMBER);
     }
 
     #[test]

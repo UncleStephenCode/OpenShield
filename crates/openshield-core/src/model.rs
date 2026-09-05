@@ -56,6 +56,34 @@ impl fmt::Display for TransportProtocol {
 pub enum RuleOrigin {
     Manual,
     Learned,
+    /// Disabled application-wide rule skeleton created by automatic learning.
+    Template,
+}
+
+/// Verdict applied when an enabled rule matches.
+///
+/// Rule activation is intentionally represented by [`RuleSpec::enabled`]
+/// rather than by another action variant: a disabled reject rule, for
+/// example, is inert instead of becoming an implicit accept rule.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum RuleAction {
+    /// Permit the matching traffic.
+    #[default]
+    Accept,
+    /// Silently discard the matching packet.
+    Drop,
+    /// Refuse the matching traffic with the backend's native reject verdict.
+    Reject,
+}
+
+impl RuleAction {
+    // serde's `skip_serializing_if` callback ABI always borrows the field,
+    // including Copy types.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_accept(action: &Self) -> bool {
+        matches!(action, Self::Accept)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -228,6 +256,13 @@ impl<'de> Deserialize<'de> for PortRange {
 pub struct RuleSpec {
     pub name: RuleName,
     pub direction: Direction,
+    /// Verdict and activation are independent policy dimensions.
+    // Accept is the wire default and is omitted deliberately. Besides keeping
+    // existing clients compatible with ordinary allow rules, this prevents a
+    // valid legacy state near the fixed persistence ceiling from expanding
+    // beyond that ceiling solely because v0.2.1 introduced this field.
+    #[serde(skip_serializing_if = "RuleAction::is_accept")]
+    pub action: RuleAction,
     pub protocol: TransportProtocol,
     pub peer_network: Option<IpNet>,
     pub port: Option<PortRange>,
@@ -240,7 +275,7 @@ pub struct RuleSpec {
 }
 
 impl RuleSpec {
-    /// Constructs and validates all selectors for an allow rule.
+    /// Constructs and validates all selectors for an Accept rule.
     ///
     /// # Errors
     ///
@@ -260,6 +295,7 @@ impl RuleSpec {
         let spec = Self {
             name,
             direction,
+            action: RuleAction::Accept,
             protocol,
             peer_network,
             port,
@@ -279,6 +315,9 @@ impl RuleSpec {
     /// Returns [`ValidationError`] for incompatible selector combinations or
     /// a completely unrestricted any-protocol rule.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.direction == Direction::Inbound && self.action != RuleAction::Accept {
+            return Err(ValidationError::DenyActionOnInboundRule);
+        }
         if self.protocol == TransportProtocol::Any
             && self.peer_network.is_none()
             && self.port.is_none()
@@ -322,6 +361,8 @@ impl<'de> Deserialize<'de> for RuleSpec {
         struct WireRuleSpec {
             name: RuleName,
             direction: Direction,
+            #[serde(default)]
+            action: RuleAction,
             protocol: TransportProtocol,
             peer_network: Option<IpNet>,
             port: Option<PortRange>,
@@ -336,6 +377,7 @@ impl<'de> Deserialize<'de> for RuleSpec {
         let specification = Self {
             name: wire.name,
             direction: wire.direction,
+            action: wire.action,
             protocol: wire.protocol,
             peer_network: wire.peer_network,
             port: wire.port,
@@ -502,6 +544,8 @@ pub enum ValidationError {
     UnrestrictedRule,
     #[error("application selectors are valid only for outbound rules")]
     ApplicationSelectorOnInboundRule,
+    #[error("drop and reject actions are valid only for outbound rules")]
+    DenyActionOnInboundRule,
     #[error(transparent)]
     InvalidApplicationSelector(#[from] crate::ApplicationValidationError),
     #[error("rule id must not be nil")]
@@ -577,6 +621,61 @@ mod tests {
             "enabled":true
         }"#;
         assert!(serde_json::from_str::<RuleSpec>(json).is_err());
+    }
+
+    #[test]
+    fn legacy_rule_without_action_migrates_to_accept() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{
+            "name":"legacy https",
+            "direction":"outbound",
+            "protocol":"tcp",
+            "peer_network":"203.0.113.7/32",
+            "port":{"start":443,"end":443},
+            "interface":null,
+            "origin":"manual",
+            "enabled":true
+        }"#;
+        let specification = serde_json::from_str::<RuleSpec>(json)?;
+        assert_eq!(specification.action, RuleAction::Accept);
+        assert!(
+            serde_json::to_value(&specification)?
+                .get("action")
+                .is_none()
+        );
+
+        let mut deny = specification;
+        deny.action = RuleAction::Drop;
+        assert_eq!(
+            serde_json::to_value(&deny)?["action"],
+            serde_json::Value::String("drop".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_actions_are_typed_but_inbound_denies_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbound = RuleSpec::new(
+            RuleName::new("deny https")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.7/32".parse()?),
+            Some(PortRange::single(443)?),
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?;
+        for action in [RuleAction::Accept, RuleAction::Drop, RuleAction::Reject] {
+            outbound.action = action;
+            outbound.validate()?;
+        }
+
+        outbound.direction = Direction::Inbound;
+        assert_eq!(
+            outbound.validate(),
+            Err(ValidationError::DenyActionOnInboundRule)
+        );
+        Ok(())
     }
 
     #[test]

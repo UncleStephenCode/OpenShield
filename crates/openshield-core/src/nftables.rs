@@ -2,8 +2,8 @@ use ipnet::IpNet;
 use thiserror::Error;
 
 use crate::{
-    ApplicationInterception, CoreError, Direction, MAX_FLOW_GENERATION, Mode, Rule, Snapshot,
-    TransportProtocol,
+    ApplicationInterception, CoreError, Direction, MAX_FLOW_GENERATION, Mode, Rule, RuleAction,
+    Snapshot, TransportProtocol,
 };
 
 pub const TABLE_NAME: &str = "openshield";
@@ -19,12 +19,16 @@ pub const COUNTER_DROPPED_IN: &str = "dropped_in";
 pub const COUNTER_DROPPED_OUT: &str = "dropped_out";
 pub const COUNTER_LEARNED_OUT: &str = "learned_out";
 pub const NFT_OWNERSHIP_COUNTER: &str = "openshield_owner_v1";
+/// Fail-closed queue used only by Enforcing application decisions.
 pub const APPLICATION_QUEUE_NUMBER: u16 = 1_337;
+/// Overflow-bypassing observational queue used only by Learning.
+pub const APPLICATION_LEARNING_QUEUE_NUMBER: u16 = 1_338;
 const APPLICATION_MARK_GENERATION_MASK: u32 = MAX_FLOW_GENERATION;
 const APPLICATION_MARK_DOMAIN_MASK: u32 = 0xc000_0000;
 const APPLICATION_MARK_PAYLOAD_MASK: u32 = 0x3fff_ffff;
 const APPLICATION_PENDING_DOMAIN: u32 = 0x8000_0000;
 const APPLICATION_HANDOFF_DOMAIN: u32 = 0xc000_0000;
+const APPLICATION_REJECT_DOMAIN: u32 = 0x4000_0000;
 const APPLICATION_FLOW_DOMAIN: u32 = 0x4000_0000;
 // OpenShield owns the low 31 connmark bits. Keep bit 31 available to an
 // existing host firewall and mask it out of every generation comparison.
@@ -53,6 +57,12 @@ pub const fn application_pending_mark(packet_mark: u32) -> u32 {
 #[must_use]
 pub const fn application_handoff_mark(packet_mark: u32) -> u32 {
     APPLICATION_HANDOFF_DOMAIN | (packet_mark & APPLICATION_MARK_PAYLOAD_MASK)
+}
+
+/// Adds the private application-reject domain while retaining unreserved bits.
+#[must_use]
+pub const fn application_reject_mark(packet_mark: u32) -> u32 {
+    APPLICATION_REJECT_DOMAIN | (packet_mark & APPLICATION_MARK_PAYLOAD_MASK)
 }
 
 /// Conntrack mark that binds both directions of an authorized application flow.
@@ -160,6 +170,7 @@ fn append_named_counters(script: &mut String) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn append_chain(
     script: &mut String,
     snapshot: &Snapshot,
@@ -182,9 +193,51 @@ fn append_chain(
     };
 
     if snapshot.mode != Mode::BlockAll {
-        script.push_str("    ct state invalid counter name ");
-        script.push_str(dropped_counter);
-        script.push_str(" drop\n");
+        if has_enabled_outbound_reject(snapshot) {
+            append_generated_reject_reply_accept(
+                script,
+                direction,
+                accepted_counter,
+                application_reject_connmark(snapshot.flow_generation),
+            );
+        }
+
+        // Learning is an explicit allow-all policy for locally originated
+        // traffic. It must not turn conntrack's INVALID classification into
+        // an outbound deny. Inbound INVALID packets remain denied.
+        if direction == Direction::Inbound {
+            append_dhcp_bootstrap_accepts(script, accepted_counter);
+        }
+        if direction == Direction::Inbound || snapshot.mode == Mode::Enforcing {
+            script.push_str("    ct state invalid counter name ");
+            script.push_str(dropped_counter);
+            script.push_str(" drop\n");
+        }
+        if direction == Direction::Inbound {
+            append_ipv6_host_control_plane_accepts(script, accepted_counter);
+        }
+
+        // Network deny rules run before the application fast path, so an old
+        // authorized conntrack generation cannot bypass a newly enabled deny.
+        if direction == Direction::Outbound {
+            append_direct_rules(
+                script,
+                snapshot,
+                direction,
+                &[RuleAction::Drop, RuleAction::Reject],
+                dropped_counter,
+            );
+        }
+
+        // If the queue consumer is absent in Learning, queue bypass admits the
+        // outbound packet without adding a generation mark. Replies to that
+        // locally initiated conntrack flow must still work; NEW inbound flows
+        // continue to the default-drop path.
+        if direction == Direction::Inbound && snapshot.mode == Mode::Learning {
+            script.push_str("    ct direction reply ct state established,related counter name ");
+            script.push_str(accepted_counter);
+            script.push_str(" accept\n");
+        }
 
         if interception != ApplicationInterception::None {
             append_application_flow_accept(
@@ -201,40 +254,85 @@ fn append_chain(
             }
         }
 
-        let mut direct_rules: Vec<&Rule> = snapshot
-            .rules
-            .iter()
-            .filter(|rule| {
-                rule.spec.enabled
-                    && rule.spec.direction == direction
-                    && rule.spec.application.is_none()
-            })
-            .collect();
-        direct_rules.sort_unstable_by_key(|rule| rule.id);
-        for rule in direct_rules {
-            append_allow_rule(script, rule, direction, false, accepted_counter);
+        // Replies to explicitly accepted inbound connections are not new
+        // application-originated flows and retain their stateful allow path.
+        if direction == Direction::Outbound {
+            append_reverse_rules(script, snapshot, direction, accepted_counter);
         }
 
-        // Replies are accepted only when they belong to a connection covered
-        // by an enabled rule in the opposite direction.  A blanket conntrack
-        // accept would keep traffic alive after its allow rule was removed and
-        // would carry unpersisted Learning flows into Enforcing mode.
-        let mut reverse_rules: Vec<&Rule> = snapshot
-            .rules
-            .iter()
-            .filter(|rule| {
-                rule.spec.enabled
-                    && rule.spec.direction != direction
-                    && rule.spec.application.is_none()
-            })
-            .collect();
-        reverse_rules.sort_unstable_by_key(|rule| rule.id);
-        for rule in reverse_rules {
-            append_allow_rule(script, rule, direction, true, accepted_counter);
+        if direction == Direction::Outbound && snapshot.mode == Mode::Enforcing {
+            // An application deny whose network envelope overlaps a broad
+            // network accept must reach userspace first. Only packets outside
+            // every enabled application envelope reach direct network accepts.
+            append_application_rule_queues(
+                script,
+                snapshot,
+                &[RuleAction::Drop, RuleAction::Reject, RuleAction::Accept],
+            );
+            append_application_candidate_guard_drops(
+                script,
+                snapshot,
+                dropped_counter,
+                &[RuleAction::Drop, RuleAction::Reject, RuleAction::Accept],
+            );
+            append_direct_rules(
+                script,
+                snapshot,
+                direction,
+                &[RuleAction::Accept],
+                accepted_counter,
+            );
+        } else if direction == Direction::Outbound && snapshot.mode == Mode::Learning {
+            // Explicit application denies use the fail-closed enforcement
+            // queue even in Learning. The generic observational queue below
+            // therefore remains a pure immediate-accept path.
+            append_application_rule_queues(
+                script,
+                snapshot,
+                &[RuleAction::Drop, RuleAction::Reject],
+            );
+            append_application_candidate_guard_drops(
+                script,
+                snapshot,
+                dropped_counter,
+                &[RuleAction::Drop, RuleAction::Reject],
+            );
+            append_direct_rules(
+                script,
+                snapshot,
+                direction,
+                &[RuleAction::Accept],
+                accepted_counter,
+            );
+        } else {
+            append_direct_rules(
+                script,
+                snapshot,
+                direction,
+                &[RuleAction::Accept],
+                accepted_counter,
+            );
         }
 
-        if interception != ApplicationInterception::None && direction == Direction::Outbound {
-            append_application_queue(script, interception);
+        // Outside Learning, replies are accepted only for an explicit Accept
+        // in the opposite direction. A deny rule can never create a reverse
+        // allow path.
+        if direction == Direction::Inbound {
+            append_reverse_rules(script, snapshot, direction, accepted_counter);
+        }
+
+        if interception != ApplicationInterception::None
+            && direction == Direction::Outbound
+            && snapshot.mode == Mode::Learning
+        {
+            append_learning_queue(script);
+            // NOTRACK, reply-direction, and other ct-less local traffic does
+            // not match the observational queue. Learning is still an
+            // explicit outbound allow-all mode, so accept it here and in the
+            // later base chain instead of reaching either terminal drop.
+            script.push_str("    counter name ");
+            script.push_str(accepted_counter);
+            script.push_str(" accept\n");
         }
     }
 
@@ -242,6 +340,156 @@ fn append_chain(
     script.push_str(dropped_counter);
     script.push_str(" drop\n");
     script.push_str("  }\n");
+}
+
+fn append_ipv6_host_control_plane_accepts(script: &mut String, accepted_counter: &str) {
+    // RFC 4890 host policy: admit only ICMPv6 errors required for PMTU and
+    // reachability, and the exact local-link control messages required by an
+    // IPv6 host. Router-only RS/Redirect and inbound MLD reports remain denied.
+    for selector in [
+        "ct state related meta nfproto ipv6 ip6 saddr != :: ip6 saddr != ff00::/8 meta l4proto icmpv6 icmpv6 type 1",
+        "ct state related meta nfproto ipv6 ip6 saddr != :: ip6 saddr != ff00::/8 meta l4proto icmpv6 icmpv6 type 2 icmpv6 code 0",
+        "ct state related meta nfproto ipv6 ip6 saddr != :: ip6 saddr != ff00::/8 meta l4proto icmpv6 icmpv6 type 3 icmpv6 code 0",
+        "ct state related meta nfproto ipv6 ip6 saddr != :: ip6 saddr != ff00::/8 meta l4proto icmpv6 icmpv6 type 4 icmpv6 code 1",
+        "ct state related meta nfproto ipv6 ip6 saddr != :: ip6 saddr != ff00::/8 meta l4proto icmpv6 icmpv6 type 4 icmpv6 code 2",
+        "meta nfproto ipv6 ip6 saddr fe80::/10 ip6 hoplimit 255 meta l4proto icmpv6 icmpv6 type 134 icmpv6 code 0",
+        "meta nfproto ipv6 ip6 saddr != ff00::/8 ip6 hoplimit 255 meta l4proto icmpv6 icmpv6 type 135 icmpv6 code 0",
+        "meta nfproto ipv6 ip6 saddr != :: ip6 saddr != ff00::/8 ip6 hoplimit 255 meta l4proto icmpv6 icmpv6 type 136 icmpv6 code 0",
+        "meta nfproto ipv6 ip6 saddr fe80::/10 ip6 daddr ff02::/16 ip6 hoplimit 1 meta l4proto icmpv6 icmpv6 type 130 icmpv6 code 0",
+    ] {
+        script.push_str("    ");
+        script.push_str(selector);
+        script.push_str(" counter name ");
+        script.push_str(accepted_counter);
+        script.push_str(" accept\n");
+    }
+}
+
+fn append_dhcp_bootstrap_accepts(script: &mut String, accepted_counter: &str) {
+    // Bootstrap replies may not share the multicast/broadcast request tuple
+    // and can therefore be classified NEW or INVALID. Keep these exceptions
+    // before the generic INVALID drop and constrain them to exact client
+    // reply ports plus the protocol-mandated source/destination scope.
+    for selector in [
+        "meta nfproto ipv6 ip6 saddr fe80::/10 meta l4proto udp udp sport 547 udp dport 546",
+        "meta nfproto ipv4 ip daddr 255.255.255.255 meta l4proto udp udp sport 67 udp dport 68",
+    ] {
+        script.push_str("    ");
+        script.push_str(selector);
+        script.push_str(" counter name ");
+        script.push_str(accepted_counter);
+        script.push_str(" accept\n");
+    }
+}
+
+fn append_generated_reject_reply_accept(
+    script: &mut String,
+    direction: Direction,
+    accepted_counter: &str,
+    reject_connmark: u32,
+) {
+    for selector in [
+        "ct state related ct direction reply meta l4proto tcp tcp flags & rst == rst",
+        "ct state related ct direction reply meta nfproto ipv4 meta l4proto icmp icmp type destination-unreachable icmp code port-unreachable",
+        "ct state related ct direction reply meta nfproto ipv6 meta l4proto icmpv6 icmpv6 type destination-unreachable icmpv6 code port-unreachable",
+    ] {
+        script.push_str("    ");
+        script.push_str(selector);
+        script.push_str(" ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_MASK);
+        script.push_str(" == 0x");
+        append_hex_u32(script, reject_connmark);
+        if direction == Direction::Outbound {
+            script.push(' ');
+            append_packet_mark_domain_set(script, APPLICATION_HANDOFF_DOMAIN);
+        }
+        script.push_str(" counter name ");
+        script.push_str(accepted_counter);
+        script.push_str(" accept\n");
+    }
+}
+
+const fn application_reject_connmark(flow_generation: u32) -> u32 {
+    flow_generation & APPLICATION_MARK_GENERATION_MASK
+}
+
+fn has_enabled_outbound_reject(snapshot: &Snapshot) -> bool {
+    snapshot.rules.iter().any(|rule| {
+        rule.spec.enabled
+            && rule.spec.direction == Direction::Outbound
+            && rule.spec.action == RuleAction::Reject
+    })
+}
+
+fn append_direct_rules(
+    script: &mut String,
+    snapshot: &Snapshot,
+    direction: Direction,
+    actions: &[RuleAction],
+    counter: &str,
+) {
+    let mut rules: Vec<&Rule> = snapshot
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.spec.enabled
+                && rule.spec.direction == direction
+                && rule.spec.application.is_none()
+                && actions.contains(&rule.spec.action)
+        })
+        .collect();
+    rules.sort_unstable_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id));
+    for rule in rules {
+        append_rule_verdict(
+            script,
+            rule,
+            direction,
+            false,
+            counter,
+            rule.spec.action,
+            snapshot.mode != Mode::Learning,
+            application_reject_connmark(snapshot.flow_generation),
+        );
+    }
+}
+
+fn append_reverse_rules(
+    script: &mut String,
+    snapshot: &Snapshot,
+    direction: Direction,
+    accepted_counter: &str,
+) {
+    let mut rules: Vec<&Rule> = snapshot
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.spec.enabled
+                && rule.spec.direction != direction
+                && rule.spec.application.is_none()
+                && rule.spec.action == RuleAction::Accept
+        })
+        .collect();
+    rules.sort_unstable_by_key(|rule| rule.id);
+    for rule in rules {
+        append_rule_verdict(
+            script,
+            rule,
+            direction,
+            true,
+            accepted_counter,
+            RuleAction::Accept,
+            snapshot.mode != Mode::Learning,
+            application_reject_connmark(snapshot.flow_generation),
+        );
+    }
+}
+
+const fn rule_action_priority(action: RuleAction) -> u8 {
+    match action {
+        RuleAction::Drop => 0,
+        RuleAction::Reject => 1,
+        RuleAction::Accept => 2,
+    }
 }
 
 fn append_application_flow_accept(
@@ -298,21 +546,129 @@ fn append_application_non_tcp_connmark_reset(script: &mut String) {
     }
 }
 
-fn append_application_queue(script: &mut String, interception: ApplicationInterception) {
-    // There is deliberately no `bypass` flag: if the authenticated queue
-    // consumer is absent or overloaded, application-scoped traffic fails
-    // closed in the kernel.
-    match interception {
-        ApplicationInterception::None => return,
-        ApplicationInterception::TcpInitial => {
-            script.push_str("    ct direction original meta l4proto tcp ");
-        }
-        ApplicationInterception::PerPacket => script.push_str("    ct direction original "),
+fn append_learning_queue(script: &mut String) {
+    for selector in [
+        "meta l4proto tcp ct state new tcp flags & (syn | ack) == syn",
+        "meta l4proto != tcp",
+    ] {
+        script.push_str("    ct direction original ");
+        script.push_str(selector);
+        // Count packets offered to Learning observation, independently of
+        // whether userspace attributes/persists them or the queue bypasses.
+        script.push_str(" counter name ");
+        script.push_str(COUNTER_LEARNED_OUT);
+        script.push_str(" queue num ");
+        script.push_str(&APPLICATION_LEARNING_QUEUE_NUMBER.to_string());
+        // `bypass` is the portable nftables 1.0.x rule-language spelling.
+        script.push_str(" bypass\n");
     }
-    append_packet_mark_domain_set(script, APPLICATION_PENDING_DOMAIN);
-    script.push_str(" queue num ");
-    script.push_str(&APPLICATION_QUEUE_NUMBER.to_string());
-    script.push('\n');
+}
+
+fn append_application_rule_queues(
+    script: &mut String,
+    snapshot: &Snapshot,
+    actions: &[RuleAction],
+) {
+    let mut rules: Vec<&Rule> = snapshot
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.spec.enabled
+                && rule.spec.direction == Direction::Outbound
+                && rule.spec.application.is_some()
+                && actions.contains(&rule.spec.action)
+        })
+        .collect();
+    rules.sort_unstable_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id));
+    for rule in rules {
+        script.push_str("    ct direction original ");
+        append_rule_selectors(script, rule, Direction::Outbound, false);
+        append_packet_mark_domain_set(script, APPLICATION_PENDING_DOMAIN);
+        script.push_str(" queue num ");
+        script.push_str(&APPLICATION_QUEUE_NUMBER.to_string());
+        // Enforcing deliberately has no bypass: an absent/overloaded consumer
+        // cannot turn an application constraint into an allow.
+        script.push('\n');
+    }
+}
+
+fn append_application_candidate_guard_drops(
+    script: &mut String,
+    snapshot: &Snapshot,
+    dropped_counter: &str,
+    actions: &[RuleAction],
+) {
+    let mut rules: Vec<&Rule> = snapshot
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.spec.enabled
+                && rule.spec.direction == Direction::Outbound
+                && rule.spec.application.is_some()
+                && actions.contains(&rule.spec.action)
+        })
+        .collect();
+    rules.sort_unstable_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id));
+    for rule in rules {
+        // A successful nft queue verdict terminates this base-chain traversal
+        // and resumes at the later authorization chain. Repeating the network
+        // envelope here therefore catches only candidates which could not be
+        // queued (notably UNTRACKED traffic) before a broad network accept.
+        script.push_str("    ");
+        append_rule_selectors(script, rule, Direction::Outbound, false);
+        script.push_str("counter name ");
+        script.push_str(dropped_counter);
+        script.push_str(" drop\n");
+
+        if rule.spec.peer_network.is_none() && rule.spec.port.is_none() {
+            continue;
+        }
+        // The ordinary selector above is evaluated after local DNAT. Also
+        // guard the conntrack original destination/port, while retaining the
+        // final output-interface constraint after rerouting.
+        script.push_str("    ");
+        if let Some(interface) = &rule.spec.interface {
+            script.push_str("oifname \"");
+            script.push_str(interface.as_str());
+            script.push_str("\" ");
+        }
+        match rule.spec.protocol {
+            TransportProtocol::Any => {}
+            TransportProtocol::Tcp => script.push_str("meta l4proto tcp "),
+            TransportProtocol::Udp => script.push_str("meta l4proto udp "),
+            TransportProtocol::Icmp => {
+                script.push_str("meta nfproto ipv4 meta l4proto icmp ");
+            }
+            TransportProtocol::IcmpV6 => {
+                script.push_str("meta nfproto ipv6 meta l4proto icmpv6 ");
+            }
+        }
+        if let Some(network) = rule.spec.peer_network {
+            match network {
+                IpNet::V4(network) => {
+                    script.push_str("ct original ip daddr ");
+                    script.push_str(&network.to_string());
+                }
+                IpNet::V6(network) => {
+                    script.push_str("ct original ip6 daddr ");
+                    script.push_str(&network.to_string());
+                }
+            }
+            script.push(' ');
+        }
+        if let Some(port) = rule.spec.port {
+            script.push_str("ct original proto-dst ");
+            script.push_str(&port.start().to_string());
+            if port.end() != port.start() {
+                script.push('-');
+                script.push_str(&port.end().to_string());
+            }
+            script.push(' ');
+        }
+        script.push_str("counter name ");
+        script.push_str(dropped_counter);
+        script.push_str(" drop\n");
+    }
 }
 
 fn append_application_mark_sanitization_chain(script: &mut String) {
@@ -349,6 +705,7 @@ fn append_application_authorization_chain(
     interception: ApplicationInterception,
 ) {
     let flow = application_flow_mark(snapshot.flow_generation);
+    let reject_connmark = application_reject_connmark(snapshot.flow_generation);
     script.push_str(
         "  chain output_authorize {\n    type filter hook output priority 1; policy drop;\n",
     );
@@ -358,6 +715,30 @@ fn append_application_authorization_chain(
         ApplicationInterception::PerPacket => &APPLICATION_REPLY_PROTOCOL_MATCHES,
     };
     if interception != ApplicationInterception::None {
+        script.push_str("    meta l4proto tcp meta mark & 0x");
+        append_hex_u32(script, APPLICATION_MARK_DOMAIN_MASK);
+        script.push_str(" == 0x");
+        append_hex_u32(script, APPLICATION_REJECT_DOMAIN);
+        script.push_str(" ct mark set (ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_FOREIGN_MASK);
+        script.push_str(") | 0x");
+        append_hex_u32(script, reject_connmark);
+        script.push_str(" counter name ");
+        script.push_str(COUNTER_DROPPED_OUT);
+        script.push_str(" reject with tcp reset\n");
+
+        script.push_str("    meta mark & 0x");
+        append_hex_u32(script, APPLICATION_MARK_DOMAIN_MASK);
+        script.push_str(" == 0x");
+        append_hex_u32(script, APPLICATION_REJECT_DOMAIN);
+        script.push_str(" ct mark set (ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_FOREIGN_MASK);
+        script.push_str(") | 0x");
+        append_hex_u32(script, reject_connmark);
+        script.push_str(" counter name ");
+        script.push_str(COUNTER_DROPPED_OUT);
+        script.push_str(" reject\n");
+
         // All attributable protocols receive the current generation so a
         // reply can be recognized. Only TCP uses that mark as an outbound
         // cache; UDP/ICMP clear it before every original packet and are queued
@@ -394,21 +775,65 @@ fn append_application_authorization_chain(
         append_hex_u32(script, APPLICATION_MARK_PAYLOAD_MASK);
         script.push_str(" accept\n");
     }
+    if snapshot.mode == Mode::Learning {
+        // Queue 1338 is observational and carries no private packet mark.
+        // Its NF_ACCEPT, kernel overflow fail-open, and packets accepted by
+        // the earlier Learning catch-all all converge here. An nft accept
+        // remains subject to later third-party base chains on this hook.
+        script.push_str("    counter name ");
+        script.push_str(COUNTER_ACCEPTED_OUT);
+        script.push_str(" accept\n");
+    }
     script.push_str("    counter name ");
     script.push_str(COUNTER_DROPPED_OUT);
     script.push_str(" drop\n");
     script.push_str("  }\n");
 }
 
-fn append_allow_rule(
+#[allow(clippy::too_many_arguments)]
+fn append_rule_verdict(
     script: &mut String,
     rule: &Rule,
     chain_direction: Direction,
     stateful_reverse: bool,
-    accepted_counter: &str,
+    counter: &str,
+    action: RuleAction,
+    outbound_handoff: bool,
+    reject_connmark: u32,
 ) {
     script.push_str("    ");
 
+    append_rule_selectors(script, rule, chain_direction, stateful_reverse);
+
+    if chain_direction == Direction::Outbound && action == RuleAction::Accept && outbound_handoff {
+        append_packet_mark_domain_set(script, APPLICATION_HANDOFF_DOMAIN);
+        script.push(' ');
+    }
+    if action == RuleAction::Reject {
+        script.push_str("ct mark set (ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_FOREIGN_MASK);
+        script.push_str(") | 0x");
+        append_hex_u32(script, reject_connmark);
+        script.push(' ');
+    }
+    script.push_str("counter name ");
+    script.push_str(counter);
+    match action {
+        RuleAction::Accept => script.push_str(" accept\n"),
+        RuleAction::Drop => script.push_str(" drop\n"),
+        RuleAction::Reject if rule.spec.protocol == TransportProtocol::Tcp => {
+            script.push_str(" reject with tcp reset\n");
+        }
+        RuleAction::Reject => script.push_str(" reject\n"),
+    }
+}
+
+fn append_rule_selectors(
+    script: &mut String,
+    rule: &Rule,
+    chain_direction: Direction,
+    stateful_reverse: bool,
+) {
     if stateful_reverse {
         // `related` packets may have a different L4 protocol/port (for example
         // ICMP errors) and therefore cannot safely use these exact reverse
@@ -477,14 +902,6 @@ fn append_allow_rule(
         }
         script.push(' ');
     }
-
-    if chain_direction == Direction::Outbound {
-        append_packet_mark_domain_set(script, APPLICATION_HANDOFF_DOMAIN);
-        script.push(' ');
-    }
-    script.push_str("counter name ");
-    script.push_str(accepted_counter);
-    script.push_str(" accept\n");
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -625,6 +1042,9 @@ mod tests {
         }
         assert!(policy.as_str().contains("counter name dropped_in drop"));
         assert!(policy.as_str().contains("counter name dropped_out drop"));
+        assert!(!policy.as_str().contains("icmpv6 type 134"));
+        assert!(!policy.as_str().contains("udp sport 547 udp dport 546"));
+        assert!(!policy.as_str().contains("udp sport 67 udp dport 68"));
         assert!(policy.as_str().contains(
             "chain forward {\n    type filter hook forward priority filter; policy drop;"
         ));
@@ -705,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn learning_queues_without_bypass_and_authorizes_with_flow_generation()
+    fn learning_queues_without_private_marks_and_has_end_to_end_allow_paths()
     -> Result<(), Box<dyn Error>> {
         let mut state = State::new();
         state.set_mode(Mode::Learning)?;
@@ -713,12 +1133,31 @@ mod tests {
         let flow = format!("{:08x}", application_flow_mark(snapshot.flow_generation));
         let script = NftablesCompiler::compile(&snapshot)?.into_string();
         assert!(script.contains(
-            "ct direction original meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337\n"
+            "ct direction original meta l4proto tcp ct state new tcp flags & (syn | ack) == syn counter name learned_out queue num 1338 bypass\n"
         ));
-        assert!(!script.contains("queue flags bypass"));
-        assert!(script.contains(&format!(
-            "meta l4proto tcp meta mark & 0xc0000000 == 0x80000000 ct mark set (ct mark & 0x80000000) | 0x{flow} meta mark set meta mark & 0x3fffffff counter name learned_out counter name accepted_out accept"
-        )));
+        assert!(script.contains(
+            "ct direction original meta l4proto != tcp counter name learned_out queue num 1338 bypass\n"
+        ));
+        assert!(!script.contains("queue num 1337"));
+        assert!(script.contains(
+            "ct direction reply ct state established,related counter name accepted_in accept"
+        ));
+        assert!(script.contains(
+            "ip6 saddr fe80::/10 ip6 hoplimit 255 meta l4proto icmpv6 icmpv6 type 134 icmpv6 code 0"
+        ));
+        assert!(
+            script.contains("ip6 saddr fe80::/10 meta l4proto udp udp sport 547 udp dport 546")
+        );
+        assert!(
+            script.contains("ip daddr 255.255.255.255 meta l4proto udp udp sport 67 udp dport 68")
+        );
+        let dhcp = script
+            .find("udp sport 67 udp dport 68")
+            .ok_or("missing DHCPv4 bootstrap allow")?;
+        let invalid = script
+            .find("ct state invalid counter name dropped_in drop")
+            .ok_or("missing inbound INVALID drop")?;
+        assert!(dhcp < invalid);
         assert!(script.contains(&format!(
             "ct direction reply ct state established meta l4proto tcp ct mark & 0x7fffffff == 0x{flow} counter name accepted_in accept"
         )));
@@ -730,13 +1169,21 @@ mod tests {
         assert!(script.contains(&format!(
             "ct direction reply ct state established meta l4proto udp ct mark & 0x7fffffff == 0x{flow} counter name accepted_in accept"
         )));
-        assert!(script.contains(&format!(
-            "meta l4proto udp meta mark & 0xc0000000 == 0x80000000 ct mark set (ct mark & 0x80000000) | 0x{flow}"
-        )));
         assert!(
             !script.contains("ct direction original ct state established meta l4proto udp ct mark")
         );
-        assert!(!script.contains("\n    meta mark & 0xc0000000 == 0x80000000 ct mark set"));
+        let queue = script
+            .find("queue num 1338 bypass")
+            .ok_or("missing Learning queue")?;
+        let catch_all = script[queue..]
+            .find("counter name accepted_out accept")
+            .map(|offset| queue + offset)
+            .ok_or("missing Learning catch-all")?;
+        assert!(queue < catch_all);
+        let authorization_chain = script
+            .find("chain output_authorize")
+            .ok_or("missing output authorization chain")?;
+        assert!(script[authorization_chain..].contains("counter name accepted_out accept"));
         assert!(script.contains(
             "chain output_sanitize {\n    type filter hook output priority -1; policy accept;"
         ));
@@ -768,7 +1215,7 @@ mod tests {
         let script = NftablesCompiler::compile(&snapshot)?.into_string();
         assert_eq!(script.matches("queue num 1337").count(), 1);
         assert!(script.contains(
-            "ct direction original meta l4proto tcp meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337\n"
+            "ct direction original oifname \"eth0\" ip daddr 203.0.113.7/32 meta l4proto tcp tcp dport 443 meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337\n"
         ));
         assert!(!script.contains(
             "ct direction original meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337\n"
@@ -813,7 +1260,7 @@ mod tests {
         );
         let tcp_only_script = NftablesCompiler::compile(&tcp_only)?.into_string();
         assert!(tcp_only_script.contains(
-            "ct direction original meta l4proto tcp meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337"
+            "ct direction original oifname \"eth0\" ip daddr 203.0.113.7/32 meta l4proto tcp tcp dport 443 meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337"
         ));
         assert!(
             !tcp_only_script.contains(
@@ -830,7 +1277,7 @@ mod tests {
         );
         let mixed_script = NftablesCompiler::compile(&mixed)?.into_string();
         assert!(mixed_script.contains(
-            "ct direction original meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337"
+            "ct direction original oifname \"eth0\" ip daddr 203.0.113.7/32 meta l4proto udp udp dport 53 meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337"
         ));
         assert!(
             mixed_script.contains(
@@ -869,12 +1316,103 @@ mod tests {
             .find("oifname \"eth0\" ip daddr 192.0.2.53/32 meta l4proto udp udp dport 53")
             .ok_or("missing direct UDP rule")?;
         let queue = script
-            .find("queue num 1337")
+            .find("queue num 1338")
             .ok_or("missing application queue")?;
         assert!(reset < direct);
         assert!(reset < queue);
         assert!(!script.contains("ct direction original ct state established meta l4proto udp"));
         assert!(!script.contains("meta l4proto sctp ct mark & 0x7fffffff"));
+        Ok(())
+    }
+
+    #[test]
+    fn network_actions_compile_drop_then_reject_then_accept() -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        for (suffix, action) in [
+            (1_u128, RuleAction::Accept),
+            (2, RuleAction::Reject),
+            (3, RuleAction::Drop),
+        ] {
+            let mut spec = RuleSpec::new(
+                RuleName::new(format!("action {suffix}"))?,
+                Direction::Outbound,
+                TransportProtocol::Tcp,
+                Some("203.0.113.0/24".parse()?),
+                Some(PortRange::single(443)?),
+                None,
+                RuleOrigin::Manual,
+                true,
+            )?;
+            spec.action = action;
+            state.create_rule_at(uuid::Uuid::from_u128(suffix), spec, Utc::now())?;
+        }
+
+        let snapshot = state.snapshot();
+        let reject_connmark = format!(
+            "{:08x}",
+            application_reject_connmark(snapshot.flow_generation)
+        );
+        let script = NftablesCompiler::compile(&snapshot)?.into_string();
+        let drop_rule = script
+            .find("ip daddr 203.0.113.0/24 meta l4proto tcp tcp dport 443 counter name dropped_out drop")
+            .ok_or("missing native drop rule")?;
+        let reject_rule = script
+            .find(&format!("ip daddr 203.0.113.0/24 meta l4proto tcp tcp dport 443 ct mark set (ct mark & 0x80000000) | 0x{reject_connmark} counter name dropped_out reject"))
+            .ok_or("missing native reject rule")?;
+        let accept_rule = script
+            .find("ip daddr 203.0.113.0/24 meta l4proto tcp tcp dport 443 meta mark set")
+            .ok_or("missing native accept rule")?;
+        assert!(drop_rule < reject_rule && reject_rule < accept_rule);
+        Ok(())
+    }
+
+    #[test]
+    fn application_deny_candidate_precedes_broad_network_accept_and_reject_is_native()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        add_https_rule(&mut state, Direction::Outbound, "203.0.113.0/24")?;
+        let application = add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let mut application_spec = state
+            .rule(application)
+            .ok_or("missing app rule")?
+            .spec
+            .clone();
+        application_spec.action = RuleAction::Reject;
+        state.update_rule(application, application_spec)?;
+
+        let snapshot = state.snapshot();
+        let reject_connmark = format!(
+            "{:08x}",
+            application_reject_connmark(snapshot.flow_generation)
+        );
+        let script = NftablesCompiler::compile(&snapshot)?.into_string();
+        let queue = script
+            .find("ip daddr 203.0.113.7/32 meta l4proto tcp tcp dport 443 meta mark set")
+            .ok_or("missing application candidate queue")?;
+        let broad_accept = script
+            .find("ip daddr 203.0.113.0/24 meta l4proto tcp tcp dport 443 meta mark set")
+            .ok_or("missing broad network accept")?;
+        let candidate_guard = script
+            .find("ip daddr 203.0.113.7/32 meta l4proto tcp tcp dport 443 counter name dropped_out drop")
+            .ok_or("missing ct-less application candidate guard")?;
+        assert!(queue < candidate_guard && candidate_guard < broad_accept);
+        assert!(
+            script.contains(&format!("meta l4proto tcp meta mark & 0xc0000000 == 0x40000000 ct mark set (ct mark & 0x80000000) | 0x{reject_connmark} counter name dropped_out reject with tcp reset"))
+        );
+        assert!(
+            script.contains(&format!("meta mark & 0xc0000000 == 0x40000000 ct mark set (ct mark & 0x80000000) | 0x{reject_connmark} counter name dropped_out reject"))
+        );
+        assert!(script.contains(
+            &format!("ct state related ct direction reply meta l4proto tcp tcp flags & rst == rst ct mark & 0x7fffffff == 0x{reject_connmark} meta mark set (meta mark & 0x3fffffff) | 0xc0000000 counter name accepted_out accept")
+        ));
+        assert!(script.contains(
+            &format!("ct state related ct direction reply meta nfproto ipv4 meta l4proto icmp icmp type destination-unreachable icmp code port-unreachable ct mark & 0x7fffffff == 0x{reject_connmark} counter name accepted_in accept")
+        ));
+        assert!(script.contains(
+            "oifname \"eth0\" meta l4proto tcp ct original ip daddr 203.0.113.7/32 ct original proto-dst 443 counter name dropped_out drop"
+        ));
         Ok(())
     }
 

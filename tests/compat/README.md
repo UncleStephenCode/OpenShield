@@ -200,9 +200,12 @@ for a legacy or unverified response. This is the worst-case active path;
 network-only matches remain in the kernel at L2 and L1.
 
 This is not kernel-capability attestation or fallback negotiation for an
-unchanged policy. The classification is independent of nftables-versus-iptables selection. Both backend
-scenarios must preserve identical rule semantics and fail closed if mandatory
-NFQUEUE setup is unavailable. A container result demonstrates the level
+unchanged policy. The classification is independent of
+nftables-versus-iptables selection. Both backend scenarios must preserve
+identical rule semantics. Mandatory Enforcing NFQUEUE setup fails closed;
+Learning uses its explicitly observational queue with a kernel bypass and
+continues its documented outbound allow policy if observation is unavailable.
+A container result demonstrates the level
 calculation and packet paths on the runner kernel only. It does not certify the
 stock kernel, boot configuration, LSM, or Secure Boot state of the named
 distribution. OpenShield has no eBPF application data plane, so none of the
@@ -216,6 +219,16 @@ capability, LSM rule, Secure Boot key, or module requirement. This statement
 describes compatibility. Retained v0.1.32 E2E and performance reports remain
 scoped to the exact artifacts they tested; a current release claim requires its
 own retained reports.
+
+## State and IPC upgrade boundary
+
+Compatibility is forward-only from v0.2.0 to v0.2.1. The v0.2.1 reader maps an
+absent rule `action` to `accept`, but a v0.2.0 process cannot parse v0.2.1
+`drop`/`reject` actions or the `template` origin. Mixed daemon/TUI versions and
+an in-place downgrade after v0.2.1 writes state are unsupported. Use a protected
+console, active kernel `BlockAll`, a reviewed state backup, and a
+distribution-tested upgrade or rollback procedure. The compatibility and E2E
+matrices described here do not validate package upgrade or downgrade.
 
 ## Real firewall end-to-end workflow
 
@@ -244,9 +257,15 @@ client and HTTP server. It is designed to verify, separately for each backend:
 - initial persisted `Learning` mode after startup quarantine;
 - observation access for `openshield` and denial for an outsider;
 - denial of control to a non-root group member;
-- learning an application-bound TCP rule and a UDP rule;
+- a real TCP exchange remaining admitted in `Learning` when bounded process
+  attribution is deliberately unavailable, without an incomplete learned rule;
+- learning enabled `accept` application-bound TCP and UDP rules;
+- creation of disabled minimal application-group templates and secure
+  executable pinning when a privileged user enables one;
 - continued access for the learned executable and denial of another executable
   in `Enforcing`;
+- admission of different arguments only after the matching template is enabled;
+- application-bound `drop` and native `reject`, plus their independent disabled state;
 - coexistence with a downstream firewall DROP;
 - inbound denial followed by an explicit inbound allow;
 - graceful-shutdown kernel `BlockAll` without replacing persisted `Enforcing`;
@@ -279,8 +298,8 @@ Each successful runtime release row reports both backend runs in its selected
 userspace:
 
 ```text
-PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (nftables)
-PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (iptables)
+PASS server Learning allow -> templates -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (nftables)
+PASS server Learning allow -> templates -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (iptables)
 ```
 
 In an nftables run both frontends are installed and nftables must be selected.

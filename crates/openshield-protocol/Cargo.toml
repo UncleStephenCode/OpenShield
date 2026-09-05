@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-openshield-core = { version = "=0.2.0", path = "../openshield-core" }
+openshield-core = { version = "=0.2.1", path = "../openshield-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

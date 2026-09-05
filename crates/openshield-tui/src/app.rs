@@ -3,7 +3,7 @@ use openshield_core::{
     ApplicationPath, ApplicationSelector, CgroupPath, CommandArgument, CommandLineMatch,
     CommandLineSelector, Direction, Event, EventKind, ExecutableFileId, FirewallCounters,
     InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_LINE_BYTES, Mode,
-    PortRange, Rule, RuleName, RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
+    PortRange, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
 };
 use openshield_protocol::{ControlRequest, FirewallBackendKind, RuntimeCompatibility};
 use std::borrow::Cow;
@@ -66,6 +66,7 @@ pub enum ConnectionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormField {
     Name,
+    Action,
     Protocol,
     PeerNetwork,
     Port,
@@ -82,6 +83,7 @@ pub enum FormField {
 impl FormField {
     const OUTBOUND: &'static [Self] = &[
         Self::Name,
+        Self::Action,
         Self::Protocol,
         Self::PeerNetwork,
         Self::Port,
@@ -129,6 +131,7 @@ pub struct RuleForm {
     pub active_field: FormField,
     pub name: String,
     direction: Direction,
+    pub action: RuleAction,
     pub protocol: TransportProtocol,
     pub peer_network: String,
     pub port: String,
@@ -154,6 +157,7 @@ impl Default for RuleForm {
             active_field: FormField::Name,
             name: String::new(),
             direction: Direction::Outbound,
+            action: RuleAction::Accept,
             protocol: TransportProtocol::Any,
             peer_network: String::new(),
             port: String::new(),
@@ -205,6 +209,7 @@ impl RuleForm {
             active_field: FormField::Name,
             name: rule.spec.name.to_string(),
             direction: rule.spec.direction,
+            action: rule.spec.action,
             protocol: rule.spec.protocol,
             peer_network: rule
                 .spec
@@ -292,6 +297,7 @@ impl RuleForm {
             }
             FormField::Cgroup => (&mut self.cgroup, MAX_CGROUP_PATH_BYTES),
             FormField::Protocol
+            | FormField::Action
             | FormField::Application
             | FormField::CommandMode
             | FormField::Enabled => return,
@@ -332,6 +338,7 @@ impl RuleForm {
                 self.cgroup.pop();
             }
             FormField::Protocol
+            | FormField::Action
             | FormField::Application
             | FormField::CommandMode
             | FormField::Enabled => return,
@@ -341,6 +348,9 @@ impl RuleForm {
 
     pub fn cycle_choice(&mut self, reverse: bool) {
         match self.active_field {
+            FormField::Action => {
+                self.action = cycle_rule_action(self.action, reverse);
+            }
             FormField::Protocol => {
                 self.protocol = cycle_protocol(self.protocol, reverse);
             }
@@ -425,6 +435,7 @@ impl RuleForm {
                 )
             })?,
             direction: self.direction,
+            action: self.action,
             protocol: self.protocol,
             peer_network,
             port,
@@ -744,6 +755,14 @@ const fn cycle_protocol(protocol: TransportProtocol, reverse: bool) -> Transport
         (TransportProtocol::IcmpV6, false) | (TransportProtocol::Tcp, true) => {
             TransportProtocol::Any
         }
+    }
+}
+
+const fn cycle_rule_action(action: RuleAction, reverse: bool) -> RuleAction {
+    match (action, reverse) {
+        (RuleAction::Accept, false) | (RuleAction::Reject, true) => RuleAction::Drop,
+        (RuleAction::Drop, false) | (RuleAction::Accept, true) => RuleAction::Reject,
+        (RuleAction::Reject, false) | (RuleAction::Drop, true) => RuleAction::Accept,
     }
 }
 
@@ -1559,6 +1578,44 @@ mod tests {
     }
 
     #[test]
+    fn outbound_action_and_enabled_state_are_independent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut form = RuleForm {
+            name: "diagnostic deny".to_owned(),
+            active_field: FormField::Action,
+            protocol: TransportProtocol::Tcp,
+            enabled: false,
+            ..RuleForm::default()
+        };
+
+        form.cycle_choice(false);
+        assert_eq!(form.action, RuleAction::Drop);
+        assert!(!form.enabled);
+        form.cycle_choice(false);
+        assert_eq!(form.action, RuleAction::Reject);
+        assert!(!form.enabled);
+        form.cycle_choice(true);
+        assert_eq!(form.action, RuleAction::Drop);
+
+        let specification = form.to_rule_spec(&I18n::test_english()).map_err(io_error)?;
+        assert_eq!(specification.action, RuleAction::Drop);
+        assert!(!specification.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_editor_does_not_offer_non_accept_actions() {
+        let mut form = RuleForm::for_direction(Direction::Inbound);
+        form.move_next();
+        assert_eq!(form.active_field, FormField::Protocol);
+
+        form.name = "invalid inbound deny".to_owned();
+        form.protocol = TransportProtocol::Tcp;
+        form.action = RuleAction::Drop;
+        assert!(form.to_rule_spec(&I18n::test_english()).is_err());
+    }
+
+    #[test]
     fn new_form_leaves_executable_version_for_daemon_pinning()
     -> Result<(), Box<dyn std::error::Error>> {
         let form = RuleForm {
@@ -2214,6 +2271,58 @@ mod tests {
         assert!(matches!(
             &groups[2].key,
             OutboundGroupKey::Destination(Some(network)) if network.to_string() == "192.0.2.9/32"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn group_selection_prefers_the_disabled_application_template()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = test_rule(
+            "learned endpoint",
+            Direction::Outbound,
+            Some("203.0.113.10"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            Some(r#"["client","--one"]"#),
+        )?;
+        let mut template_form = RuleForm {
+            name: "application-wide template".to_owned(),
+            origin: RuleOrigin::Template,
+            enabled: false,
+            bind_application: true,
+            executable: "/usr/bin/client".to_owned(),
+            cgroup: "/system.slice/client.service".to_owned(),
+            ..RuleForm::default()
+        };
+        template_form.action = RuleAction::Accept;
+        let template = Rule::new(
+            template_form
+                .to_rule_spec(&I18n::test_english())
+                .map_err(io_error)?,
+        )?;
+        let template_id = template.id;
+
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![endpoint, template],
+        });
+
+        let groups = app.outbound_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rules[0].id, template_id);
+        assert_eq!(app.selected_rule().map(|rule| rule.id), Some(template_id));
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled {
+                id,
+                enabled: true,
+                ..
+            }) if id == template_id
         ));
         Ok(())
     }

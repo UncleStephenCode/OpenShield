@@ -12,8 +12,8 @@ anyhow.workspace = true
 chrono.workspace = true
 libc.workspace = true
 nix.workspace = true
-openshield-core = { version = "=0.2.0", path = "../openshield-core" }
-openshield-protocol = { version = "=0.2.0", path = "../openshield-protocol" }
+openshield-core = { version = "=0.2.1", path = "../openshield-core" }
+openshield-protocol = { version = "=0.2.1", path = "../openshield-protocol" }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

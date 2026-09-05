@@ -782,6 +782,7 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         and (.metric_collectors.peer | pinned_process(0))
         and (.metric_collectors.canary | pinned_process(0))
         and .dut_metrics.schema == "openshield.perf.metrics.v3"
+        and .dut_metrics.nfqueue.queue_number == 1337
         and (.dut_metrics as $metrics
              | $metrics.cgroup
              | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
@@ -800,6 +801,7 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         and .dut_metrics.finished_at_monotonic_ns
             == .dut_metric_boundary.boundary_monotonic_ns
         and .post_resume_dut_metrics.schema == "openshield.perf.metrics.v3"
+        and .post_resume_dut_metrics.nfqueue.queue_number == 1337
         and (.post_resume_dut_metrics as $metrics
              | $metrics.cgroup
              | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
@@ -1168,6 +1170,8 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         and .passed == true
         and .safety_pass == true
         and .dut_metrics.schema == "openshield.perf.metrics.v3"
+        and .dut_metrics.nfqueue.queue_number
+            == (if .mode == "learning" then 1338 else 1337 end)
         and (.dut_metrics as $metrics
              | $metrics.cgroup
              | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
