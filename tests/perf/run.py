@@ -167,6 +167,10 @@ MAX_TCP_SERVER_WORKERS = (
 NFQUEUE_DRAIN_POLL_SECONDS = 0.01
 ENFORCING_NFQUEUE_NUMBER = 1_337
 LEARNING_NFQUEUE_NUMBER = 1_338
+# Keep these synchronized with the bounded established-flow Learning observer
+# in the nftables/iptables compilers. Initial SYNs remain independently queued.
+LEARNING_ESTABLISHED_OBSERVATIONS_PER_SECOND = 64
+LEARNING_ESTABLISHED_OBSERVATION_BURST = 32
 PERFORMANCE_NFQUEUE_NUMBERS = frozenset(
     {ENFORCING_NFQUEUE_NUMBER, LEARNING_NFQUEUE_NUMBER}
 )
@@ -7813,7 +7817,49 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
         # no longer observable after quarantine and must not be mislabeled as
         # a safety failure.  The mode transition still fails capacity above.
         if not verified_quarantine:
-            if result["policy"] == "network_only":
+            if result["mode"] == "learning":
+                # Learning observes outbound traffic even when an existing
+                # network Accept permits it. Established TCP is also sampled
+                # so applications with pre-existing connections can be learned;
+                # its queue shape is therefore not the Enforcing fast-path.
+                if workload_queue_hits is None:
+                    failures.append("Learning observer queue hits are unavailable")
+                elif result.get("direction") == "outbound":
+                    if transport == "tcp":
+                        ratio = result["derived"]["nfqueue_hits_per_connection"]
+                        elapsed = numeric(nested(result, "dut_metrics", "elapsed_seconds"))
+                        # nft has one inet limiter; xtables has one per family.
+                        limiters = 2 if result["backend"] == "iptables" else 1
+                        sample_allowance = (
+                            None if elapsed is None or elapsed <= 0
+                            else limiters * (
+                                math.ceil(elapsed * LEARNING_ESTABLISHED_OBSERVATIONS_PER_SECOND)
+                                + LEARNING_ESTABLISHED_OBSERVATION_BURST
+                            )
+                        )
+                        maximum_hits = (
+                            None if connections is None or sample_allowance is None
+                            else connections * criteria["application_tcp_maximum_queue_hits_per_connection"]
+                            + sample_allowance
+                        )
+                        if (
+                            ratio is None
+                            or ratio < criteria["application_tcp_minimum_queue_hits_per_connection"]
+                            or maximum_hits is None
+                            or workload_queue_hits > maximum_hits
+                        ):
+                            failures.append("Learning TCP queue hits do not track new connections and bounded established observations")
+                    else:
+                        ratio = result["derived"]["nfqueue_hits_per_datagram"]
+                        if ratio is None or not (
+                            criteria["application_udp_minimum_queue_hits_per_datagram"]
+                            <= ratio
+                            <= criteria["application_udp_maximum_queue_hits_per_datagram"]
+                        ):
+                            failures.append("Learning UDP queue hits do not track outbound datagrams")
+                # Ingress workloads exercise local reply packets, which do not
+                # require positive ORIGINAL-direction learning observations.
+            elif result["policy"] == "network_only":
                 if (
                     workload_queue_hits is None
                     or workload_queue_hits > criteria["network_only_maximum_queue_hits"]

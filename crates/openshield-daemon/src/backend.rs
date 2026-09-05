@@ -68,6 +68,7 @@ const XTABLES_CAPABILITY_POLICY: &str = "*mangle\n\
 :OPENSHIELD_PROBE_MARK - [0:0]\n\
 -A OPENSHIELD_PROBE_MARK -m mark ! --mark 0x00000000/0xc0000000 -j MARK --set-xmark 0x00000000/0xc0000000\n\
 -A OPENSHIELD_PROBE_MARK -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1338 --queue-bypass\n\
+-A OPENSHIELD_PROBE_MARK -p tcp -m tcp --tcp-flags FIN,RST NONE -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -m limit --limit 64/sec --limit-burst 32 -j NFQUEUE --queue-num 1338 --queue-bypass\n\
 -A OPENSHIELD_PROBE_MARK -j RETURN\n\
 COMMIT\n\
 *filter\n\

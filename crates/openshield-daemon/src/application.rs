@@ -31,6 +31,7 @@ const MAX_STATUS_BYTES: usize = 256 * 1024;
 const MAX_STAT_BYTES: usize = 64 * 1024;
 const MAX_CGROUP_BYTES: usize = 256 * 1024;
 const PROC_SCAN_DEADLINE: Duration = Duration::from_millis(250);
+const LEARNING_PROC_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const NETLINK_HEADER_BYTES: usize = 16;
 const INET_DIAG_REQUEST_BYTES: usize = 56;
 const INET_DIAG_MESSAGE_BYTES: usize = 72;
@@ -621,6 +622,22 @@ impl ProcfsResolver {
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
     ) -> Vec<Result<ApplicationIdentity>> {
         self.resolve_batch_for_enforcement_until(requests, Instant::now() + PROC_SCAN_DEADLINE)
+    }
+
+    /// Resolves observations after Learning has already accepted their packets.
+    ///
+    /// The blocking enforcement deadline is too short to inspect all tasks on
+    /// a busy desktop. An asynchronous observation gets a separate bounded
+    /// budget while retaining every socket-owner, UID, executable, and race
+    /// check. The enforcement API and its 250 ms deadline remain unchanged.
+    pub(crate) fn resolve_batch_for_learning(
+        &self,
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+    ) -> Vec<Result<ApplicationIdentity>> {
+        self.resolve_batch_for_enforcement_until(
+            requests,
+            Instant::now() + LEARNING_PROC_SCAN_DEADLINE,
+        )
     }
 
     fn resolve_batch_for_enforcement_until(
@@ -4313,6 +4330,91 @@ mod tests {
                 )
                 .into_iter()
                 .all(|result| result.is_err())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn asynchronous_learning_budget_does_not_expire_with_the_blocking_enforcement_budget()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        write_udp_socket_table(directory.path(), &[(12_345, 54_321, 1_000, 77)])?;
+        let owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        complete_identity_fixture(&owner, 100)?;
+        symlink("socket:[77]", owner.join("fd/3"))?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            54_321,
+            1_000,
+        )?;
+        let requests = [(&connection, IdentityCaptureRequirements::full()); 2];
+        let resolver = ProcfsResolver::at(directory.path());
+        // Model time already spent traversing a busy procfs without sleeping
+        // or depending on the host's process count or filesystem throughput.
+        let started = Instant::now()
+            .checked_sub(PROC_SCAN_DEADLINE)
+            .ok_or("cannot construct an elapsed attribution budget")?;
+        let enforcing =
+            resolver.resolve_batch_for_enforcement_until(&requests, started + PROC_SCAN_DEADLINE);
+        assert!(enforcing.into_iter().all(|result| {
+            result
+                .err()
+                .is_some_and(|error| is_attribution_timeout(&error))
+        }));
+
+        let learning = resolver
+            .resolve_batch_for_enforcement_until(&requests, started + LEARNING_PROC_SCAN_DEADLINE);
+        let identities = learning.into_iter().collect::<Result<Vec<_>>>()?;
+        assert_eq!(identities.len(), requests.len());
+        assert!(identities.iter().all(|identity| identity.pid == 100));
+        Ok(())
+    }
+
+    #[test]
+    fn asynchronous_learning_still_rejects_shared_socket_owners_and_oversized_batches()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        write_udp_socket_table(directory.path(), &[(12_345, 54_321, 1_000, 77)])?;
+        let owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        complete_identity_fixture(&owner, 100)?;
+        symlink("socket:[77]", owner.join("fd/3"))?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            54_321,
+            1_000,
+        )?;
+        let requests = [(&connection, IdentityCaptureRequirements::full()); 2];
+        let resolver = ProcfsResolver::at(directory.path());
+        let initial = resolver
+            .resolve_batch_for_learning(&requests)
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        assert!(initial.iter().all(|identity| identity.pid == 100));
+
+        let second_owner = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        symlink("socket:[77]", second_owner.join("fd/9"))?;
+        assert!(
+            resolver
+                .resolve_batch_for_learning(&requests)
+                .into_iter()
+                .all(|result| result
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("multiple processes")))
+        );
+        let oversized = vec![requests[0]; MAX_ATTRIBUTION_BATCH_SIZE + 1];
+        assert!(
+            resolver
+                .resolve_batch_for_learning(&oversized)
+                .into_iter()
+                .all(|result| result
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("fixed bound")))
         );
         Ok(())
     }

@@ -1729,6 +1729,10 @@ def independent_validation_fixture(
             )
             measured["status_before"]["mode"] = scenario["mode"]
             measured["status_after"]["mode"] = scenario["mode"]
+            if scenario["mode"] == "learning" and profile["direction"] == "outbound":
+                measured["dut_metrics"]["nfqueue"]["hits"] = (
+                    10 if profile["transport"] == "tcp" else 104
+                )
             if scenario["policy"].startswith("application_"):
                 measured["identity_probe"] = {
                     "blocked": True,
@@ -2284,6 +2288,102 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(result["safety_pass"])
         self.assertIn(reason, result["unreliable_reasons"])
         self.assertIn(reason, result["safety_failure_reasons"])
+
+    @staticmethod
+    def learning_result(policy: str, transport: str = "tcp") -> dict:
+        result = synthetic_result(policy, transport)
+        result["mode"] = "learning"
+        result["status_before"]["mode"] = "learning"
+        result["status_after"]["mode"] = "learning"
+        result["dut_metrics"]["nfqueue"].update({
+            "queue_number": 1338,
+            "hits": 100 if transport == "tcp" else 104,
+        })
+        return result
+
+    def test_learning_observes_network_accept_and_established_tcp(self) -> None:
+        for backend in ("nftables", "iptables"):
+            for policy in ("network_only", "application_tcp"):
+                with self.subTest(backend=backend, policy=policy):
+                    result = self.learning_result(policy)
+                    result["backend"] = backend
+                    for status in ("status_before", "status_after"):
+                        result[status]["backend"] = backend
+                    runner.evaluate_result(result, self.criteria)
+                    # Ten new connections and a hundred observed packets:
+                    # valid bounded Learning sampling, not an Enforcing fast-path.
+                    self.assertEqual(result["derived"]["nfqueue_hits_per_connection"], 10)
+                    self.assertGreater(
+                        result["derived"]["nfqueue_hits_per_operation"],
+                        self.criteria["application_tcp_keepalive_maximum_queue_hits_per_operation"],
+                    )
+                    self.assertTrue(result["passed"], result["failure_reasons"])
+
+    def test_enforcing_still_requires_kernel_and_conntrack_fast_paths(self) -> None:
+        for policy in ("network_only", "application_tcp"):
+            with self.subTest(policy=policy):
+                result = synthetic_result(policy)
+                result["dut_metrics"]["nfqueue"]["hits"] = 100
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["capacity_pass"])
+                self.assertFalse(result["passed"])
+                if policy == "application_tcp":
+                    self.assertIn(
+                        "established TCP did not demonstrate the conntrack fast-path",
+                        result["failure_reasons"],
+                    )
+
+    def test_learning_tcp_rejects_missing_or_unbounded_observation(self) -> None:
+        for backend, maximum in (("nftables", 136), ("iptables", 232)):
+            for hits in (None, 0, maximum + 1):
+                with self.subTest(backend=backend, hits=hits):
+                    result = self.learning_result("network_only")
+                    result["backend"] = backend
+                    result["dut_metrics"]["nfqueue"]["hits"] = hits
+                    runner.evaluate_result(result, self.criteria)
+                    self.assertFalse(result["capacity_pass"])
+                    self.assertFalse(result["passed"])
+
+    def test_learning_udp_network_accept_requires_per_datagram_observation(self) -> None:
+        for policy in ("network_only", "application_udp"):
+            for hits, passed in ((104, True), (0, False), (208, False)):
+                with self.subTest(policy=policy, hits=hits):
+                    result = self.learning_result(policy, "udp")
+                    result["dut_metrics"]["nfqueue"]["hits"] = hits
+                    runner.evaluate_result(result, self.criteria)
+                    self.assertEqual(result["passed"], passed, result["failure_reasons"])
+
+    def test_learning_ingress_does_not_require_observing_reply_packets(self) -> None:
+        result = self.learning_result("network_only")
+        result["direction"] = "inbound"
+        result["dut_metrics"]["nfqueue"]["hits"] = 0
+        runner.evaluate_result(result, self.criteria)
+        self.assertTrue(result["passed"], result["failure_reasons"])
+        result["dut_metrics"]["nfqueue"]["hits"] = None
+        runner.evaluate_result(result, self.criteria)
+        self.assertFalse(result["passed"])
+
+    def test_learning_observation_retains_safety_and_capacity_budgets(self) -> None:
+        mutations = {
+            "NFQUEUE drop": lambda row: row["dut_metrics"]["nfqueue"].update({"kernel_dropped": 1}),
+            "NFQUEUE error": lambda row: row["status_after"]["nfqueue"].update({"terminal_queue_error": 1}),
+            "NIC drop": lambda row: row["dut_metrics"]["network"].update({"rx_dropped": 1}),
+            "fail-open": lambda row: row.update({"identity_probe": {"fail_open": True, "attempts_completed": 1}}),
+            "daemon CPU": lambda row: row["dut_metrics"]["daemon"].update({
+                "cpu_percent_one_core": self.criteria["maximum_daemon_cpu_percent_one_core"] + 1,
+            }),
+            "latency": lambda row: row["workload"]["metrics"]["latency_ms"].update({
+                "p99": self.criteria["maximum_latency_p99_ms"] + 1,
+            }),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                result = self.learning_result("network_only")
+                mutate(result)
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["passed"])
+                if defect not in {"daemon CPU", "latency"}:
+                    self.assertFalse(result["safety_pass"])
 
     def test_metric_schema_and_cpu_percent_identity_are_authoritative(self) -> None:
         cases = {

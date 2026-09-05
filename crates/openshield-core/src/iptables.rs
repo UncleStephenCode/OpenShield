@@ -108,6 +108,9 @@ fn compile_family(
         // no host mangle rules and continue into the ordinary filter hook.
         for selector in [
             "-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW --ctdir ORIGINAL",
+            // A global token bucket has no per-flow allocations or hotdrop
+            // path. Exhaustion skips observation, never the Learning accept.
+            "-p tcp -m tcp --tcp-flags FIN,RST NONE -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -m limit --limit 64/sec --limit-burst 32",
             "! -p tcp -m conntrack --ctdir ORIGINAL",
         ] {
             let _infallible = writeln!(
@@ -195,14 +198,14 @@ fn append_learning_observer_kernel_guards(
         .filter(|rule| {
             rule.spec.enabled
                 && rule.spec.direction == Direction::Outbound
-                && (rule.spec.application.is_none()
-                    || matches!(rule.spec.action, RuleAction::Drop | RuleAction::Reject))
+                && matches!(rule.spec.action, RuleAction::Drop | RuleAction::Reject)
                 && supports_family(rule, family)
         })
         .collect();
     rules.sort_unstable_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id));
     for rule in rules {
-        // Network-only rules remain kernel-only, matching nftables behavior.
+        // Network accepts must not hide applications from Learning. Only deny
+        // envelopes skip observation and continue to enforcement in filter.
         // Application deny envelopes continue to fail-closed queue 1337 in
         // filter; a successfully resolved non-matching process is learned
         // there without a second /proc scan.
@@ -243,6 +246,12 @@ fn append_input_chain(
         }
 
         if snapshot.mode == Mode::Learning {
+            // Local proxies receive the ORIGINAL half of a loopback flow at
+            // INPUT after OUTPUT has checked all explicit outbound denies.
+            let _infallible = writeln!(
+                script,
+                "-A {IPTABLES_INPUT_CHAIN} -i lo -m conntrack --ctdir ORIGINAL -m comment --comment openshield:accepted_in -j RETURN"
+            );
             let _infallible = writeln!(
                 script,
                 "-A {IPTABLES_INPUT_CHAIN} -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -m comment --comment openshield:accepted_in -j RETURN"
@@ -1112,6 +1121,9 @@ mod tests {
                 "-A OPENSHIELD_OBSERVE -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW --ctdir ORIGINAL -m comment --comment openshield:learned_out -j NFQUEUE --queue-num 1338 --queue-bypass"
             ));
             assert!(script.contains(
+                "-A OPENSHIELD_OBSERVE -p tcp -m tcp --tcp-flags FIN,RST NONE -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -m limit --limit 64/sec --limit-burst 32 -m comment --comment openshield:learned_out -j NFQUEUE --queue-num 1338 --queue-bypass"
+            ));
+            assert!(script.contains(
                 "-A OPENSHIELD_OBSERVE ! -p tcp -m conntrack --ctdir ORIGINAL -m comment --comment openshield:learned_out -j NFQUEUE --queue-num 1338 --queue-bypass"
             ));
             assert!(!script.contains("-A OPENSHIELD_MARK -m conntrack"));
@@ -1401,6 +1413,53 @@ mod tests {
         assert!(!policy.ipv4().contains(
             "-d 203.0.113.7/32 -o eth0 -p tcp --dport 443 -m comment --comment openshield:accepted_out -j RETURN"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn learning_observer_skips_only_denies_and_never_network_accepts() -> Result<(), Box<dyn Error>>
+    {
+        let mut state = State::new();
+        add_rule(&mut state, Direction::Outbound, "203.0.113.0/24", false)?;
+        let deny = add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let mut spec = state
+            .rule(deny)
+            .ok_or("missing application rule")?
+            .spec
+            .clone();
+        spec.action = RuleAction::Reject;
+        state.update_rule(deny, spec)?;
+        for mode in [Mode::Learning, Mode::Enforcing, Mode::BlockAll] {
+            state.set_mode(mode)?;
+            let policy = IptablesCompiler::compile(&state.snapshot())?;
+            for script in [policy.ipv4(), policy.ipv6()] {
+                assert!(!script.contains("-A OPENSHIELD_OBSERVE -d 203.0.113.0/24"));
+                if mode == Mode::Learning {
+                    let loopback = script.find("-A OPENSHIELD_IN -i lo -m conntrack --ctdir ORIGINAL -m comment --comment openshield:accepted_in -j RETURN")
+                        .ok_or("missing loopback rule")?;
+                    let invalid = script
+                        .find("--ctstate INVALID")
+                        .ok_or("missing invalid ingress guard")?;
+                    assert!(invalid < loopback);
+                    assert!(script.contains("--limit 64/sec --limit-burst 32"));
+                    if script == policy.ipv4() {
+                        let guard = script
+                            .find("-A OPENSHIELD_OBSERVE -d 203.0.113.7/32")
+                            .ok_or("missing application deny guard")?;
+                        let observer = script
+                            .find("--queue-num 1338 --queue-bypass")
+                            .ok_or("missing observer")?;
+                        assert!(guard < observer);
+                        assert!(script.contains("--queue-num 1337"));
+                        assert!(script.contains("-j REJECT"));
+                    }
+                } else {
+                    assert!(!script.contains("-A OPENSHIELD_IN -i lo"));
+                    assert!(!script.contains("--queue-num 1338"));
+                    assert!(!script.contains("--limit 64/sec"));
+                }
+            }
+        }
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +66,9 @@ const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(1);
 const CONFIGURATION_POLL_MILLIS: u16 = 100;
 const LEARNING_QUEUE_CAPACITY: usize = 512;
 const LEARNING_BATCH_SIZE: usize = 256;
+const LEARNING_TCP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const LEARNING_DATAGRAM_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
+const LEARNING_TCP_RECENT_CAPACITY: usize = 512;
 const NFNETLINK_FAMILY_UNSPEC: u8 = 0;
 const MAX_PACKET_BATCH_SIZE: usize = MAX_ATTRIBUTION_BATCH_SIZE;
 
@@ -248,6 +251,7 @@ fn packet_loop(
     let resolver = ProcfsResolver::new();
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_BYTES];
     let mut errors = ErrorThrottle::default();
+    let mut observations = LearningAttributionDebounce::default();
 
     while !shutdown.load(Ordering::Acquire) {
         match queue.receive(&mut receive_buffer) {
@@ -340,6 +344,7 @@ fn packet_loop(
                         attribution,
                         counters,
                         &mut errors,
+                        &mut observations,
                     ),
                 };
                 if let Err(error) = result {
@@ -393,6 +398,7 @@ fn handle_packet_queue_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn return_learning_batch_verdicts(
     queue: &mut QueueSocket,
     batch: Vec<QueuedPacketWork>,
@@ -401,6 +407,7 @@ fn return_learning_batch_verdicts(
     attribution: &SyncSender<LearningAttributionWork>,
     counters: &NfqueueRuntimeCounters,
     errors: &mut ErrorThrottle,
+    observations: &mut LearningAttributionDebounce,
 ) -> Result<()> {
     for work in batch {
         // Recheck only the policy identity needed to authorize the explicitly
@@ -427,6 +434,15 @@ fn return_learning_batch_verdicts(
         }
         queue.verdict(work.packet_id, NF_ACCEPT)?;
         drop(guard);
+        // Coalesce observations before the bounded background channel, not
+        // just after it: otherwise repeated packets occupy every slot while
+        // a desktop-sized /proc scan is still running. The verdict above is
+        // already final; this scheduling hint is never consulted by q1337.
+        if let Ok(packet) = &work.packet
+            && !observations.should_enqueue(flow_generation, &packet.connection, Instant::now())
+        {
+            continue;
+        }
         enqueue_learning_attribution(work.packet, flow_generation, attribution, counters, errors);
     }
     Ok(())
@@ -913,13 +929,14 @@ fn learning_attribution_loop(
 ) {
     let resolver = ProcfsResolver::new();
     let mut errors = ErrorThrottle::default();
+    let mut recent_attempts = LearningAttributionDebounce::default();
     while !shutdown.load(Ordering::Acquire) {
         let first = match receiver.recv_timeout(Duration::from_millis(RECEIVE_POLL_MILLIS.into())) {
             Ok(work) => work,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
-        let (flow_generation, batch) = collect_learning_attribution_batch(first, receiver);
+        let (flow_generation, mut batch) = collect_learning_attribution_batch(first, receiver);
         let Ok(guard) = engine.lock() else {
             quarantine_engine(engine);
             shutdown.store(true, Ordering::Release);
@@ -942,12 +959,21 @@ fn learning_attribution_loop(
         if snapshot.mode != Mode::Learning || snapshot.flow_generation != flow_generation {
             continue;
         }
+        let now = Instant::now();
+        batch.retain(|work| {
+            recent_attempts.should_attempt(flow_generation, &work.packet.connection, now)
+        });
+        if batch.is_empty() {
+            continue;
+        }
         let requests = batch
             .iter()
             .map(|work| (&work.packet.connection, IdentityCaptureRequirements::full()))
             .collect::<Vec<_>>();
-        let identities = resolver.resolve_batch_for_enforcement(&requests);
+        let identities = resolver.resolve_batch_for_learning(&requests);
+        let completed_at = Instant::now();
         for (work, identity) in batch.into_iter().zip(identities) {
+            recent_attempts.completed(&work.packet.connection, completed_at);
             match identity {
                 Ok(identity) => {
                     match authorize_attributed_packet(
@@ -991,13 +1017,16 @@ fn collect_learning_attribution_batch(
     receiver: &Receiver<LearningAttributionWork>,
 ) -> (u32, Vec<LearningAttributionWork>) {
     let flow_generation = first.flow_generation;
+    let mut connections = HashSet::from([first.packet.connection.clone()]);
     let mut batch = vec![first];
     let mut drained = 1_usize;
     while drained < MAX_ATTRIBUTION_BATCH_SIZE {
         match receiver.try_recv() {
             Ok(work) => {
                 drained += 1;
-                if work.flow_generation == flow_generation {
+                if work.flow_generation == flow_generation
+                    && connections.insert(work.packet.connection.clone())
+                {
                     batch.push(work);
                 }
             }
@@ -1005,6 +1034,75 @@ fn collect_learning_attribution_batch(
         }
     }
     (flow_generation, batch)
+}
+
+/// Short-lived scheduling state for already accepted Learning observations.
+///
+/// This stores no application identity or authorization result and is never
+/// consulted by queue 1337. Success and failure both become eligible for a new
+/// TCP observation after a fixed interval; suppressed samples do not extend it.
+#[derive(Debug, Default)]
+struct LearningAttributionDebounce {
+    flow_generation: Option<u32>,
+    attempts: HashMap<OutboundConnection, Instant>,
+}
+
+impl LearningAttributionDebounce {
+    fn should_attempt(
+        &mut self,
+        flow_generation: u32,
+        connection: &OutboundConnection,
+        now: Instant,
+    ) -> bool {
+        if connection.protocol != TransportProtocol::Tcp {
+            return true;
+        }
+        self.should_enqueue(flow_generation, connection, now)
+    }
+
+    fn should_enqueue(
+        &mut self,
+        flow_generation: u32,
+        connection: &OutboundConnection,
+        now: Instant,
+    ) -> bool {
+        if self.flow_generation != Some(flow_generation) {
+            self.attempts.clear();
+            self.flow_generation = Some(flow_generation);
+        }
+        self.attempts.retain(|connection, previous| {
+            let interval = if connection.protocol == TransportProtocol::Tcp {
+                LEARNING_TCP_RETRY_INTERVAL
+            } else {
+                LEARNING_DATAGRAM_COALESCE_INTERVAL
+            };
+            now.saturating_duration_since(*previous) < interval
+        });
+        if self.attempts.contains_key(connection) {
+            return false;
+        }
+        if self.attempts.len() >= LEARNING_TCP_RECENT_CAPACITY
+            && let Some(oldest) = self
+                .attempts
+                .iter()
+                .min_by_key(|(_, previous)| **previous)
+                .map(|(connection, _)| connection.clone())
+        {
+            // Admit new flows even at capacity; bounded eviction only loses
+            // a duplicate-suppression hint, never an authorization check.
+            self.attempts.remove(&oldest);
+        }
+        self.attempts.insert(connection.clone(), now);
+        true
+    }
+
+    fn completed(&mut self, connection: &OutboundConnection, now: Instant) {
+        if let Some(previous) = self.attempts.get_mut(connection) {
+            // A slow successful scan must not immediately expire its own
+            // retry interval and start the same exhaustive scan once again.
+            *previous = now;
+        }
+    }
 }
 
 fn learning_loop(
@@ -1891,10 +1989,17 @@ impl ErrorThrottle {
             .last_log
             .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10))
         {
-            warn!(
-                suppressed = self.suppressed,
-                message, "application packet denied"
-            );
+            if message.starts_with("Learning ") {
+                warn!(
+                    suppressed = self.suppressed,
+                    message, "application learning observation skipped"
+                );
+            } else {
+                warn!(
+                    suppressed = self.suppressed,
+                    message, "application packet denied"
+                );
+            }
             self.last_log = Some(now);
             self.suppressed = 0;
         } else {
@@ -2032,6 +2137,140 @@ mod tests {
         assert_eq!(generation, 7);
         assert_eq!(first_batch.len() + second_batch.len(), total);
         assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn asynchronous_attribution_coalesces_connections_and_discards_stale_generations()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+        let first = learning_attribution_work(7, 1)?;
+        let mut duplicate = first.clone();
+        duplicate.packet.packet_mark = 5;
+        sender.try_send(duplicate)?;
+        sender.try_send(learning_attribution_work(8, 2)?)?;
+        sender.try_send(learning_attribution_work(7, 3)?)?;
+
+        let (generation, batch) = collect_learning_attribution_batch(first, &receiver);
+
+        assert_eq!(generation, 7);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].packet.connection.source_port, Some(40_001));
+        assert_eq!(batch[1].packet.connection.source_port, Some(40_003));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_attribution_storm_keeps_the_batch_drain_bounded() -> Result<(), Box<dyn Error>> {
+        let (sender, receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+        let first = learning_attribution_work(7, 1)?;
+        for _ in 0..MAX_ATTRIBUTION_BATCH_SIZE {
+            sender.try_send(first.clone())?;
+        }
+
+        let (_, batch) = collect_learning_attribution_batch(first, &receiver);
+
+        assert_eq!(batch.len(), 1);
+        assert!(receiver.try_recv().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn learning_tcp_debounce_retries_without_sliding_the_deadline() -> Result<(), Box<dyn Error>> {
+        let connection = learning_attribution_work(7, 1)?.packet.connection;
+        let mut debounce = LearningAttributionDebounce::default();
+        let now = Instant::now();
+
+        assert!(debounce.should_attempt(7, &connection, now));
+        assert!(!debounce.should_attempt(7, &connection, now + Duration::from_millis(999)));
+        assert!(debounce.should_attempt(7, &connection, now + LEARNING_TCP_RETRY_INTERVAL));
+        assert!(!debounce.should_attempt(7, &connection, now + Duration::from_millis(1_001)));
+        // A new policy generation retries immediately, regardless of whether
+        // the previous attempt succeeded, failed, or was still in flight.
+        assert!(debounce.should_attempt(8, &connection, now + Duration::from_millis(1_001)));
+        Ok(())
+    }
+
+    #[test]
+    fn learning_observation_coalescing_prevents_repeated_datagrams_filling_the_backlog()
+    -> Result<(), Box<dyn Error>> {
+        let mut connection = learning_attribution_work(7, 1)?.packet.connection;
+        connection.protocol = TransportProtocol::Udp;
+        let mut observations = LearningAttributionDebounce::default();
+        let now = Instant::now();
+        assert!(observations.should_enqueue(7, &connection, now));
+        for _ in 0..LEARNING_QUEUE_CAPACITY {
+            assert!(!observations.should_enqueue(7, &connection, now));
+        }
+        let mut other_application = connection.clone();
+        other_application.socket_uid += 1;
+        assert!(observations.should_enqueue(7, &other_application, now));
+        assert!(observations.should_enqueue(
+            7,
+            &connection,
+            now + LEARNING_DATAGRAM_COALESCE_INTERVAL,
+        ));
+        assert!(observations.should_enqueue(8, &connection, now));
+        Ok(())
+    }
+
+    #[test]
+    fn learning_tcp_retry_interval_starts_after_a_slow_background_scan()
+    -> Result<(), Box<dyn Error>> {
+        let connection = learning_attribution_work(7, 1)?.packet.connection;
+        let mut observations = LearningAttributionDebounce::default();
+        let started = Instant::now();
+        assert!(observations.should_attempt(7, &connection, started));
+        let completed = started + Duration::from_secs(4);
+        observations.completed(&connection, completed);
+        assert!(!observations.should_attempt(7, &connection, completed));
+        assert!(observations.should_attempt(
+            7,
+            &connection,
+            completed + LEARNING_TCP_RETRY_INTERVAL,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn learning_tcp_debounce_has_a_fixed_capacity_without_refusing_new_flows()
+    -> Result<(), Box<dyn Error>> {
+        let mut debounce = LearningAttributionDebounce::default();
+        let now = Instant::now();
+        for offset in 0..=LEARNING_TCP_RECENT_CAPACITY {
+            let connection = learning_attribution_work(7, u32::try_from(offset)?)?
+                .packet
+                .connection;
+            assert!(debounce.should_attempt(7, &connection, now));
+            assert!(debounce.attempts.len() <= LEARNING_TCP_RECENT_CAPACITY);
+        }
+        let next = learning_attribution_work(7, u32::try_from(LEARNING_TCP_RECENT_CAPACITY + 1)?)?
+            .packet
+            .connection;
+        assert!(debounce.should_attempt(7, &next, now + LEARNING_TCP_RETRY_INTERVAL));
+        assert_eq!(debounce.attempts.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn learning_tcp_debounce_separates_socket_uids_interfaces_and_transport_protocols()
+    -> Result<(), Box<dyn Error>> {
+        let connection = learning_attribution_work(7, 1)?.packet.connection;
+        let mut debounce = LearningAttributionDebounce::default();
+        let now = Instant::now();
+        assert!(debounce.should_attempt(7, &connection, now));
+
+        let mut different_uid = connection.clone();
+        different_uid.socket_uid += 1;
+        assert!(debounce.should_attempt(7, &different_uid, now));
+        let mut different_interface = connection.clone();
+        different_interface.output_interface = InterfaceName::new("eth1")?;
+        assert!(debounce.should_attempt(7, &different_interface, now));
+
+        let mut udp = connection;
+        udp.protocol = TransportProtocol::Udp;
+        assert!(debounce.should_attempt(7, &udp, now));
+        assert!(debounce.should_attempt(7, &udp, now));
         Ok(())
     }
 

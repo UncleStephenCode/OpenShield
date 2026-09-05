@@ -234,6 +234,13 @@ fn append_chain(
         // locally initiated conntrack flow must still work; NEW inbound flows
         // continue to the default-drop path.
         if direction == Direction::Inbound && snapshot.mode == Mode::Learning {
+            // A locally initiated loopback flow traverses both OUTPUT and
+            // INPUT in its ORIGINAL direction. Its output policy has already
+            // checked explicit denies; do not block local proxies at INPUT.
+            // A physical ingress interface can never match this exception.
+            script.push_str("    iifname \"lo\" ct direction original counter name ");
+            script.push_str(accepted_counter);
+            script.push_str(" accept\n");
             script.push_str("    ct direction reply ct state established,related counter name ");
             script.push_str(accepted_counter);
             script.push_str(" accept\n");
@@ -297,13 +304,9 @@ fn append_chain(
                 dropped_counter,
                 &[RuleAction::Drop, RuleAction::Reject],
             );
-            append_direct_rules(
-                script,
-                snapshot,
-                direction,
-                &[RuleAction::Accept],
-                accepted_counter,
-            );
+            // Network accepts must not hide their applications from Learning.
+            // The observational queue and the final allow-all verdict below
+            // admit this traffic after the explicit denies have been checked.
         } else {
             append_direct_rules(
                 script,
@@ -549,6 +552,10 @@ fn append_application_non_tcp_connmark_reset(script: &mut String) {
 fn append_learning_queue(script: &mut String) {
     for selector in [
         "meta l4proto tcp ct state new tcp flags & (syn | ack) == syn",
+        // Retry attribution for active connections opened before Learning or
+        // whose initial SYN raced process/socket discovery. Sampling is bounded
+        // and never changes their authorization or conntrack generation.
+        "meta l4proto tcp ct state established tcp flags & (fin | rst) == 0 limit rate 64/second burst 32 packets",
         "meta l4proto != tcp",
     ] {
         script.push_str("    ct direction original ");
@@ -1136,6 +1143,9 @@ mod tests {
             "ct direction original meta l4proto tcp ct state new tcp flags & (syn | ack) == syn counter name learned_out queue num 1338 bypass\n"
         ));
         assert!(script.contains(
+            "ct direction original meta l4proto tcp ct state established tcp flags & (fin | rst) == 0 limit rate 64/second burst 32 packets counter name learned_out queue num 1338 bypass\n"
+        ));
+        assert!(script.contains(
             "ct direction original meta l4proto != tcp counter name learned_out queue num 1338 bypass\n"
         ));
         assert!(!script.contains("queue num 1337"));
@@ -1289,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn non_tcp_application_reply_allowlist_is_explicit_and_refreshed_before_direct_rules()
+    fn non_tcp_application_reply_allowlist_is_explicit_and_refreshed_before_observation()
     -> Result<(), Box<dyn Error>> {
         let mut state = State::new();
         state.set_mode(Mode::Learning)?;
@@ -1312,16 +1322,62 @@ mod tests {
         let reset = script
             .find("ct direction original meta l4proto udp ct mark set ct mark & 0x80000000")
             .ok_or("missing UDP connmark reset")?;
-        let direct = script
-            .find("oifname \"eth0\" ip daddr 192.0.2.53/32 meta l4proto udp udp dport 53")
-            .ok_or("missing direct UDP rule")?;
+        assert!(
+            !script
+                .contains("oifname \"eth0\" ip daddr 192.0.2.53/32 meta l4proto udp udp dport 53")
+        );
         let queue = script
             .find("queue num 1338")
             .ok_or("missing application queue")?;
-        assert!(reset < direct);
         assert!(reset < queue);
         assert!(!script.contains("ct direction original ct state established meta l4proto udp"));
         assert!(!script.contains("meta l4proto sctp ct mark & 0x7fffffff"));
+        Ok(())
+    }
+
+    #[test]
+    fn learning_network_accept_does_not_hide_applications_but_denies_still_precede_observation()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        add_https_rule(&mut state, Direction::Outbound, "203.0.113.0/24")?;
+        let deny = add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let mut spec = state
+            .rule(deny)
+            .ok_or("missing application rule")?
+            .spec
+            .clone();
+        spec.action = RuleAction::Reject;
+        state.update_rule(deny, spec)?;
+        for mode in [Mode::Learning, Mode::Enforcing, Mode::BlockAll] {
+            state.set_mode(mode)?;
+            let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+            let direct_accept =
+                "ip daddr 203.0.113.0/24 meta l4proto tcp tcp dport 443 meta mark set";
+            if mode == Mode::Learning {
+                assert!(script.contains(
+                    "iifname \"lo\" ct direction original counter name accepted_in accept"
+                ));
+                let invalid = script
+                    .find("ct state invalid counter name dropped_in drop")
+                    .ok_or("missing invalid ingress guard")?;
+                let loopback = script
+                    .find("iifname \"lo\" ct direction original")
+                    .ok_or("missing loopback rule")?;
+                assert!(invalid < loopback);
+                assert!(!script.contains(direct_accept));
+                let deny_queue = script.find("queue num 1337").ok_or("missing deny queue")?;
+                let observer = script
+                    .find("queue num 1338 bypass")
+                    .ok_or("missing observer")?;
+                assert!(deny_queue < observer);
+                assert!(script.contains("counter name dropped_out reject"));
+            } else {
+                assert!(!script.contains("iifname \"lo\" ct direction original"));
+                assert!(!script.contains("queue num 1338"));
+                assert!(!script.contains("limit rate 64/second"));
+                assert_eq!(script.contains(direct_accept), mode == Mode::Enforcing);
+            }
+        }
         Ok(())
     }
 
