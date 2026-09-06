@@ -352,18 +352,29 @@ the first available identity in this fixed priority order:
 2. exact validated executable path, without command-line arguments;
 3. destination IP network (including a distinct "any destination" group).
 
-Only that one value is the group key. The right pane retains the individual
-rules and shows their protocol, destination, port or range, interface, command
-line, UID, executable file-version identity, origin, action, enabled state, UUID, and
-timestamps. Grouping is a presentation operation only: it never combines
-rules, changes their AND matching semantics, or turns a single-rule action into
-a group-wide policy change. `Up`/`Down` select a group and `Left`/`Right`
-select an individual rule in that group. `PageUp`/`PageDown` scroll the full
-detail pane without truncating bounded selectors. `n` creates a rule for the current
+Cgroup roots have always-expanded child rows for each visible executable path;
+arguments do not split those children. Executable-path and destination fallback
+groups remain root rows. `Up`/`Down` select a root or child row, and `Left`/`Right`
+select an individual rule within that row. The right pane shows the selected
+rule's network and application selectors, origin, action, enabled state, UUID,
+and timestamps; `PageUp`/`PageDown` scroll its full details. Grouping preserves
+each rule and its AND matching semantics. `n` creates a rule for the current
 direction, `e` edits the selected rule, `d` deletes it, and `Space` toggles only
-that selected rule. A disabled application template is shown in the same group;
-review it carefully before enabling its intentionally unrestricted outbound
-`accept` action.
+that rule.
+
+On Outbound, root can press `g` to choose Delete, Accept, Reject, Drop, Disable,
+or Enable for the selected row. A cgroup root covers all its rules; an executable
+child covers only that exact path within the cgroup, regardless of arguments.
+A fallback executable or destination group covers all rules in that group.
+Every action requires confirmation: `Y` applies it; `N`, `Esc`, or `Enter`
+cancels. The selector and policy revision are fixed when the menu opens. The
+daemon applies the group change atomically through one candidate policy and
+one backend/persistence commit; changed rules may emit consecutive event
+revisions. A conflict cancels the operation without automatic retry.
+Accept/Reject/Drop change only the action and preserve each rule's enabled
+state. Enable and Disable set the requested state, so repeating either does not
+toggle it. Disabled application templates are included: Enable activates them
+too and may allow unrestricted access through their outbound `accept` action.
 
 The Inbound tab is intentionally separate. It creates explicit inbound allow
 rules scoped by source network, local port or range, interface, and protocol;

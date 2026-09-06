@@ -5,7 +5,7 @@ use openshield_core::{
     CounterValue, Direction, Event, EventKind, Mode, Rule, RuleAction, RuleOrigin,
     TransportProtocol,
 };
-use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
+use openshield_protocol::{CompatibilityLevel, CompatibilityReason, OutboundGroupAction};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -18,8 +18,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, CommandMode, ConnectionState, FormField, OutboundGroupKey, Overlay, RuleForm, View,
-    peer_label,
+    App, CommandMode, ConnectionState, FormField, GROUP_ACTIONS, GroupTarget, OutboundGroupKey,
+    Overlay, RuleForm, View, peer_label,
 };
 use crate::i18n::I18n;
 
@@ -925,6 +925,24 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
             &i18n.format("overlay.delete_body", &[("name", one_line(name).as_str())]),
             Color::Yellow,
         ),
+        Overlay::GroupMenu { target, selected } => draw_group_menu(frame, target, *selected, i18n),
+        Overlay::ConfirmGroup { target, action } => {
+            let body = i18n.format(
+                "group.confirm_body",
+                &[
+                    ("action", group_action_label(*action, i18n)),
+                    ("group", group_dialog_label(target, frame.area()).as_str()),
+                    ("count", target.count.to_string().as_str()),
+                ],
+            );
+            let body = format!("{body}\n\n{}", i18n.tr("group.semantics"));
+            draw_group_dialog(
+                frame,
+                i18n.tr("group.confirm_title"),
+                Text::from(body),
+                Color::Yellow,
+            );
+        }
         Overlay::Editor(form) => draw_editor(frame, form, i18n),
         Overlay::Message { title, body } => {
             let area = centered_rect(70, 9, frame.area());
@@ -937,6 +955,81 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
             );
         }
     }
+}
+
+pub fn group_action_label(action: OutboundGroupAction, i18n: &I18n) -> &str {
+    i18n.tr(match action {
+        OutboundGroupAction::Delete => "group.delete",
+        OutboundGroupAction::Accept => "rule_action.accept",
+        OutboundGroupAction::Reject => "rule_action.reject",
+        OutboundGroupAction::Drop => "rule_action.drop",
+        OutboundGroupAction::Disable => "group.disable",
+        OutboundGroupAction::Enable => "group.enable",
+    })
+}
+
+fn draw_group_menu(
+    frame: &mut Frame<'_>,
+    target: &GroupTarget,
+    selected: OutboundGroupAction,
+    i18n: &I18n,
+) {
+    let scope = i18n.format(
+        "group.scope",
+        &[
+            ("group", group_dialog_label(target, frame.area()).as_str()),
+            ("count", target.count.to_string().as_str()),
+        ],
+    );
+    let mut text = Text::from(scope);
+    text.push_line("");
+    for (index, action) in GROUP_ACTIONS.into_iter().enumerate() {
+        let marker = if action == selected { "▶" } else { " " };
+        let style = if action == selected {
+            selected_style()
+        } else {
+            Style::default()
+        };
+        text.push_line(Line::styled(
+            format!(
+                "{marker} {}. {}",
+                index + 1,
+                group_action_label(action, i18n)
+            ),
+            style,
+        ));
+    }
+    text.push_line("");
+    text.push_line(i18n.tr("group.hint").to_owned());
+    text.push_line("");
+    text.lines
+        .extend(Text::from(i18n.tr("group.semantics").to_owned()).lines);
+    draw_group_dialog(frame, i18n.tr("group.title"), text, Color::Cyan);
+}
+
+fn group_dialog_label(target: &GroupTarget, terminal: Rect) -> String {
+    let area = centered_rect(90, 23, terminal);
+    // A very long cgroup/path must not push actions and the broad-template
+    // warning out of the dialog. Only the displayed label is abbreviated.
+    clipped_counter_label(
+        &one_line(&target.label),
+        usize::from(area.width.saturating_sub(2)) * 2,
+    )
+}
+
+fn draw_group_dialog(frame: &mut Frame<'_>, title: &str, text: Text<'static>, color: Color) {
+    let area = centered_rect(90, 23, frame.area());
+    let lines = hard_wrap_lines(text.lines, area.width.saturating_sub(2).max(1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(title),
+        ),
+        area,
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1730,6 +1823,60 @@ mod tests {
     }
 
     #[test]
+    fn group_dialogs_show_actions_scope_and_template_warning_in_every_locale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = GroupTarget {
+            selector: openshield_protocol::OutboundGroupSelector::Destination {
+                peer_network: None,
+            },
+            label: format!("/system.slice/{}.service", "long-name-".repeat(100)),
+            count: 321,
+        };
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace() && *ch != '│')
+                .collect::<String>()
+        };
+        for &locale in Locale::SUPPORTED {
+            let mut app = App::new(false, I18n::load(locale)?);
+            for (width, height) in [(80, 24), (120, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+                for confirmation in [false, true] {
+                    app.overlay = if confirmation {
+                        Overlay::ConfirmGroup {
+                            target: target.clone(),
+                            action: OutboundGroupAction::Enable,
+                        }
+                    } else {
+                        Overlay::GroupMenu {
+                            target: target.clone(),
+                            selected: OutboundGroupAction::Enable,
+                        }
+                    };
+                    terminal.draw(|frame| draw_overlay(frame, &app))?;
+                    let screen = buffer_text(terminal.backend());
+                    assert!(screen.contains("321"), "{locale}: {screen}");
+                    assert!(screen.contains('…'), "{locale}: {screen}");
+                    assert!(
+                        compact(&screen).contains(&compact(app.i18n.tr("group.semantics"))),
+                        "warning hidden in {locale} at {width}x{height}: {screen}"
+                    );
+                    if !confirmation {
+                        for action in GROUP_ACTIONS {
+                            assert!(
+                                compact(&screen)
+                                    .contains(&compact(group_action_label(action, &app.i18n))),
+                                "action hidden in {locale}: {screen}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn emergency_quarantine_renders_level_and_reason_in_red()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::new(true, I18n::test_english());
@@ -2200,11 +2347,19 @@ mod tests {
     }
 
     fn buffer_text(backend: &TestBackend) -> String {
-        backend
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect()
+        let buffer = backend.buffer();
+        let mut text = String::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let mut x = buffer.area.x;
+            while x < buffer.area.right() {
+                let symbol = buffer[(x, y)].symbol();
+                text.push_str(symbol);
+                // TestBackend can retain old symbols under the trailing cell
+                // of a wide glyph. A real terminal does not display those cells.
+                x = x.saturating_add(u16::try_from(symbol.width()).unwrap_or(u16::MAX).max(1));
+            }
+            text.push('\n');
+        }
+        text
     }
 }

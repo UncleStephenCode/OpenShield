@@ -6,7 +6,10 @@ use openshield_core::{
     MAX_COMMAND_LINE_BYTES, Mode, PortRange, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec,
     Snapshot, TransportProtocol,
 };
-use openshield_protocol::{ControlRequest, FirewallBackendKind, RuntimeCompatibility};
+use openshield_protocol::{
+    ControlRequest, FirewallBackendKind, OutboundGroupAction, OutboundGroupSelector,
+    RuntimeCompatibility,
+};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -817,14 +820,46 @@ const fn cycle_rule_action(action: RuleAction, reverse: bool) -> RuleAction {
     }
 }
 
+pub const GROUP_ACTIONS: [OutboundGroupAction; 6] = [
+    OutboundGroupAction::Delete,
+    OutboundGroupAction::Accept,
+    OutboundGroupAction::Reject,
+    OutboundGroupAction::Drop,
+    OutboundGroupAction::Disable,
+    OutboundGroupAction::Enable,
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupTarget {
+    pub selector: OutboundGroupSelector,
+    pub label: String,
+    pub count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
     None,
-    ModePicker { selected: Mode },
+    ModePicker {
+        selected: Mode,
+    },
     ConfirmBlockAll,
     Editor(Box<RuleForm>),
-    ConfirmDelete { id: Uuid, name: String },
-    Message { title: String, body: String },
+    ConfirmDelete {
+        id: Uuid,
+        name: String,
+    },
+    GroupMenu {
+        target: GroupTarget,
+        selected: OutboundGroupAction,
+    },
+    ConfirmGroup {
+        target: GroupTarget,
+        action: OutboundGroupAction,
+    },
+    Message {
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1301,6 +1336,122 @@ impl App {
         })
     }
 
+    pub fn open_group_menu(&mut self) {
+        if !self.require_write_access() || self.view != View::Outbound {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            self.notice = Some(self.i18n.tr("notice.wait_snapshot").to_owned());
+            return;
+        };
+        let revision = snapshot.revision;
+        let Some(target) = self.selected_group_target() else {
+            self.notice = Some(self.i18n.tr("notice.no_rule_selected").to_owned());
+            return;
+        };
+        // Freeze both scope and revision at menu opening. Later learning events
+        // cannot silently enlarge a confirmed group operation.
+        self.pending_revision = Some(revision);
+        self.overlay = Overlay::GroupMenu {
+            target,
+            selected: GROUP_ACTIONS[0],
+        };
+    }
+
+    fn selected_group_target(&self) -> Option<GroupTarget> {
+        let nodes = self.outbound_nodes();
+        let node = &nodes[self.selected_outbound_node_index(&nodes)?];
+        let (selector, label) = match &node.key {
+            OutboundGroupKey::Cgroup(cgroup) => {
+                let executable = node.executable.map(ApplicationPath::new).transpose().ok()?;
+                let label = node
+                    .executable
+                    .map_or_else(|| cgroup.to_string(), |path| format!("{cgroup} → {path}"));
+                (
+                    OutboundGroupSelector::Cgroup {
+                        cgroup: CgroupPath::new(cgroup.as_ref()).ok()?,
+                        executable,
+                    },
+                    label,
+                )
+            }
+            OutboundGroupKey::Executable(path) => (
+                OutboundGroupSelector::Executable {
+                    executable: ApplicationPath::new(path.as_ref()).ok()?,
+                },
+                path.to_string(),
+            ),
+            OutboundGroupKey::Destination(peer_network) => (
+                OutboundGroupSelector::Destination {
+                    peer_network: *peer_network,
+                },
+                peer_network.map_or_else(
+                    || self.i18n.tr("common.any").to_owned(),
+                    |network| network.to_string(),
+                ),
+            ),
+        };
+        Some(GroupTarget {
+            selector,
+            label,
+            count: node.rules.len(),
+        })
+    }
+
+    pub fn move_group_action(&mut self, reverse: bool) {
+        let Overlay::GroupMenu { selected, .. } = &mut self.overlay else {
+            return;
+        };
+        let index = GROUP_ACTIONS
+            .iter()
+            .position(|action| action == selected)
+            .unwrap_or(0);
+        let index = if reverse {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(GROUP_ACTIONS.len() - 1)
+        };
+        *selected = GROUP_ACTIONS[index];
+    }
+
+    pub fn request_group_action(&mut self, action: OutboundGroupAction) {
+        if !self.require_write_access() {
+            self.close_overlay();
+            return;
+        }
+        let Overlay::GroupMenu { target, .. } = &self.overlay else {
+            return;
+        };
+        self.overlay = Overlay::ConfirmGroup {
+            target: target.clone(),
+            action,
+        };
+    }
+
+    pub fn confirm_group_action(&mut self, confirmed: bool) -> Option<ControlRequest> {
+        if !matches!(self.overlay, Overlay::ConfirmGroup { .. }) {
+            return None;
+        }
+        if !confirmed || !self.require_write_access() {
+            self.close_overlay();
+            return None;
+        }
+        let Overlay::ConfirmGroup { target, action } =
+            std::mem::replace(&mut self.overlay, Overlay::None)
+        else {
+            return None;
+        };
+        let Some(expected_revision) = self.pending_revision.take() else {
+            self.notice = Some(self.i18n.tr("notice.base_revision_missing").to_owned());
+            return None;
+        };
+        Some(ControlRequest::ManageOutboundGroup {
+            expected_revision,
+            group: target.selector,
+            action,
+        })
+    }
+
     pub fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
         self.pending_revision = None;
@@ -1683,6 +1834,9 @@ mod tests {
 
         app.open_mode_picker();
         app.open_create_rule();
+        app.open_group_menu();
+        app.request_group_action(OutboundGroupAction::Delete);
+        assert!(app.confirm_group_action(true).is_none());
 
         assert_eq!(app.overlay, Overlay::None);
         assert!(app.request_mode(Mode::Learning).is_none());
@@ -3191,6 +3345,127 @@ mod tests {
                 }) if id == selected_id
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn group_menu_scope_matches_the_displayed_tree_members()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut rules = outbound_tree_fixture()?;
+        rules.push(test_rule(
+            "destination",
+            Direction::Outbound,
+            Some("198.51.100.1"),
+            None,
+            None,
+            None,
+        )?);
+        rules.push(test_rule(
+            "inbound",
+            Direction::Inbound,
+            Some("198.51.100.1"),
+            None,
+            None,
+            None,
+        )?);
+        let mut app = outbound_tree_app(false, rules.clone());
+        let node_count = app.outbound_nodes().len();
+        for index in 0..node_count {
+            let expected = app.outbound_nodes()[index]
+                .rules
+                .iter()
+                .map(|rule| rule.id)
+                .collect::<HashSet<_>>();
+            app.open_group_menu();
+            let Overlay::GroupMenu { target, .. } = &app.overlay else {
+                return Err("missing menu".into());
+            };
+            assert_eq!(target.count, expected.len());
+            let matched = rules
+                .iter()
+                .filter(|rule| target.selector.matches(rule))
+                .map(|rule| rule.id)
+                .collect::<HashSet<_>>();
+            assert_eq!(matched, expected, "row {index}");
+            app.close_overlay();
+            app.select_next_rule();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_menu_freezes_scope_and_revision_until_explicit_confirmation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for action in GROUP_ACTIONS {
+            let mut app = outbound_tree_app(false, outbound_tree_fixture()?);
+            app.select_next_rule();
+            app.open_group_menu();
+            let Overlay::GroupMenu { target, .. } = &app.overlay else {
+                return Err("missing menu".into());
+            };
+            let expected = target.clone();
+            assert_eq!(expected.count, 2);
+            let mut snapshot = app.snapshot.clone().ok_or("missing snapshot")?;
+            snapshot.revision = 2;
+            snapshot.rules.clear();
+            app.set_snapshot(snapshot);
+            app.request_group_action(action);
+            assert!(
+                matches!(&app.overlay, Overlay::ConfirmGroup { target, action: selected } if target == &expected && *selected == action)
+            );
+            assert_eq!(
+                app.confirm_group_action(true),
+                Some(ControlRequest::ManageOutboundGroup {
+                    expected_revision: 1,
+                    group: expected.selector,
+                    action,
+                })
+            );
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(app.confirm_group_action(true).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_menu_cancels_on_disconnect_and_rechecks_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        for view in [View::Status, View::Inbound, View::Events, View::Help] {
+            let mut app = outbound_tree_app(false, rules.clone());
+            app.view = view;
+            app.open_group_menu();
+            assert_eq!(app.overlay, Overlay::None);
+        }
+        let mut app = outbound_tree_app(true, rules.clone());
+        app.open_group_menu();
+        assert_eq!(app.overlay, Overlay::None);
+        for revoked in [false, true] {
+            let mut app = outbound_tree_app(false, rules.clone());
+            app.open_group_menu();
+            app.request_group_action(OutboundGroupAction::Enable);
+            if revoked {
+                app.read_only = true;
+            } else {
+                app.set_disconnected("test".to_owned());
+            }
+            assert!(app.confirm_group_action(true).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+            assert_eq!(app.pending_revision, None);
+        }
+        let mut app = outbound_tree_app(false, rules);
+        app.open_group_menu();
+        app.request_group_action(OutboundGroupAction::Delete);
+        assert!(app.confirm_group_action(false).is_none());
+        assert_eq!(app.pending_revision, None);
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        });
+        app.open_group_menu();
+        assert_eq!(app.overlay, Overlay::None);
         Ok(())
     }
 

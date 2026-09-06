@@ -70,6 +70,17 @@ or EOF after sending a command is treated as an unconfirmed outcome because the
 daemon may have committed before its acknowledgement was lost. The TUI warns
 against retrying and resynchronizes instead of claiming the change failed.
 
+`ManageOutboundGroup` (wire name `manage_outbound_group`) applies only to
+outbound rules. Its selector identifies an exact cgroup path, optionally
+restricted to an exact executable path within that cgroup; a fallback executable
+group without a cgroup; or a fallback destination CIDR (`None` means any
+destination). Arguments do not split executable groups. The TUI freezes the
+selector and `expected_revision` when the group menu opens. The daemon stages
+all changes in one candidate policy and commits the backend and persistence
+once, while changed rules retain consecutive event revisions. Root-only control
+still applies, and Accept/Reject/Drop preserve each rule's enabled state.
+Older daemons reject the unknown command; update the daemon and TUI together.
+
 ## TUI policy projection
 
 The TUI separates Status, Outbound rules, Inbound rules, Events, and Help into
@@ -105,7 +116,9 @@ rejects an inbound `Drop` or `Reject` even if a client bypasses the TUI.
 `Left`/`Right` change the selected member of an outbound group.
 `PageUp`/`PageDown` scroll the complete, bounded rule detail projection. The
 current tab supplies the direction for `n`; `e`, `d`, and `Space` act on one
-selected UUID. The daemon still independently enforces root-only control;
+selected UUID. On Outbound, `g` opens the actions for the selected group row
+(including an executable child), and every group action requires confirmation.
+The daemon still independently enforces root-only control;
 authorized non-root `openshield` observers can navigate only the redacted,
 read-only projection.
 
