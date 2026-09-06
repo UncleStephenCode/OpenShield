@@ -200,21 +200,24 @@ fn draw_status(
                 i18n.format("status.age", &[("duration", duration.as_str())])
             },
         );
-        lines.extend([
-            Line::from(Span::styled(
-                i18n.format("status.counters_title", &[("age", age.as_str())]),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            counter_line(i18n.tr("status.counter_accepted_in"), counters.accepted_in),
-            counter_line(
-                i18n.tr("status.counter_accepted_out"),
-                counters.accepted_out,
-            ),
-            counter_line(i18n.tr("status.counter_dropped_in"), counters.dropped_in),
-            counter_line(i18n.tr("status.counter_dropped_out"), counters.dropped_out),
-            counter_line(i18n.tr("status.counter_learned_out"), counters.learned_out),
-            Line::from(""),
-        ]);
+        lines.push(Line::from(Span::styled(
+            i18n.format("status.counters_title", &[("age", age.as_str())]),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(counter_lines(
+            &[
+                (i18n.tr("status.counter_accepted_in"), counters.accepted_in),
+                (
+                    i18n.tr("status.counter_accepted_out"),
+                    counters.accepted_out,
+                ),
+                (i18n.tr("status.counter_dropped_in"), counters.dropped_in),
+                (i18n.tr("status.counter_dropped_out"), counters.dropped_out),
+                (i18n.tr("status.counter_learned_out"), counters.learned_out),
+            ],
+            usize::from(area.width.saturating_sub(2)),
+        ));
+        lines.push(Line::from(""));
     } else {
         lines.push(Line::from(i18n.tr("status.counters_waiting")));
         lines.push(Line::from(""));
@@ -335,39 +338,53 @@ fn draw_outbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(area);
-    let groups = app.outbound_groups();
-    let group_rows = groups
+    let nodes = app.outbound_nodes();
+    let selected_node = app.selected_outbound_node_index(&nodes);
+    let group_rows = nodes
         .iter()
-        .map(|group| {
-            let active = group.rules.iter().filter(|rule| rule.spec.enabled).count();
-            let state = if active == group.rules.len() {
+        .map(|node| {
+            let active = node.rules.iter().filter(|rule| rule.spec.enabled).count();
+            let state = if active == node.rules.len() {
                 "●"
             } else if active == 0 {
                 "○"
             } else {
                 "◐"
             };
+            let label = node.executable.map_or_else(
+                || {
+                    format!(
+                        "{} {}",
+                        group_kind_label(&node.key, i18n),
+                        group_value_label(&node.key, i18n)
+                    )
+                },
+                |path| {
+                    format!(
+                        "  {} {}",
+                        if node.last_child { "└" } else { "├" },
+                        one_line(path)
+                    )
+                },
+            );
             Row::new([
                 Cell::from(state),
-                Cell::from(group_kind_label(&group.key, i18n)),
-                Cell::from(group_value_label(&group.key, i18n)),
-                Cell::from(group.rules.len().to_string()),
+                Cell::from(label),
+                Cell::from(node.rules.len().to_string()),
             ])
         })
         .collect::<Vec<_>>();
     let group_header = styled_header([
         i18n.tr("rules.column_enabled"),
         i18n.tr("rules.column_group"),
-        "",
         i18n.tr("rules.column_count"),
     ]);
     let group_table = Table::new(
         group_rows,
         [
-            Constraint::Length(4),
-            Constraint::Length(11),
+            Constraint::Length(3),
             Constraint::Min(12),
-            Constraint::Length(6),
+            Constraint::Length(5),
         ],
     )
     .header(group_header)
@@ -378,16 +395,14 @@ fn draw_outbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
     )
     .row_highlight_style(selected_style())
     .highlight_symbol("▶ ");
-    let mut group_state = TableState::default()
-        .with_selected((!groups.is_empty()).then_some(app.selected_outbound_group_index()));
+    let mut group_state = TableState::default().with_selected(selected_node);
     frame.render_stateful_widget(group_table, areas[0], &mut group_state);
 
     let right = Layout::default()
         .direction(LayoutDirection::Vertical)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(areas[1]);
-    let selected_group = groups.get(app.selected_outbound_group_index());
-    let members = selected_group.map_or(&[][..], |group| group.rules.as_slice());
+    let members = selected_node.map_or(&[][..], |index| nodes[index].rules.as_slice());
     draw_rule_table(
         frame,
         members,
@@ -1401,11 +1416,83 @@ fn safe_multiline(value: &str) -> String {
         .collect()
 }
 
-fn counter_line(label: &str, value: CounterValue) -> Line<'static> {
-    Line::from(format!(
-        "  {label:<16} {:>12} / {:>16}",
-        value.packets, value.bytes
-    ))
+fn counter_lines(rows: &[(&str, CounterValue)], width: usize) -> Vec<Line<'static>> {
+    let rows = rows
+        .iter()
+        .map(|(label, value)| (*label, value.packets.to_string(), value.bytes.to_string()))
+        .collect::<Vec<_>>();
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| label.width())
+        .max()
+        .unwrap_or(0);
+    let packet_width = rows
+        .iter()
+        .map(|(_, packets, _)| packets.len())
+        .max()
+        .unwrap_or(0);
+    let byte_width = rows
+        .iter()
+        .map(|(_, _, bytes)| bytes.len())
+        .max()
+        .unwrap_or(0);
+
+    // Reserve the indentation, column gap and separator. Prefer complete
+    // numbers, while retaining enough of a clipped label to identify its row.
+    let available = width.saturating_sub(6);
+    let numeric_space = available.saturating_sub(label_width.min(8));
+    let packet_space = packet_width.min(numeric_space / 2);
+    let byte_space = byte_width.min(numeric_space - packet_space);
+    let packet_space = packet_width.min(numeric_space - byte_space);
+    let label_space = label_width.min(available - packet_space - byte_space);
+    let spare = available - label_space - packet_space - byte_space;
+    let packet_padding = 12_usize.saturating_sub(packet_space).min(spare);
+    let packet_space = packet_space + packet_padding;
+    let byte_space = byte_space
+        + 16_usize
+            .saturating_sub(byte_space)
+            .min(spare - packet_padding);
+
+    rows.into_iter()
+        .map(|(label, packets, bytes)| {
+            let label = clipped_counter_label(label, label_space);
+            let padding = " ".repeat(label_space.saturating_sub(label.width()));
+            // Never present a partial integer as though it were the full count.
+            let packets = if packets.len() <= packet_space {
+                packets.as_str()
+            } else if packet_space == 0 {
+                ""
+            } else {
+                "…"
+            };
+            let bytes = if bytes.len() <= byte_space {
+                bytes.as_str()
+            } else if byte_space == 0 {
+                ""
+            } else {
+                "…"
+            };
+            let line =
+                format!("  {label}{padding} {packets:>packet_space$} / {bytes:>byte_space$}");
+            Line::from(clipped_counter_label(&line, width))
+        })
+        .collect()
+}
+
+fn clipped_counter_label(label: &str, width: usize) -> String {
+    if label.width() <= width {
+        return label.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let end = label
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|&index| label[..index].width() < width)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &label[..end])
 }
 
 #[cfg(test)]
@@ -1420,6 +1507,174 @@ mod tests {
 
     use super::*;
     use crate::i18n::Locale;
+
+    #[test]
+    fn counter_columns_align_in_every_locale() -> Result<(), Box<dyn std::error::Error>> {
+        for &locale in Locale::SUPPORTED {
+            let i18n = I18n::load(locale)?;
+            let rows = [
+                "status.counter_accepted_in",
+                "status.counter_accepted_out",
+                "status.counter_dropped_in",
+                "status.counter_dropped_out",
+                "status.counter_learned_out",
+            ]
+            .map(|key| {
+                (
+                    i18n.tr(key),
+                    CounterValue {
+                        packets: 123,
+                        bytes: 456,
+                    },
+                )
+            });
+            let lines = counter_lines(&rows, 118);
+            let mut terminal = Terminal::new(TestBackend::new(118, 5))?;
+            terminal.draw(|frame| {
+                frame.render_widget(Paragraph::new(lines.clone()), frame.area());
+            })?;
+            let buffer = terminal.backend().buffer();
+            let expected = (0..118)
+                .filter(|&x| matches!(buffer[(x, 0)].symbol(), "1" | "/" | "4"))
+                .collect::<Vec<_>>();
+            assert_eq!(expected.len(), 3, "locale {locale}");
+            for y in 1..5 {
+                let actual = (0..118)
+                    .filter(|&x| matches!(buffer[(x, y)].symbol(), "1" | "/" | "4"))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "locale {locale}, row {y}");
+            }
+            for ((label, _), line) in rows.iter().zip(&lines) {
+                assert!(line.to_string().contains(*label), "locale {locale}: {line}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn counter_columns_share_width_for_large_values_and_unicode_labels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = [
+            (
+                "in",
+                CounterValue {
+                    packets: 1,
+                    bytes: 2,
+                },
+            ),
+            (
+                "принято исходящих",
+                CounterValue {
+                    packets: u64::MAX,
+                    bytes: 3,
+                },
+            ),
+            (
+                "已丢弃入站",
+                CounterValue {
+                    packets: 4,
+                    bytes: u64::MAX,
+                },
+            ),
+            (
+                "e\u{301}",
+                CounterValue {
+                    packets: 5,
+                    bytes: 6,
+                },
+            ),
+        ];
+        let lines = counter_lines(&rows, 118);
+        let mut separator_columns = Vec::new();
+        let mut byte_ends = Vec::new();
+        for ((label, value), line) in rows.iter().zip(&lines) {
+            let text = line.to_string();
+            let (packets, bytes) = text.split_once(" / ").ok_or("missing counter separator")?;
+            assert!(text.contains(*label), "{text}");
+            assert!(packets.ends_with(&value.packets.to_string()), "{text}");
+            assert_eq!(bytes.trim(), value.bytes.to_string());
+            separator_columns.push(packets.width());
+            byte_ends.push(text.width());
+        }
+        assert!(separator_columns.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(byte_ends.windows(2).all(|pair| pair[0] == pair[1]));
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_counter_rows_fit_without_wrapping_or_partial_numbers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = [
+            (
+                "принято входящих",
+                CounterValue {
+                    packets: 7,
+                    bytes: 8,
+                },
+            ),
+            (
+                "принято исходящих",
+                CounterValue {
+                    packets: 9,
+                    bytes: u64::MAX,
+                },
+            ),
+            (
+                "заблокировано входящих",
+                CounterValue {
+                    packets: u64::MAX,
+                    bytes: 0,
+                },
+            ),
+            (
+                "已丢弃出站",
+                CounterValue {
+                    packets: 1,
+                    bytes: 2,
+                },
+            ),
+            (
+                "e\u{301} learned outbound",
+                CounterValue {
+                    packets: 3,
+                    bytes: 4,
+                },
+            ),
+        ];
+        assert!(counter_lines(&rows, 0).iter().all(|line| line.width() == 0));
+        for width in [1_u16, 5, 10, 20, 38, 60, 80] {
+            let mut lines = counter_lines(&rows, usize::from(width));
+            for line in &lines {
+                assert!(line.width() <= usize::from(width), "width {width}: {line}");
+                let text = line.to_string();
+                if let Some((label_and_packets, bytes)) = text.split_once(" / ") {
+                    let packet = label_and_packets
+                        .rsplit_once(' ')
+                        .map_or("", |(_, number)| number);
+                    for number in [packet, bytes.trim()] {
+                        assert!(
+                            number.len() <= 1 || number == "…" || number == u64::MAX.to_string(),
+                            "partial number at width {width}: {text}"
+                        );
+                    }
+                }
+            }
+            lines.push(Line::from("X"));
+            let mut terminal = Terminal::new(TestBackend::new(width, 6))?;
+            terminal.draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(lines.clone()).wrap(Wrap { trim: false }),
+                    frame.area(),
+                );
+            })?;
+            assert_eq!(
+                terminal.backend().buffer()[(0, 5)].symbol(),
+                "X",
+                "width {width}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn status_renders_verified_backend_instead_of_subscription_wording()
@@ -1674,6 +1929,121 @@ mod tests {
             );
         }
         assert!(!inbound_screen.contains("/usr/bin/updater"));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercise root and both children in two locales.
+    fn outbound_tree_renders_branches_and_filters_both_right_panes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for locale in [Locale::En, Locale::Ru] {
+            let mut rules = Vec::new();
+            for (path, peer, name) in [
+                (
+                    "/usr/libexec/nm-daemon-helper",
+                    "203.0.113.11",
+                    "helper-one",
+                ),
+                (
+                    "/usr/libexec/nm-daemon-helper",
+                    "203.0.113.12",
+                    "helper-two",
+                ),
+                ("/usr/sbin/NetworkManager", "198.51.100.9", "manager-only"),
+            ] {
+                let mut form = RuleForm::default();
+                form.name = name.to_owned();
+                form.protocol = TransportProtocol::Tcp;
+                form.port = "443".to_owned();
+                form.peer_network = peer.to_owned();
+                form.bind_application = true;
+                form.executable = path.to_owned();
+                form.cgroup = "/system.slice/NetworkManager.service".to_owned();
+                rules.push(Rule::new(
+                    form.to_rule_spec(&I18n::test_english())
+                        .map_err(std::io::Error::other)?,
+                )?);
+            }
+            let mut app = App::new(false, I18n::load(locale)?);
+            app.view = View::Outbound;
+            app.set_snapshot(Snapshot {
+                revision: 1,
+                flow_generation: 1,
+                mode: Mode::Learning,
+                rules,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(220, 44))?;
+            for row in 0..3 {
+                terminal.draw(|frame| draw_outbound_rules(frame, &app, frame.area()))?;
+                let screen = buffer_text(terminal.backend());
+                assert!(
+                    screen.contains("/system.slice/NetworkManager.service"),
+                    "{screen}"
+                );
+                assert!(
+                    screen.contains("├ /usr/libexec/nm-daemon-helper"),
+                    "{screen}"
+                );
+                assert!(screen.contains("└ /usr/sbin/NetworkManager"), "{screen}");
+                // Inspect the actual right-hand cells: both paths deliberately
+                // remain visible in the left tree even when filtered out here.
+                let right = Layout::default()
+                    .direction(LayoutDirection::Horizontal)
+                    .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+                    .split(Rect::new(0, 0, 220, 44))[1];
+                let buffer = terminal.backend().buffer();
+                let right_text = (right.y..right.bottom())
+                    .map(|y| {
+                        (right.x..right.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(
+                    right_text.contains("203.0.113.11"),
+                    row != 2,
+                    "{right_text}"
+                );
+                assert_eq!(
+                    right_text.contains("203.0.113.12"),
+                    row != 2,
+                    "{right_text}"
+                );
+                assert_eq!(
+                    right_text.contains("198.51.100.9"),
+                    row != 1,
+                    "{right_text}"
+                );
+                if row == 1 {
+                    assert!(
+                        right_text.contains("/usr/libexec/nm-daemon-helper"),
+                        "{right_text}"
+                    );
+                    assert!(
+                        !right_text.contains("/usr/sbin/NetworkManager"),
+                        "{right_text}"
+                    );
+                } else if row == 2 {
+                    assert!(
+                        right_text.contains("/usr/sbin/NetworkManager"),
+                        "{right_text}"
+                    );
+                    assert!(
+                        !right_text.contains("/usr/libexec/nm-daemon-helper"),
+                        "{right_text}"
+                    );
+                }
+                app.select_next_rule();
+            }
+            app.select_previous_rule();
+            app.select_previous_rule();
+            terminal.draw(|frame| draw_outbound_rules(frame, &app, frame.area()))?;
+            let screen = buffer_text(terminal.backend());
+            for peer in ["203.0.113.11", "203.0.113.12", "198.51.100.9"] {
+                assert!(screen.contains(peer), "{screen}");
+            }
+        }
         Ok(())
     }
 

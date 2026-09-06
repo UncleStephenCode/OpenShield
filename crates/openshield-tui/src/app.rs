@@ -707,6 +707,46 @@ pub struct OutboundGroup<'a> {
     pub rules: Vec<&'a Rule>,
 }
 
+/// An expanded tree row. Root rows include every rule in their group; executable
+/// children include only that path within the cgroup, regardless of arguments.
+#[derive(Debug)]
+pub struct OutboundNode<'a> {
+    pub key: OutboundGroupKey<'a>,
+    pub executable: Option<&'a str>,
+    pub last_child: bool,
+    pub rules: Vec<&'a Rule>,
+    group_index: usize,
+}
+
+struct OutboundSelection {
+    group_index: usize,
+    key: OutboundGroupKey<'static>,
+    executable: Option<String>,
+    member_index: usize,
+    rule_id: Uuid,
+}
+
+impl OutboundNode<'_> {
+    fn selection(&self, member_index: usize) -> Option<OutboundSelection> {
+        self.rules.get(member_index).map(|rule| OutboundSelection {
+            group_index: self.group_index,
+            key: self.key.to_owned_key(),
+            executable: self.executable.map(str::to_owned),
+            member_index,
+            rule_id: rule.id,
+        })
+    }
+}
+
+fn visible_executable(rule: &Rule) -> Option<&str> {
+    rule.spec
+        .application
+        .as_ref()
+        .filter(|application| !application.metadata_redacted)
+        .and_then(|application| application.executable.as_ref())
+        .map(ApplicationPath::as_str)
+}
+
 fn protocol_rank(protocol: TransportProtocol) -> u8 {
     match protocol {
         TransportProtocol::Any => 0,
@@ -803,6 +843,7 @@ pub struct App {
     selected_outbound_member: usize,
     selected_outbound_rule_id: Option<Uuid>,
     selected_outbound_group_key: Option<OutboundGroupKey<'static>>,
+    selected_outbound_executable: Option<String>,
     selected_inbound_rule: usize,
     selected_inbound_rule_id: Option<Uuid>,
     outbound_details_scroll: Cell<u16>,
@@ -834,6 +875,7 @@ impl App {
             selected_outbound_member: 0,
             selected_outbound_rule_id: None,
             selected_outbound_group_key: None,
+            selected_outbound_executable: None,
             selected_inbound_rule: 0,
             selected_inbound_rule_id: None,
             outbound_details_scroll: Cell::new(0),
@@ -1293,6 +1335,47 @@ impl App {
     }
 
     #[must_use]
+    pub fn outbound_nodes(&self) -> Vec<OutboundNode<'_>> {
+        let mut nodes = Vec::new();
+        for (group_index, group) in self.outbound_groups().into_iter().enumerate() {
+            let mut children = BTreeMap::<&str, Vec<&Rule>>::new();
+            if matches!(&group.key, OutboundGroupKey::Cgroup(_)) {
+                for rule in &group.rules {
+                    if let Some(executable) = visible_executable(rule) {
+                        children.entry(executable).or_default().push(*rule);
+                    }
+                }
+            }
+            nodes.push(OutboundNode {
+                key: group.key.clone(),
+                executable: None,
+                last_child: false,
+                rules: group.rules,
+                group_index,
+            });
+            let child_count = children.len();
+            for (index, (executable, rules)) in children.into_iter().enumerate() {
+                nodes.push(OutboundNode {
+                    key: group.key.clone(),
+                    executable: Some(executable),
+                    last_child: index + 1 == child_count,
+                    rules,
+                    group_index,
+                });
+            }
+        }
+        nodes
+    }
+
+    #[must_use]
+    pub fn selected_outbound_node_index(&self, nodes: &[OutboundNode<'_>]) -> Option<usize> {
+        nodes.iter().position(|node| {
+            node.group_index == self.selected_outbound_group
+                && node.executable == self.selected_outbound_executable.as_deref()
+        })
+    }
+
+    #[must_use]
     pub fn inbound_rules(&self) -> Vec<&Rule> {
         let mut rules = self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
             snapshot
@@ -1303,11 +1386,6 @@ impl App {
         });
         rules.sort_unstable_by(|left, right| compare_inbound_rules(left, right));
         rules
-    }
-
-    #[must_use]
-    pub const fn selected_outbound_group_index(&self) -> usize {
-        self.selected_outbound_group
     }
 
     #[must_use]
@@ -1344,55 +1422,57 @@ impl App {
 
     fn select_outbound_group(&mut self, reverse: bool) {
         let target = {
-            let groups = self.outbound_groups();
-            if groups.is_empty() {
-                None
-            } else {
-                let index = if reverse {
-                    self.selected_outbound_group.saturating_sub(1)
-                } else {
-                    (self.selected_outbound_group + 1).min(groups.len() - 1)
-                };
-                groups[index]
-                    .rules
-                    .first()
-                    .map(|rule| (index, groups[index].key.to_owned_key(), rule.id))
-            }
+            let nodes = self.outbound_nodes();
+            self.selected_outbound_node_index(&nodes)
+                .and_then(|current| {
+                    let index = if reverse {
+                        current.saturating_sub(1)
+                    } else {
+                        (current + 1).min(nodes.len() - 1)
+                    };
+                    nodes[index].selection(0)
+                })
         };
-        if let Some((index, key, id)) = target {
-            if self.selected_outbound_rule_id != Some(id) {
-                self.outbound_details_scroll.set(0);
-            }
-            self.selected_outbound_group = index;
-            self.selected_outbound_member = 0;
-            self.selected_outbound_group_key = Some(key);
-            self.selected_outbound_rule_id = Some(id);
+        if let Some(target) = target {
+            self.set_outbound_selection(target);
         }
     }
 
     fn select_outbound_member(&mut self, reverse: bool) {
         let target = {
-            let groups = self.outbound_groups();
-            groups.get(self.selected_outbound_group).and_then(|group| {
-                if group.rules.is_empty() {
-                    None
-                } else {
-                    let index = if reverse {
-                        self.selected_outbound_member.saturating_sub(1)
+            let nodes = self.outbound_nodes();
+            self.selected_outbound_node_index(&nodes)
+                .and_then(|node_index| {
+                    let node = &nodes[node_index];
+                    if node.rules.is_empty() {
+                        None
                     } else {
-                        (self.selected_outbound_member + 1).min(group.rules.len() - 1)
-                    };
-                    Some((index, group.rules[index].id))
-                }
-            })
+                        let index = if reverse {
+                            self.selected_outbound_member.saturating_sub(1)
+                        } else {
+                            (self.selected_outbound_member + 1).min(node.rules.len() - 1)
+                        };
+                        node.selection(index)
+                    }
+                })
         };
-        if let Some((index, id)) = target {
-            if self.selected_outbound_rule_id != Some(id) {
-                self.outbound_details_scroll.set(0);
-            }
-            self.selected_outbound_member = index;
-            self.selected_outbound_rule_id = Some(id);
+        if let Some(target) = target {
+            self.set_outbound_selection(target);
         }
+    }
+
+    fn set_outbound_selection(&mut self, target: OutboundSelection) {
+        if self.selected_outbound_rule_id != Some(target.rule_id)
+            || self.selected_outbound_executable != target.executable
+            || self.selected_outbound_group_key.as_ref() != Some(&target.key)
+        {
+            self.outbound_details_scroll.set(0);
+        }
+        self.selected_outbound_group = target.group_index;
+        self.selected_outbound_group_key = Some(target.key);
+        self.selected_outbound_executable = target.executable;
+        self.selected_outbound_member = target.member_index;
+        self.selected_outbound_rule_id = Some(target.rule_id);
     }
 
     fn select_inbound_rule(&mut self, reverse: bool) {
@@ -1423,6 +1503,7 @@ impl App {
         self.selected_outbound_member = 0;
         self.selected_outbound_rule_id = None;
         self.selected_outbound_group_key = None;
+        self.selected_outbound_executable = None;
         self.selected_inbound_rule = 0;
         self.selected_inbound_rule_id = None;
         self.outbound_details_scroll.set(0);
@@ -1435,52 +1516,62 @@ impl App {
         let group_hint = self.selected_outbound_group;
         let member_hint = self.selected_outbound_member;
         let outbound = {
-            let groups = self.outbound_groups();
-            if groups.is_empty() {
+            let nodes = self.outbound_nodes();
+            let roots = nodes
+                .iter()
+                .filter(|node| node.executable.is_none())
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
                 None
             } else {
-                let selected_position = selected_id.and_then(|id| {
-                    groups.iter().enumerate().find_map(|(group_index, group)| {
-                        group
-                            .rules
+                let root = selected_id
+                    .and_then(|id| {
+                        roots
                             .iter()
-                            .position(|rule| rule.id == id)
-                            .map(|member_index| (group_index, member_index))
+                            .copied()
+                            .find(|node| node.rules.iter().any(|rule| rule.id == id))
                     })
-                });
-                let (group_index, member_index) = selected_position.unwrap_or_else(|| {
-                    let group_index = selected_key
-                        .as_ref()
-                        .and_then(|key| {
-                            groups
+                    .or_else(|| {
+                        selected_key.as_ref().and_then(|key| {
+                            roots
                                 .iter()
-                                .position(|group| key.same_identity(&group.key))
+                                .copied()
+                                .find(|node| key.same_identity(&node.key))
                         })
-                        .unwrap_or_else(|| group_hint.min(groups.len() - 1));
-                    let member_index = member_hint.min(groups[group_index].rules.len() - 1);
-                    (group_index, member_index)
-                });
-                Some((
-                    group_index,
-                    member_index,
-                    groups[group_index].key.to_owned_key(),
-                    groups[group_index].rules[member_index].id,
-                ))
+                    })
+                    .unwrap_or(roots[group_hint.min(roots.len() - 1)]);
+                // Follow a selected rule's identity across updates, retaining the
+                // root/child scope. If a child disappears, fall back to its root.
+                let executable = self
+                    .selected_outbound_executable
+                    .as_deref()
+                    .and_then(|path| {
+                        selected_id
+                            .and_then(|id| root.rules.iter().find(|rule| rule.id == id))
+                            .map_or(Some(path), |rule| visible_executable(rule))
+                    });
+                let node = executable
+                    .and_then(|path| {
+                        nodes.iter().find(|node| {
+                            node.group_index == root.group_index && node.executable == Some(path)
+                        })
+                    })
+                    .unwrap_or(root);
+                let member_index = selected_id
+                    .and_then(|id| node.rules.iter().position(|rule| rule.id == id))
+                    .unwrap_or_else(|| member_hint.min(node.rules.len() - 1));
+                node.selection(member_index)
             }
         };
-        if let Some((group, member, key, id)) = outbound {
-            if self.selected_outbound_rule_id != Some(id) {
-                self.outbound_details_scroll.set(0);
-            }
-            self.selected_outbound_group = group;
-            self.selected_outbound_member = member;
-            self.selected_outbound_group_key = Some(key);
-            self.selected_outbound_rule_id = Some(id);
+        if let Some(target) = outbound {
+            self.set_outbound_selection(target);
         } else {
             self.selected_outbound_group = 0;
             self.selected_outbound_member = 0;
             self.selected_outbound_group_key = None;
+            self.selected_outbound_executable = None;
             self.selected_outbound_rule_id = None;
+            self.outbound_details_scroll.set(0);
         }
 
         let selected_id = self.selected_inbound_rule_id;
@@ -2707,6 +2798,457 @@ mod tests {
                 if rule.direction == Direction::Inbound && rule.application.is_none()
         ));
         Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Explicit expected rows document the tree projection.
+    fn outbound_tree_sorts_roots_and_paths_without_splitting_arguments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut rules = outbound_tree_fixture()?;
+        let first_id = rules[0].id;
+        let second_id = rules[1].id;
+        let other_path_id = rules[2].id;
+        let fallback_id = rules[3].id;
+        let earlier_group = test_rule(
+            "same path in another cgroup",
+            Direction::Outbound,
+            Some("203.0.113.1"),
+            Some("/usr/bin/alpha"),
+            Some("/system.slice/aaa.service"),
+            None,
+        )?;
+        let earlier_group_id = earlier_group.id;
+        let fallback_variant = test_rule(
+            "unbound argument variant",
+            Direction::Outbound,
+            Some("203.0.113.41"),
+            Some("/usr/bin/alpha"),
+            None,
+            Some(r#"["alpha","--unbound"]"#),
+        )?;
+        let fallback_variant_id = fallback_variant.id;
+        let redacted = test_rule(
+            "private application",
+            Direction::Outbound,
+            Some("203.0.113.50"),
+            Some("/usr/bin/private"),
+            Some("/system.slice/private.service"),
+            None,
+        )?
+        .redacted_for_observer();
+        let redacted_id = redacted.id;
+        let any = test_rule("any", Direction::Outbound, None, None, None, None)?;
+        let any_id = any.id;
+        rules.extend([
+            earlier_group,
+            fallback_variant,
+            redacted,
+            any,
+            test_rule("inbound", Direction::Inbound, None, None, None, None)?,
+        ]);
+        rules.reverse();
+        let app = outbound_tree_app(false, rules);
+        let nodes = app.outbound_nodes();
+
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| (node.key.clone(), node.executable, node.last_child))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/aaa.service")),
+                    None,
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/aaa.service")),
+                    Some("/usr/bin/alpha"),
+                    true,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/client.service")),
+                    None,
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/client.service")),
+                    Some("/usr/bin/alpha"),
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/client.service")),
+                    Some("/usr/bin/zulu"),
+                    true,
+                ),
+                (
+                    OutboundGroupKey::Executable(Cow::Borrowed("/usr/bin/alpha")),
+                    None,
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Destination(Some("203.0.113.50/32".parse()?)),
+                    None,
+                    false,
+                ),
+                (OutboundGroupKey::Destination(None), None, false),
+            ]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.rules.iter().map(|rule| rule.id).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![earlier_group_id],
+                vec![earlier_group_id],
+                vec![other_path_id, first_id, second_id],
+                vec![first_id, second_id],
+                vec![other_path_id],
+                vec![fallback_id, fallback_variant_id],
+                vec![redacted_id],
+                vec![any_id],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_navigation_visits_every_row_and_limits_members_to_its_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let first_id = rules[0].id;
+        let second_id = rules[1].id;
+        let other_path_id = rules[2].id;
+        let fallback_id = rules[3].id;
+        let mut app = outbound_tree_app(false, rules);
+
+        assert_outbound_selection(&app, 0, 0, other_path_id);
+        app.select_previous_rule();
+        app.select_previous_group_member();
+        assert_outbound_selection(&app, 0, 0, other_path_id);
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 0, 1, first_id);
+        app.select_next_group_member();
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 0, 2, second_id);
+
+        app.select_next_rule();
+        assert_outbound_selection(&app, 1, 0, first_id);
+        app.select_next_group_member();
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 1, 1, second_id);
+        app.select_previous_group_member();
+        app.select_previous_group_member();
+        assert_outbound_selection(&app, 1, 0, first_id);
+
+        app.select_next_rule();
+        app.select_next_group_member();
+        app.select_previous_group_member();
+        assert_outbound_selection(&app, 2, 0, other_path_id);
+        app.select_next_rule();
+        app.select_next_rule();
+        assert_outbound_selection(&app, 3, 0, fallback_id);
+        app.select_previous_rule();
+        assert_outbound_selection(&app, 2, 0, other_path_id);
+        app.select_previous_rule();
+        assert_outbound_selection(&app, 1, 0, first_id);
+        app.select_previous_rule();
+        app.select_previous_rule();
+        assert_outbound_selection(&app, 0, 0, other_path_id);
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_preserves_selected_child_and_uuid_across_snapshot_and_event_inserts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let selected_id = rules[1].id;
+        let mut app = outbound_tree_app(false, rules.clone());
+        app.select_next_rule();
+        app.select_next_group_member();
+        app.outbound_details_scroll.set(4);
+        assert_outbound_selection(&app, 1, 1, selected_id);
+
+        let mut refreshed_rules = rules;
+        refreshed_rules.extend([
+            test_rule(
+                "earlier root",
+                Direction::Outbound,
+                Some("203.0.113.1"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/aaa.service"),
+                None,
+            )?,
+            test_rule(
+                "earlier child",
+                Direction::Outbound,
+                Some("203.0.113.2"),
+                Some("/usr/bin/aardvark"),
+                Some("/system.slice/client.service"),
+                None,
+            )?,
+            test_rule(
+                "earlier member",
+                Direction::Outbound,
+                Some("203.0.113.15"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/client.service"),
+                Some(r#"["alpha","--new"]"#),
+            )?,
+        ]);
+        refreshed_rules.reverse();
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: refreshed_rules,
+        });
+        assert_outbound_selection(&app, 4, 2, selected_id);
+        assert_eq!(app.outbound_details_scroll.get(), 4);
+
+        let inserted = test_rule(
+            "event member",
+            Direction::Outbound,
+            Some("203.0.113.25"),
+            Some("/usr/bin/alpha"),
+            Some("/system.slice/client.service"),
+            Some(r#"["alpha","--event"]"#),
+        )?;
+        assert!(app.push_observer_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleCreated { rule: inserted },
+        }));
+        let mut disabled = app.selected_rule().ok_or("missing selection")?.clone();
+        disabled.spec.enabled = false;
+        assert!(app.push_observer_event(Event {
+            revision: 4,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleEnabledChanged { rule: disabled },
+        }));
+        app.reconcile_rule_selection();
+        assert_outbound_selection(&app, 4, 3, selected_id);
+        assert_eq!(app.outbound_details_scroll.get(), 4);
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled {
+                expected_revision: 4,
+                id,
+                enabled: true,
+            }) if id == selected_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_deleted_members_stay_in_child_then_fall_back_to_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut rules = outbound_tree_fixture()?;
+        rules.pop();
+        let first = rules[0].clone();
+        let second = rules[1].clone();
+        let other_path = rules[2].clone();
+        let mut app = outbound_tree_app(false, rules);
+        app.select_next_rule();
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 1, 1, second.id);
+
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: second },
+        });
+        assert_outbound_selection(&app, 1, 0, first.id);
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: first },
+        });
+        assert_outbound_selection(&app, 0, 0, other_path.id);
+        assert_eq!(app.outbound_nodes().len(), 2);
+
+        app.push_event(Event {
+            revision: 4,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: other_path },
+        });
+        app.select_next_rule();
+        app.select_previous_rule();
+        app.select_next_group_member();
+        app.select_previous_group_member();
+        assert!(app.outbound_nodes().is_empty());
+        assert!(app.selected_outbound_node_index(&[]).is_none());
+        assert!(app.selected_rule().is_none());
+        assert!(app.toggle_selected_rule().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_selected_uuid_follows_cgroup_and_path_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let selected_id = rules[1].id;
+        let mut app = outbound_tree_app(false, rules);
+        app.select_next_rule();
+        app.select_next_group_member();
+        let mut moved = app.selected_rule().ok_or("missing selection")?.clone();
+        let application = moved.spec.application.as_mut().ok_or("missing selector")?;
+        application.cgroup = Some(CgroupPath::new("/system.slice/aaa.service")?);
+        application.executable = Some(ApplicationPath::new("/usr/bin/beta")?);
+        moved.spec.validate()?;
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleUpdated {
+                rule: moved.clone(),
+            },
+        });
+        assert_outbound_selection(&app, 1, 0, selected_id);
+        let nodes = app.outbound_nodes();
+        assert_eq!(nodes[1].executable, Some("/usr/bin/beta"));
+        assert_eq!(
+            nodes[1].key,
+            OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/aaa.service"))
+        );
+
+        moved
+            .spec
+            .application
+            .as_mut()
+            .ok_or("missing selector")?
+            .cgroup = None;
+        moved.spec.validate()?;
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleUpdated { rule: moved },
+        });
+        assert_outbound_selection(&app, 4, 0, selected_id);
+        let nodes = app.outbound_nodes();
+        assert_eq!(nodes[4].executable, None);
+        assert_eq!(
+            nodes[4].key,
+            OutboundGroupKey::Executable(Cow::Borrowed("/usr/bin/beta"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_child_actions_target_one_uuid_and_respect_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let selected_id = rules[1].id;
+        let selected_spec = rules[1].spec.clone();
+        for read_only in [false, true] {
+            let mut app = outbound_tree_app(read_only, rules.clone());
+            app.select_next_rule();
+            app.select_next_group_member();
+            assert_outbound_selection(&app, 1, 1, selected_id);
+            let toggle = app.toggle_selected_rule();
+            app.open_edit_rule();
+            if read_only {
+                assert!(toggle.is_none());
+                assert_eq!(app.overlay, Overlay::None);
+                app.open_delete_confirmation();
+                assert_eq!(app.overlay, Overlay::None);
+                assert!(app.confirm_delete(true).is_none());
+                assert_eq!(app.pending_revision, None);
+                assert_eq!(app.notice.as_deref(), Some(app.i18n.tr("notice.read_only")));
+                continue;
+            }
+
+            assert!(matches!(
+                toggle,
+                Some(ControlRequest::SetRuleEnabled {
+                    expected_revision: 1,
+                    id,
+                    enabled: false,
+                }) if id == selected_id
+            ));
+            assert!(matches!(
+                &app.overlay,
+                Overlay::Editor(form) if form.id == Some(selected_id)
+            ));
+            assert!(matches!(
+                app.submit_editor(),
+                Some(ControlRequest::UpdateRule {
+                    expected_revision: 1,
+                    id,
+                    rule,
+                }) if id == selected_id && rule == selected_spec
+            ));
+            app.open_delete_confirmation();
+            assert!(matches!(
+                &app.overlay,
+                Overlay::ConfirmDelete { id, .. } if *id == selected_id
+            ));
+            assert!(matches!(
+                app.confirm_delete(true),
+                Some(ControlRequest::DeleteRule {
+                    expected_revision: 1,
+                    id,
+                }) if id == selected_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn outbound_tree_fixture() -> Result<Vec<Rule>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            test_rule(
+                "alpha first",
+                Direction::Outbound,
+                Some("203.0.113.20"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/client.service"),
+                Some(r#"["alpha","--first"]"#),
+            )?,
+            test_rule(
+                "alpha second",
+                Direction::Outbound,
+                Some("203.0.113.30"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/client.service"),
+                Some(r#"["alpha","--second"]"#),
+            )?,
+            test_rule(
+                "zulu",
+                Direction::Outbound,
+                Some("203.0.113.10"),
+                Some("/usr/bin/zulu"),
+                Some("/system.slice/client.service"),
+                None,
+            )?,
+            test_rule(
+                "unbound alpha",
+                Direction::Outbound,
+                Some("203.0.113.40"),
+                Some("/usr/bin/alpha"),
+                None,
+                None,
+            )?,
+        ])
+    }
+
+    fn outbound_tree_app(read_only: bool, rules: Vec<Rule>) -> App {
+        let mut app = App::new(read_only, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules,
+        });
+        app
+    }
+
+    fn assert_outbound_selection(app: &App, node_index: usize, member_index: usize, id: Uuid) {
+        let nodes = app.outbound_nodes();
+        assert_eq!(app.selected_outbound_node_index(&nodes), Some(node_index));
+        assert_eq!(app.selected_outbound_member_index(), member_index);
+        assert_eq!(app.selected_rule().map(|rule| rule.id), Some(id));
+        assert_eq!(nodes[node_index].rules[member_index].id, id);
     }
 
     fn test_rule(
