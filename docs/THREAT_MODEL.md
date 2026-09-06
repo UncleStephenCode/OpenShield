@@ -116,7 +116,7 @@ are broader than firewall administration alone.
   neither bypass nor `NFQA_CFG_F_FAIL_OPEN`, while observational queue 1338 has
   both. A separate fail-closed reader of INPUT queue 1339 can briefly hold
   eligible UDP/ICMP echo replies and repeat current kernel policy, never accept
-  them itself. Its drain barrier, flow readiness and three-attempt packet mark
+  them itself. Its captured outgoing sequence, flow readiness and three-attempt packet mark
   are scheduling state, not an authorization cache. Bounded waits and fresh
   mode/generation checks apply; see [the architecture](ARCHITECTURE.md).
   Queue 1338 normally returns `NF_ACCEPT` immediately; the first eligible

@@ -185,7 +185,14 @@ saturated observer must not turn Learning into accidental packet loss. For
 packets delivered to userspace, the kernel supplies a bounded packet prefix,
 socket UID when available, and output-interface index. Missing packet-bound UID
 remains an attribution failure; a later socket-table lookup is not a substitute
-for proof of the queued packet's sender. Three independent packet-consumer
+for proof of the queued packet's sender. All three queues request
+`NFQA_CFG_F_GSO` so the kernel need not segment a large socket-associated skb
+before enqueueing it. The reader validates `NFQA_CAP_LEN`, `NFQA_SKB_INFO`, IP
+lengths, and complete transport headers within the 512-byte prefix; it neither
+copies the full payload nor replaces the kernel packet. A deferred checksum is
+not an attribution failure or an allow signal. GSO metadata never substitutes
+for socket UID. Unsupported queue configuration fails before activation.
+Three independent packet-consumer
 threads own the fixed queues. Queue 1337 performs bounded synchronous fail-closed
 decisions. Queue 1338 submits a bounded copy to a separate asynchronous
 attribution worker; another bounded worker persists successful observations.
@@ -193,12 +200,19 @@ Queue 1339 defers only established UDP/ICMP echo replies inside enabled outbound
 application-Accept envelopes in Enforcing, after the usual kernel allow paths.
 An outgoing non-TCP packet still clears the shared authorization mark before
 attribution. If an earlier reply arrives during that interval, a bounded
-per-flow readiness registry can wait for the pending verdicts, then return
+per-flow readiness registry can wait for already queued verdicts, then return
 `NF_REPEAT` to re-evaluate the current INPUT policy. It never returns `NF_ACCEPT`.
-Before retrying, the queue-1337 reader must observe its socket empty after the
-reply was admitted and after returning every verdict from its previous batch.
-This prevents a completed old flow entry from releasing a reply while a new
-outgoing packet is still unread behind another flow's attribution batch.
+On admission, the reply reader captures queue 1337's kernel packet sequence
+from bounded `/proc/self/net/netfilter/nfnetlink_queue` metadata. It waits for
+the ordered outgoing reader to send verdicts through that fixed sequence,
+not for the entire outgoing queue to become empty. Later traffic, including
+new packets of the same flow, cannot extend this boundary or invalidate a
+reply merely by starting a new attribution batch. A recorded failure in the
+current flow still denies the retry. The netlink port and a private runtime epoch
+bind the boundary to this queue instance; malformed or unavailable metadata
+causes a reply to be dropped, not admitted. Sequence rollover is checked.
+This prevents a completed old flow entry from releasing a reply while an
+already queued outgoing packet is still unread behind another attribution batch.
 The two reserved packet-mark bits count at most three retries while preserving
 the other 30 bits; they are not a conntrack mark or an authorization token.
 At most 128 replies wait up to 2 seconds per attempt (at most 6 seconds across
@@ -206,7 +220,9 @@ three attempts), with a 5 ms poll interval and an explicit pause before retries.
 Missing/failed/expired readiness, policy-generation changes,
 and overload remain fail-closed. This narrows the mark-reset loss window; it is
 not a per-request UDP authorization cache or a guarantee of lossless overload.
-In particular, a continuously busy outgoing queue may exhaust the bounded wait.
+Attribution overload and repeated mark resets on the same flow can still
+exhaust the bounded wait; removing the global empty-queue condition does not
+make per-packet attribution a kernel fast path.
 
 Command arguments retain their exact UTF-8 bytes and token boundaries, including
 newlines and formatting characters. Each argument can occupy up to 8191 bytes;

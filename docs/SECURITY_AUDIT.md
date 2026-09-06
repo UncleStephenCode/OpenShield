@@ -120,8 +120,10 @@ The normative boundary is defined by the
   state.
 - A third reader owns fail-closed INPUT queue 1339 for eligible delayed
   UDP/ICMP echo replies. It returns only Drop or `NF_REPEAT`, never Accept.
-  Its bounded readiness state waits for a post-admission, post-verdict empty
-  check of queue 1337; it cannot authorize a flow. Current kernel rules and
+  Its bounded readiness state waits for actual outgoing verdicts through the
+  kernel sequence captured on admission, without requiring queue 1337 to become
+  empty. Missing metadata or a different queue owner/runtime cannot release a
+  reply. This scheduling state cannot authorize a flow. Current kernel rules and
   conntrack generation still decide delivery on every retry. At most 128 replies
   wait, for up to 2 seconds per attempt and three attempts per packet. The
   attempt bits preserve all unreserved packet-mark bits. Timeouts, policy

@@ -41,7 +41,8 @@ jobs:
             tests/perf/test_harness.py \
             tests/perf/test_environment.py \
             tests/perf/test_metrics.py \
-            tests/perf/workloads/test_workloads.py
+            tests/perf/workloads/test_workloads.py \
+            tests/e2e/test_continuous_attribution.py
 
   packaging:
     name: Packaging checks

@@ -389,3 +389,76 @@ session survives a policy-generation change without reauthorization/reconnect.
 Evidence is retained in the printed `/tmp/openshield-delayed-evidence.*` directory.
 The peer's ICMP sysctl and firewall rules are changed only inside disposable
 containers; no host sysctl, module, or OpenShield policy is modified.
+
+## Continuous attribution contention
+
+[`../e2e/continuous-attribution.sh`](../e2e/continuous-attribution.sh) adds
+continuous socket churn to the delayed-peer fixture. Run each backend separately:
+
+```console
+CONTINUOUS_UDP_PPS=10 sh tests/e2e/continuous-attribution.sh nftables /absolute/openshield-package.rpm
+CONTINUOUS_UDP_PPS=10 sh tests/e2e/continuous-attribution.sh iptables /absolute/openshield-package.rpm
+```
+
+Baseline and Enforcing both have 1,024 sleeping worker threads and 8,192 open
+descriptors distributed across the application's UID and another UID. A separate
+unknown executable opens real TCP/UDP sockets at 20, 50, and 100 attempts/second,
+for 20 seconds per level after warm-up. Known applications simultaneously send
+ICMP at 1 request/second, persistent TCP at 2 requests/second, and pipelined UDP
+at `CONTINUOUS_UDP_PPS` (default 2). The peer delays replies by 55 ms. Rules are
+installed explicitly to isolate queue scheduling from automatic learning.
+
+The report records send-time cohorts, latency, loss, daemon CPU/RSS, queue depth,
+kernel/user drops, and whether queue 1339 was actually exercised. Invalid peer
+timing or generator saturation invalidates the measurement. Unknown-application
+delivery, missing expected replies, NFQUEUE drops, or more than 500 ms additional
+p99 latency fail this functional regression. This is not a maximum-capacity or
+5–10% performance-gate claim. Evidence remains under the printed
+`/tmp/openshield-continuous-evidence.*` path. Do not run other heavy builds or
+load tests concurrently when comparing candidates.
+
+With nftables, the earlier daemon `083165d4…` passed the 2-PPS UDP case, but the 10-PPS case
+exposed 372 missing replies out of 600 steady-state UDP requests despite zero
+NFQUEUE kernel/user drops. Thus the earlier finite delayed-reply pass did not
+establish correctness under continuous attribution contention.
+
+## Large TCP writes and GSO
+
+[`../e2e/gso-attribution.sh`](../e2e/gso-attribution.sh) extracts the daemon from
+the specified RPM and tests it in an isolated Tumbleweed x86_64 container with
+an independent TCP peer in a separate container. Run from the repository root,
+once per backend:
+
+```console
+bash tests/e2e/gso-attribution.sh nftables /absolute/openshield-package.rpm
+bash tests/e2e/gso-attribution.sh iptables /absolute/openshield-package.rpm
+```
+
+The fixed-seed workload uses real TCP sockets, `TCP_CORK`, and application
+writes of 128 bytes, 64 KiB, 256 KiB, and 1 MiB; it does not generate synthetic
+TCP packets. It checks Learning, a connection held across the transition to
+Enforcing and policy-generation change, new Enforcing connections, denial of
+an unknown executable and changed argv, and continued authorized access after
+those negative probes. SHA-256 replies and independent peer record counts check
+data integrity and prevent blocked replies from masking unauthorized delivery.
+NFQUEUE kernel/user drops, overflow, attribution timeouts, and terminal queue
+errors must not increase; both application queues must actually be exercised.
+
+A passive device observer requires outgoing IPv4 TCP skbs larger than the
+1500-byte MTU. For nftables, trace evidence separately records large-skb
+traversal of Learning queue 1338 and Enforcing queue 1337, and new-connection
+queue use. See `trace_scope` and `queue_trace_proven` in the JSON report:
+an unobserved large Enforcing queue subcase is explicitly reported as untested,
+not passed, because established TCP may use the kernel fast-path. For iptables,
+the large-queue trace fields and `queue_trace_proven` are `null`; device-level
+offload observation and Enforcing new-connection queue checks still apply.
+These observations do not independently inspect the kernel's `NFQA_SKB_GSO`
+attribute on delivered queue messages.
+
+The script retains JSON results, peer records, daemon logs, available traces,
+and exact RPM/daemon hashes under the printed `/tmp/openshield-gso-evidence.*`
+path, then removes its containers and network. This is an IPv4 TCP functional
+regression, not a throughput, retransmit, or latency benchmark. IPv6, BIG TCP,
+and UDP segmentation offload have parser unit coverage but are not exercised
+by this runtime fixture. As with the other container fixtures, the kernel under
+test is the host kernel, not a booted Tumbleweed kernel.

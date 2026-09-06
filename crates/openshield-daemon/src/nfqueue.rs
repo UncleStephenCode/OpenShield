@@ -11,8 +11,8 @@ use nix::errno::Errno;
 use nix::net::if_::if_indextoname;
 use nix::poll::{PollFd, PollFlags, poll};
 use nix::sys::socket::{
-    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, sendto,
-    socket,
+    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, getsockname,
+    recv, sendto, socket,
 };
 use openshield_core::{
     APPLICATION_LEARNING_QUEUE_NUMBER, APPLICATION_QUEUE_NUMBER, InterfaceName,
@@ -43,6 +43,8 @@ const NFQA_VERDICT_HDR: u16 = 2;
 const NFQA_MARK: u16 = 3;
 const NFQA_IFINDEX_OUTDEV: u16 = 6;
 const NFQA_PAYLOAD: u16 = 10;
+const NFQA_CAP_LEN: u16 = 13;
+const NFQA_SKB_INFO: u16 = 14;
 const NFQA_UID: u16 = 16;
 const NFQA_CFG_CMD: u16 = 1;
 const NFQA_CFG_PARAMS: u16 = 2;
@@ -50,7 +52,9 @@ const NFQA_CFG_QUEUE_MAXLEN: u16 = 3;
 const NFQA_CFG_MASK: u16 = 4;
 const NFQA_CFG_FLAGS: u16 = 5;
 const NFQA_CFG_F_FAIL_OPEN: u32 = 1;
+const NFQA_CFG_F_GSO: u32 = 1 << 2;
 const NFQA_CFG_F_UID_GID: u32 = 1 << 3;
+const NFQA_SKB_GSO: u32 = 1 << 1;
 const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
 const NF_REPEAT: u32 = 4;
@@ -129,7 +133,7 @@ pub fn spawn(
         .context("cannot bind the fail-open Learning observation queue")?;
     let reply_queue = QueueSocket::open(openshield_core::APPLICATION_REPLY_QUEUE_NUMBER, false)
         .context("cannot bind the fail-closed application reply retry queue")?;
-    let reply_registry = reply::shared_registry();
+    let reply_registry = reply::shared_registry(enforcing_queue.port_id()?)?;
     let (learning_sender, learning_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
     let (attribution_sender, attribution_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
     let (completion_sender, completion_receiver) = mpsc::sync_channel(LEARNING_PENDING_CAPACITY);
@@ -310,19 +314,7 @@ fn packet_loop(
             );
             return;
         }
-        let received = if role == QueueRole::Enforcing {
-            // Only this top-level check runs after every verdict in the
-            // previous batch. The inner drain below still has an undecided
-            // batch and must never publish reply-readiness evidence.
-            let checked_at = Instant::now();
-            match queue.receive_ready(&mut receive_buffer) {
-                Ok(QueueReceive::Idle) => reply::record_queue_drained(reply_registry, checked_at)
-                    .and_then(|()| queue.receive(&mut receive_buffer, pending.poll_millis())),
-                result => result,
-            }
-        } else {
-            queue.receive(&mut receive_buffer, pending.poll_millis())
-        };
+        let received = queue.receive(&mut receive_buffer, pending.poll_millis());
         match received {
             Ok(QueueReceive::Idle | QueueReceive::Interrupted) => {}
             Ok(QueueReceive::Overflow) => {
@@ -837,6 +829,9 @@ fn return_batch_verdicts(
             verdict_strategy,
         )?;
         reply::complete_outgoing(reply_registry, ticket, accepted && decision_error.is_none())?;
+        // Advance only after the actual verdict send, including denied,
+        // malformed and TCP packets that have no per-flow reply ticket.
+        reply::record_outgoing_verdict(reply_registry, packet.packet_id)?;
         if !accepted {
             counters.record_denied();
         }
@@ -1620,24 +1615,22 @@ fn parse_queued_packet(payload: &[u8]) -> Result<QueuedPacket> {
         "queued packet netlink payload is truncated"
     );
     let attributes = Attributes::new(&payload[NFGENMSG_BYTES..]);
-    let mut packet_payload = None;
     let mut uid = None;
     let mut output_index = None;
     let mut mark = None;
     for attribute in attributes {
         let attribute = attribute?;
         match attribute.kind {
-            NFQA_PAYLOAD => packet_payload = Some(attribute.payload),
             NFQA_UID => uid = Some(network_u32(attribute.payload)?),
             NFQA_IFINDEX_OUTDEV => output_index = Some(network_u32(attribute.payload)?),
             NFQA_MARK => mark = Some(network_u32(attribute.payload)?),
             _ => {}
         }
     }
-    let packet_payload = packet_payload.ok_or_else(|| anyhow!("queued packet has no payload"))?;
+    let capture = parse_packet_capture(&payload[NFGENMSG_BYTES..])?;
     // Decode only bounded protocol/control metadata before requiring the
     // packet-bound UID. This improves diagnostics, never attribution fallback.
-    let parsed = parse_ip_packet(packet_payload)?;
+    let parsed = capture.parse(IpPacketDirection::Outbound)?;
     let socket_uid = uid.ok_or_else(|| {
         anyhow!(
             "queued packet has no kernel socket uid (protocol={:?}, tcp_flags={:?}, icmp_type={:?})",
@@ -1700,8 +1693,104 @@ struct ParsedIpPacket {
     icmp_type: Option<u8>,
 }
 
+/// A bounded prefix of the kernel-owned skb, never replacement packet data.
+/// `CAP_LEN` may describe BIG TCP packets larger than the netlink attribute
+/// limit: no allocation or indexing is based on that unbounded original size.
+#[derive(Clone, Copy, Debug)]
+struct PacketCapture<'a> {
+    payload: &'a [u8],
+    original_length: u32,
+    skb_info: u32,
+}
+
+impl PacketCapture<'_> {
+    fn parse(self, direction: IpPacketDirection) -> Result<ParsedIpPacket> {
+        let version = self
+            .payload
+            .first()
+            .map(|byte| byte >> 4)
+            .ok_or_else(|| anyhow!("queued IP packet is empty"))?;
+        // Deferred checksum flags are deliberately not an admission signal.
+        // We only inspect headers; the unmodified skb completes its normal
+        // kernel checksum/segmentation path after the ordinary policy verdict.
+        let parsed = match version {
+            4 => parse_ipv4_packet(self, direction),
+            6 => parse_ipv6_packet(self, direction),
+            _ => bail!("queued payload is not IPv4 or IPv6"),
+        }?;
+        if parsed.protocol == TransportProtocol::Udp {
+            let offset = parsed.transport_offset;
+            let length = u32::from(u16::from_be_bytes([
+                self.payload[offset + 4],
+                self.payload[offset + 5],
+            ]));
+            ensure!(
+                u32::try_from(offset)? + length <= self.original_length,
+                "UDP length exceeds the kernel packet length"
+            );
+        }
+        Ok(parsed)
+    }
+
+    const fn is_gso(self) -> bool {
+        self.skb_info & NFQA_SKB_GSO != 0
+    }
+}
+
+fn parse_packet_capture(attributes: &[u8]) -> Result<PacketCapture<'_>> {
+    let mut payload = None;
+    let mut original_length = None;
+    let mut skb_info = None;
+    for attribute in Attributes::new(attributes) {
+        let attribute = attribute?;
+        match attribute.kind {
+            NFQA_PAYLOAD => {
+                ensure!(payload.is_none(), "duplicate queued packet payload");
+                payload = Some(attribute.payload);
+            }
+            NFQA_CAP_LEN => {
+                ensure!(
+                    original_length.is_none(),
+                    "duplicate queued packet capture length"
+                );
+                original_length = Some(network_u32(attribute.payload)?);
+            }
+            NFQA_SKB_INFO => {
+                ensure!(
+                    skb_info.is_none(),
+                    "duplicate queued packet skb information"
+                );
+                skb_info = Some(network_u32(attribute.payload)?);
+            }
+            _ => {}
+        }
+    }
+    let payload = payload.ok_or_else(|| anyhow!("queued packet has no payload"))?;
+    let copied_length = u32::try_from(payload.len())?;
+    ensure!(
+        copied_length > 0 && copied_length <= COPY_RANGE,
+        "queued packet capture exceeds the configured prefix bound or is empty"
+    );
+    let original_length = original_length.unwrap_or(copied_length);
+    ensure!(
+        original_length >= copied_length,
+        "queued packet capture length is smaller than its payload"
+    );
+    Ok(PacketCapture {
+        payload,
+        original_length,
+        skb_info: skb_info.unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
 fn parse_ip_packet(packet: &[u8]) -> Result<ParsedIpPacket> {
-    parse_ip_packet_direction(packet, IpPacketDirection::Outbound)
+    PacketCapture {
+        payload: packet,
+        original_length: u32::try_from(packet.len())?,
+        skb_info: 0,
+    }
+    .parse(IpPacketDirection::Outbound)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1710,27 +1799,24 @@ enum IpPacketDirection {
     Reply,
 }
 
-fn parse_ip_packet_direction(
-    packet: &[u8],
+fn parse_ipv4_packet(
+    capture: PacketCapture<'_>,
     direction: IpPacketDirection,
 ) -> Result<ParsedIpPacket> {
-    let version = packet
-        .first()
-        .map(|byte| byte >> 4)
-        .ok_or_else(|| anyhow!("queued IP packet is empty"))?;
-    match version {
-        4 => parse_ipv4_packet(packet, direction),
-        6 => parse_ipv6_packet(packet, direction),
-        _ => bail!("queued payload is not IPv4 or IPv6"),
-    }
-}
-
-fn parse_ipv4_packet(packet: &[u8], direction: IpPacketDirection) -> Result<ParsedIpPacket> {
+    let packet = capture.payload;
     ensure!(packet.len() >= 20, "IPv4 header is truncated");
     let header_length = usize::from(packet[0] & 0x0f) * 4;
     ensure!(
         header_length >= 20 && packet.len() >= header_length,
         "invalid IPv4 IHL"
+    );
+    let total_length = u32::from(u16::from_be_bytes([packet[2], packet[3]]));
+    ensure!(
+        total_length == capture.original_length
+            || (total_length == 0
+                && capture.is_gso()
+                && capture.original_length > u32::from(u16::MAX)),
+        "IPv4 total length does not match the kernel capture length"
     );
     let fragment = u16::from_be_bytes([packet[6], packet[7]]);
     ensure!(
@@ -1750,8 +1836,20 @@ fn parse_ipv4_packet(packet: &[u8], direction: IpPacketDirection) -> Result<Pars
     )
 }
 
-fn parse_ipv6_packet(packet: &[u8], direction: IpPacketDirection) -> Result<ParsedIpPacket> {
+fn parse_ipv6_packet(
+    capture: PacketCapture<'_>,
+    direction: IpPacketDirection,
+) -> Result<ParsedIpPacket> {
+    let packet = capture.payload;
     ensure!(packet.len() >= 40, "IPv6 header is truncated");
+    let payload_length = u32::from(u16::from_be_bytes([packet[4], packet[5]]));
+    ensure!(
+        payload_length + 40 == capture.original_length
+            || (payload_length == 0
+                && capture.is_gso()
+                && capture.original_length > u32::from(u16::MAX) + 40),
+        "IPv6 payload length does not match the kernel capture length (non-GSO jumbograms are unsupported)"
+    );
     let source: [u8; 16] = packet[8..24]
         .try_into()
         .map_err(|_| anyhow!("IPv6 source is truncated"))?;
@@ -1811,6 +1909,28 @@ fn parse_ipv6_packet(packet: &[u8], direction: IpPacketDirection) -> Result<Pars
     bail!("IPv6 extension-header bound exceeded")
 }
 
+fn parse_transport_ports(protocol_number: u8, packet: &[u8], offset: usize) -> Result<(u16, u16)> {
+    if protocol_number == 6 {
+        ensure!(packet.len() >= offset + 20, "TCP header is truncated");
+        let header_length = usize::from(packet[offset + 12] >> 4) * 4;
+        ensure!(
+            header_length >= 20 && packet.len() >= offset + header_length,
+            "TCP data offset is invalid or its options are truncated"
+        );
+    } else {
+        ensure!(packet.len() >= offset + 8, "UDP header is truncated");
+        let length = u16::from_be_bytes([packet[offset + 4], packet[offset + 5]]);
+        ensure!(
+            length >= 8,
+            "UDP length is smaller than its header (UDP jumbograms are unsupported)"
+        );
+    }
+    let source = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+    let destination = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+    ensure!(source != 0 && destination != 0, "transport port is zero");
+    Ok((source, destination))
+}
+
 fn finish_transport(
     source_address: std::net::IpAddr,
     destination_address: std::net::IpAddr,
@@ -1821,10 +1941,7 @@ fn finish_transport(
 ) -> Result<ParsedIpPacket> {
     let (protocol, source_port, destination_port) = match protocol_number {
         6 | 17 => {
-            ensure!(packet.len() >= offset + 4, "transport header is truncated");
-            let source = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-            let destination = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
-            ensure!(source != 0 && destination != 0, "transport port is zero");
+            let (source, destination) = parse_transport_ports(protocol_number, packet, offset)?;
             (
                 if protocol_number == 6 {
                     TransportProtocol::Tcp
@@ -1910,8 +2027,8 @@ struct QueueSocket {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueReceive {
     Idle,
-    // A signal interrupted the syscall; unlike a nonblocking EAGAIN, this
-    // does not prove that the socket was empty for the reply drain barrier.
+    // A signal interrupted the syscall. No packet was consumed, so this
+    // must not advance the reply read-through watermark.
     Interrupted,
     Datagram(usize),
     Overflow,
@@ -1941,8 +2058,18 @@ impl QueueSocket {
             sequence: 0,
         };
         queue.configure_command(NFQNL_CFG_CMD_BIND)?;
-        queue.configure_parameters(fail_open)?;
+        queue
+            .configure_parameters(fail_open)
+            .context("kernel must support NFQUEUE GSO and socket UID metadata before activation")?;
         Ok(queue)
+    }
+
+    fn port_id(&self) -> Result<u32> {
+        let address = getsockname::<NetlinkAddr>(self.socket.as_raw_fd())
+            .context("cannot read the NFQUEUE netlink port id")?;
+        let port_id = address.pid();
+        ensure!(port_id != 0, "NFQUEUE netlink port id is zero");
+        Ok(port_id)
     }
 
     fn overflow_message(&self) -> &'static str {
@@ -2132,8 +2259,16 @@ impl QueueSocket {
 }
 
 const fn queue_configuration_flags(fail_open: bool) -> (u32, u32) {
-    let flags = NFQA_CFG_F_UID_GID | if fail_open { NFQA_CFG_F_FAIL_OPEN } else { 0 };
-    (flags, NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN)
+    // Keep the original socket-associated skb: pre-queue GSO normalization
+    // costs CPU and can omit UID metadata on segmented packets. GSO changes
+    // representation only, never authorization or overflow policy. Require
+    // the kernel to acknowledge it before activating any application rules.
+    let flags =
+        NFQA_CFG_F_UID_GID | NFQA_CFG_F_GSO | if fail_open { NFQA_CFG_F_FAIL_OPEN } else { 0 };
+    (
+        flags,
+        NFQA_CFG_F_UID_GID | NFQA_CFG_F_GSO | NFQA_CFG_F_FAIL_OPEN,
+    )
 }
 
 fn classify_ready_receive(
@@ -3392,11 +3527,13 @@ mod tests {
     fn parses_ipv4_tcp_tuple() -> Result<(), Box<dyn Error>> {
         let mut packet = vec![0_u8; 40];
         packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
         packet[9] = 6;
         packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
         packet[16..20].copy_from_slice(&[203, 0, 113, 7]);
         packet[20..22].copy_from_slice(&50_000_u16.to_be_bytes());
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        packet[32] = 0x50;
         let parsed = parse_ip_packet(&packet)?;
         assert_eq!(
             parsed.source_address,
@@ -3421,10 +3558,9 @@ mod tests {
             packet[33] = flags;
             assert_eq!(parse_ip_packet(&packet)?.initial_observation, initial);
         }
-        // A minimally parsed header may still be handled by strict q1337,
-        // but an absent TCP flags byte must not trigger a Learning hold.
-        assert!(!parse_ip_packet(&packet[..24])?.initial_observation);
+        assert!(parse_ip_packet(&packet[..24]).is_err());
         packet[9] = 17;
+        packet[24..26].copy_from_slice(&20_u16.to_be_bytes());
         assert!(parse_ip_packet(&packet)?.initial_observation);
         Ok(())
     }
@@ -3433,11 +3569,13 @@ mod tests {
     fn learning_packet_without_nfqa_mark_parses_as_unmarked() -> Result<(), Box<dyn Error>> {
         let mut packet = vec![0_u8; 40];
         packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
         packet[9] = 6;
         packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
         packet[16..20].copy_from_slice(&[203, 0, 113, 7]);
         packet[20..22].copy_from_slice(&50_000_u16.to_be_bytes());
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        packet[32] = 0x50;
         let uid = 1_000_u32.to_be_bytes();
         let output_index = nix::net::if_::if_nametoindex("lo")?.to_be_bytes();
         let message = build_message(
@@ -3467,6 +3605,7 @@ mod tests {
     fn parses_only_attributable_icmp_echo_identifiers() -> Result<(), Box<dyn Error>> {
         let mut packet = vec![0_u8; 28];
         packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28_u16.to_be_bytes());
         packet[9] = 1;
         packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
         packet[16..20].copy_from_slice(&[203, 0, 113, 7]);
@@ -3486,11 +3625,13 @@ mod tests {
     fn drops_non_initial_fragments_and_deep_ipv6_extensions() {
         let mut ipv4 = vec![0_u8; 20];
         ipv4[0] = 0x45;
+        ipv4[2..4].copy_from_slice(&20_u16.to_be_bytes());
         ipv4[6..8].copy_from_slice(&1_u16.to_be_bytes());
         assert!(parse_ip_packet(&ipv4).is_err());
 
         let mut ipv6 = vec![0_u8; 40 + 9 * 8];
         ipv6[0] = 0x60;
+        ipv6[4..6].copy_from_slice(&72_u16.to_be_bytes());
         ipv6[6] = 0;
         for index in 0..9 {
             let offset = 40 + index * 8;
@@ -3626,18 +3767,228 @@ mod tests {
         assert_eq!(
             queue_configuration_flags(false),
             (
-                NFQA_CFG_F_UID_GID,
-                NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_GSO,
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_GSO | NFQA_CFG_F_FAIL_OPEN
             )
         );
         assert_eq!(
             queue_configuration_flags(true),
             (
-                NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN,
-                NFQA_CFG_F_UID_GID | NFQA_CFG_F_FAIL_OPEN
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_GSO | NFQA_CFG_F_FAIL_OPEN,
+                NFQA_CFG_F_UID_GID | NFQA_CFG_F_GSO | NFQA_CFG_F_FAIL_OPEN
             )
         );
         assert_ne!(APPLICATION_QUEUE_NUMBER, APPLICATION_LEARNING_QUEUE_NUMBER);
+    }
+
+    fn tcp_capture_prefix(ipv6: bool, original_length: u32) -> Vec<u8> {
+        let mut packet = vec![0_u8; 512];
+        let offset = if ipv6 { 40 } else { 20 };
+        if ipv6 {
+            packet[0] = 0x60;
+            let payload_length = u16::try_from(original_length - 40).unwrap_or_default();
+            packet[4..6].copy_from_slice(&payload_length.to_be_bytes());
+            packet[6] = 6;
+            packet[23] = 1;
+            packet[39] = 2;
+        } else {
+            packet[0] = 0x45;
+            let total_length = u16::try_from(original_length).unwrap_or_default();
+            packet[2..4].copy_from_slice(&total_length.to_be_bytes());
+            packet[9] = 6;
+            packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            packet[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        }
+        packet[offset..offset + 2].copy_from_slice(&50_000_u16.to_be_bytes());
+        packet[offset + 2..offset + 4].copy_from_slice(&443_u16.to_be_bytes());
+        packet[offset + 12] = 0x50;
+        packet[offset + 13] = 0x18;
+        packet
+    }
+
+    fn capture_attributes(packet: &[u8], original_length: u32, skb_info: u32) -> Result<Vec<u8>> {
+        let mut attributes = Vec::new();
+        append_attribute(&mut attributes, NFQA_PAYLOAD, packet)?;
+        append_attribute(
+            &mut attributes,
+            NFQA_CAP_LEN,
+            &original_length.to_be_bytes(),
+        )?;
+        append_attribute(&mut attributes, NFQA_SKB_INFO, &skb_info.to_be_bytes())?;
+        Ok(attributes)
+    }
+
+    #[test]
+    fn gso_capture_parses_bounded_large_packet_prefixes_without_checksum_guessing() -> Result<()> {
+        for ipv6 in [false, true] {
+            for skb_info in [0, NFQA_SKB_GSO, NFQA_SKB_GSO | 1, NFQA_SKB_GSO | 4] {
+                let packet = tcp_capture_prefix(ipv6, 60_000);
+                let attributes = capture_attributes(&packet, 60_000, skb_info)?;
+                let capture = parse_packet_capture(&attributes)?;
+                let parsed = capture.parse(IpPacketDirection::Outbound)?;
+                assert_eq!(capture.payload.len(), 512);
+                assert_eq!(capture.original_length, 60_000);
+                assert_eq!(parsed.protocol, TransportProtocol::Tcp);
+                assert_eq!(parsed.source_port, Some(50_000));
+                assert_eq!(parsed.destination_port, Some(443));
+                assert_eq!(parsed.tcp_flags, Some(0x18));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn big_tcp_zero_length_requires_kernel_gso_and_original_size_metadata() -> Result<()> {
+        for ipv6 in [false, true] {
+            for original_length in [70_000, 262_144, u32::MAX] {
+                let packet = tcp_capture_prefix(ipv6, original_length);
+                let attributes = capture_attributes(&packet, original_length, NFQA_SKB_GSO)?;
+                assert!(
+                    parse_packet_capture(&attributes)?
+                        .parse(IpPacketDirection::Outbound)
+                        .is_ok()
+                );
+                let attributes = capture_attributes(&packet, original_length, 0)?;
+                assert!(
+                    parse_packet_capture(&attributes)?
+                        .parse(IpPacketDirection::Outbound)
+                        .is_err()
+                );
+                let attributes = capture_attributes(&packet, 512, NFQA_SKB_GSO)?;
+                assert!(
+                    parse_packet_capture(&attributes)?
+                        .parse(IpPacketDirection::Outbound)
+                        .is_err()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn big_tcp_ipv6_hop_by_hop_header_keeps_bounded_transport_parsing() -> Result<()> {
+        let original_length = 262_144_u32;
+        let mut packet = tcp_capture_prefix(true, original_length);
+        packet.copy_within(40..60, 48);
+        packet[6] = 0;
+        packet[40..48].copy_from_slice(&[6, 0, 0xc2, 4, 0, 0, 0, 0]);
+        packet[44..48].copy_from_slice(&(original_length - 40).to_be_bytes());
+        let attributes = capture_attributes(&packet, original_length, NFQA_SKB_GSO | 1)?;
+        let parsed = parse_packet_capture(&attributes)?.parse(IpPacketDirection::Outbound)?;
+        assert_eq!(parsed.transport_offset, 48);
+        assert_eq!(parsed.source_port, Some(50_000));
+        assert_eq!(parsed.destination_port, Some(443));
+        assert_eq!(parsed.tcp_flags, Some(0x18));
+        let attributes = capture_attributes(&packet[..60], original_length, NFQA_SKB_GSO)?;
+        assert!(
+            parse_packet_capture(&attributes)?
+                .parse(IpPacketDirection::Outbound)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn udp_segmentation_keeps_kernel_length_separate_from_datagram_length() -> Result<()> {
+        for ipv6 in [false, true] {
+            let mut packet = tcp_capture_prefix(ipv6, 60_000);
+            let offset = if ipv6 { 40 } else { 20 };
+            packet[if ipv6 { 6 } else { 9 }] = 17;
+            packet[offset + 4..offset + 6].copy_from_slice(&1208_u16.to_be_bytes());
+            let attributes = capture_attributes(&packet, 60_000, NFQA_SKB_GSO | 1)?;
+            let parsed = parse_packet_capture(&attributes)?.parse(IpPacketDirection::Outbound)?;
+            assert_eq!(parsed.protocol, TransportProtocol::Udp);
+            assert_eq!(parsed.source_port, Some(50_000));
+            assert_eq!(parsed.destination_port, Some(443));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_metadata_rejects_duplicates_invalid_lengths_and_oversized_prefixes() -> Result<()> {
+        let packet = tcp_capture_prefix(false, 60_000);
+        for kind in [NFQA_PAYLOAD, NFQA_CAP_LEN, NFQA_SKB_INFO] {
+            let mut attributes = capture_attributes(&packet, 60_000, NFQA_SKB_GSO)?;
+            append_attribute(&mut attributes, kind, &[0; 4])?;
+            assert!(parse_packet_capture(&attributes).is_err());
+        }
+        for original_length in [0, 511] {
+            assert!(
+                parse_packet_capture(&capture_attributes(&packet, original_length, 0)?).is_err()
+            );
+        }
+        for kind in [NFQA_CAP_LEN, NFQA_SKB_INFO] {
+            let mut attributes = Vec::new();
+            append_attribute(&mut attributes, NFQA_PAYLOAD, &packet)?;
+            append_attribute(&mut attributes, kind, &[0; 3])?;
+            assert!(parse_packet_capture(&attributes).is_err());
+        }
+        assert!(
+            parse_packet_capture(&capture_attributes(&[0; 513], 60_000, NFQA_SKB_GSO)?).is_err()
+        );
+        assert!(parse_packet_capture(&capture_attributes(&[], 60_000, NFQA_SKB_GSO)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gso_captures_still_require_complete_tcp_and_udp_headers() -> Result<()> {
+        let packet = tcp_capture_prefix(false, 60_000);
+        for prefix_length in [24, 33, 39] {
+            let attributes = capture_attributes(&packet[..prefix_length], 60_000, NFQA_SKB_GSO)?;
+            assert!(
+                parse_packet_capture(&attributes)?
+                    .parse(IpPacketDirection::Outbound)
+                    .is_err()
+            );
+        }
+        for data_offset in [0x40, 0xf0] {
+            let mut packet = packet[..40].to_vec();
+            packet[32] = data_offset;
+            let attributes = capture_attributes(&packet, 60_000, NFQA_SKB_GSO)?;
+            assert!(
+                parse_packet_capture(&attributes)?
+                    .parse(IpPacketDirection::Outbound)
+                    .is_err()
+            );
+        }
+        let mut udp = packet;
+        udp[9] = 17;
+        for length in [0_u16, 7, 60_000] {
+            udp[24..26].copy_from_slice(&length.to_be_bytes());
+            let attributes = capture_attributes(&udp, 60_000, NFQA_SKB_GSO)?;
+            assert!(
+                parse_packet_capture(&attributes)?
+                    .parse(IpPacketDirection::Outbound)
+                    .is_err()
+            );
+        }
+        udp[24..26].copy_from_slice(&1208_u16.to_be_bytes());
+        let attributes = capture_attributes(&udp, 60_000, NFQA_SKB_GSO)?;
+        assert_eq!(
+            parse_packet_capture(&attributes)?
+                .parse(IpPacketDirection::Outbound)?
+                .protocol,
+            TransportProtocol::Udp
+        );
+        let attributes = capture_attributes(&udp[..27], 60_000, NFQA_SKB_GSO)?;
+        assert!(
+            parse_packet_capture(&attributes)?
+                .parse(IpPacketDirection::Outbound)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gso_capture_does_not_supply_a_missing_socket_uid() -> Result<()> {
+        let packet = tcp_capture_prefix(false, 60_000);
+        let mut payload = vec![0_u8; NFGENMSG_BYTES];
+        payload.extend_from_slice(&capture_attributes(&packet, 60_000, NFQA_SKB_GSO)?);
+        let error = parse_queued_packet(&payload)
+            .err()
+            .ok_or_else(|| anyhow!("GSO bypassed socket UID"))?;
+        assert!(error.to_string().contains("no kernel socket uid"));
+        Ok(())
     }
 
     #[test]

@@ -556,6 +556,19 @@ comparison.
 
 Compatibility claims are intentionally scoped:
 
+The later September 6 candidate, daemon SHA-256
+`0282b8ac3cf0ad4f33f7a5420de05c340b64d8b26d45a959700beb56719cb121`,
+passed 481 ordinary workspace Rust tests, all seven separately invoked ignored
+checks, formatting, all-target Clippy, and 243 Python tests. In the new continuous
+contention fixture it delivered all 650 UDP replies per backend, including
+warm-up, with nftables and iptables; TCP/ICMP also had no loss and all 3,400
+unknown-application attempts per backend were blocked. However, the fixture's
+overall result remains **FAIL on latency**: UDP p99 was 565–583 ms with nftables
+and 570–728 ms with iptables, against an approximately 55 ms baseline. This
+exceeds the 500 ms additional-latency limit; the limit was not relaxed. The full
+performance smoke was not rerun. See the
+[continuous contention fixture](tests/compat/README.md#continuous-attribution-contention).
+
 The September 6 v0.2.1 correction, daemon SHA-256
 `083165d4de3655b7db3ff5795da3e32dc3ed9566c588902ed90cbf580ace615a`, passed
 462 workspace Rust tests, all seven separately invoked ignored tests, formatting,
