@@ -23,6 +23,9 @@ pub const NFT_OWNERSHIP_COUNTER: &str = "openshield_owner_v1";
 pub const APPLICATION_QUEUE_NUMBER: u16 = 1_337;
 /// Overflow-bypassing observational queue used only by Learning.
 pub const APPLICATION_LEARNING_QUEUE_NUMBER: u16 = 1_338;
+/// Fail-closed, bounded deferral of replies during a non-TCP authorization.
+/// Its consumer can only drop or repeat the current INPUT hook, never accept.
+pub const APPLICATION_REPLY_QUEUE_NUMBER: u16 = 1_339;
 const APPLICATION_MARK_GENERATION_MASK: u32 = MAX_FLOW_GENERATION;
 const APPLICATION_MARK_DOMAIN_MASK: u32 = 0xc000_0000;
 const APPLICATION_MARK_PAYLOAD_MASK: u32 = 0x3fff_ffff;
@@ -63,6 +66,19 @@ pub const fn application_handoff_mark(packet_mark: u32) -> u32 {
 #[must_use]
 pub const fn application_reject_mark(packet_mark: u32) -> u32 {
     APPLICATION_REJECT_DOMAIN | (packet_mark & APPLICATION_MARK_PAYLOAD_MASK)
+}
+
+/// Counts an INPUT retry while retaining the unreserved packet-mark bits.
+///
+/// The two reserved bits saturate after three retries. In INPUT they only
+/// bound deferral; they never substitute for a current-generation conntrack
+/// mark or an explicit network rule. OUTPUT strips these bits before making
+/// any decision, as for all reserved marks.
+#[must_use]
+pub const fn application_reply_retry_mark(packet_mark: u32) -> u32 {
+    let attempts = packet_mark >> 30;
+    let next_attempt = if attempts < 3 { attempts + 1 } else { 3 };
+    (next_attempt << 30) | (packet_mark & APPLICATION_MARK_PAYLOAD_MASK)
 }
 
 /// Conntrack mark that binds both directions of an authorized application flow.
@@ -329,6 +345,11 @@ fn append_chain(
         // allow path.
         if direction == Direction::Inbound {
             append_reverse_rules(script, snapshot, direction, accepted_counter);
+            if snapshot.mode == Mode::Enforcing
+                && interception == ApplicationInterception::PerPacket
+            {
+                append_application_reply_queues(script, snapshot);
+            }
         }
 
         if interception != ApplicationInterception::None
@@ -596,6 +617,66 @@ fn append_application_non_tcp_connmark_reset(script: &mut String) {
         append_hex_u32(script, APPLICATION_CONNMARK_FOREIGN_MASK);
         script.push('\n');
     }
+}
+
+fn append_application_reply_queues(script: &mut String, snapshot: &Snapshot) {
+    for rule in application_reply_candidates(snapshot) {
+        script.push_str("    ");
+        append_rule_selectors(script, &rule, Direction::Inbound, true);
+        match rule.spec.protocol {
+            TransportProtocol::Icmp => script.push_str("icmp type echo-reply icmp code 0 "),
+            TransportProtocol::IcmpV6 => {
+                script.push_str("icmpv6 type echo-reply icmpv6 code 0 ");
+            }
+            _ => {}
+        }
+        script.push_str("meta mark & 0xc0000000 != 0xc0000000 queue to ");
+        script.push_str(&APPLICATION_REPLY_QUEUE_NUMBER.to_string());
+        script.push('\n');
+    }
+}
+
+/// Network envelopes only: these rules never authorize an inbound packet.
+/// A reverse interface constraint is intentionally absent, like the existing
+/// authenticated reply fast path, so asymmetric routing can still retry.
+pub(crate) fn application_reply_candidates(snapshot: &Snapshot) -> Vec<Rule> {
+    let mut rules: Vec<&Rule> = snapshot
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.spec.enabled
+                && rule.spec.direction == Direction::Outbound
+                && rule.spec.application.is_some()
+                && rule.spec.action == RuleAction::Accept
+        })
+        .collect();
+    rules.sort_unstable_by_key(|rule| rule.id);
+    let mut candidates = Vec::new();
+    for rule in rules {
+        for protocol in [
+            TransportProtocol::Udp,
+            TransportProtocol::Icmp,
+            TransportProtocol::IcmpV6,
+        ] {
+            if !matches!(rule.spec.protocol, TransportProtocol::Any)
+                && rule.spec.protocol != protocol
+            {
+                continue;
+            }
+            if matches!(
+                (protocol, rule.spec.peer_network),
+                (TransportProtocol::Icmp, Some(IpNet::V6(_)))
+                    | (TransportProtocol::IcmpV6, Some(IpNet::V4(_)))
+            ) {
+                continue;
+            }
+            let mut candidate = rule.clone();
+            candidate.spec.protocol = protocol;
+            candidate.spec.interface = None;
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 fn append_learning_queue(script: &mut String) {
@@ -1071,6 +1152,107 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         state.create_rule_at(id, spec, now)?;
         Ok(id)
+    }
+
+    #[test]
+    fn deferred_datagram_replies_repeat_policy_instead_of_getting_an_allow()
+    -> Result<(), Box<dyn Error>> {
+        for protocol in [
+            TransportProtocol::Udp,
+            TransportProtocol::Icmp,
+            TransportProtocol::IcmpV6,
+        ] {
+            let mut state = State::new();
+            add_application_rule(&mut state, protocol, true)?;
+            state.set_mode(Mode::Enforcing)?;
+            let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+            let input = script
+                .split("  chain output_sanitize")
+                .next()
+                .ok_or("input")?;
+            let retry = input
+                .lines()
+                .find(|line| line.ends_with("queue to 1339"))
+                .ok_or("missing bounded reply queue")?;
+            assert!(retry.contains("ct direction reply ct state established "));
+            assert!(retry.contains("meta mark & 0xc0000000 != 0xc0000000"));
+            assert!(!retry.contains(" bypass"));
+            assert!(!retry.contains(" accept"));
+            assert!(!retry.contains("iifname"));
+            match protocol {
+                TransportProtocol::Udp => assert!(
+                    retry.contains("ip saddr 203.0.113.7/32 meta l4proto udp udp sport 53 ")
+                ),
+                TransportProtocol::Icmp => {
+                    assert!(retry.contains("icmp type echo-reply icmp code 0 "));
+                }
+                TransportProtocol::IcmpV6 => {
+                    assert!(retry.contains("ip6 saddr 2001:db8::7/128 "));
+                    assert!(retry.contains("icmpv6 type echo-reply icmpv6 code 0 "));
+                }
+                _ => return Err("unexpected test protocol".into()),
+            }
+            let retry_offset = input.find(retry).ok_or("retry offset")?;
+            assert!(input.find("ct mark & 0x7fffffff ==").ok_or("generation")? < retry_offset);
+            assert!(
+                input
+                    .rfind("counter name dropped_in drop")
+                    .ok_or("default drop")?
+                    > retry_offset
+            );
+            assert!(script.contains("ct mark set ct mark & 0x80000000"));
+        }
+        assert_eq!(application_reply_retry_mark(0xffff_1234), 0xffff_1234);
+        for payload in [0, 0x1234, APPLICATION_MARK_PAYLOAD_MASK] {
+            let mut mark = payload;
+            for domain in [0x4000_0000, 0x8000_0000, 0xc000_0000, 0xc000_0000] {
+                mark = application_reply_retry_mark(mark);
+                assert_eq!(mark, domain | payload);
+            }
+        }
+        assert_ne!(application_reply_retry_mark(0), application_handoff_mark(0));
+        assert_ne!(application_reply_retry_mark(0), application_pending_mark(0));
+        Ok(())
+    }
+
+    #[test]
+    fn reply_deferral_is_absent_for_tcp_disabled_denies_and_other_modes()
+    -> Result<(), Box<dyn Error>> {
+        for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
+            for mode in [Mode::BlockAll, Mode::Learning, Mode::Enforcing] {
+                for enabled in [false, true] {
+                    for action in [RuleAction::Accept, RuleAction::Drop, RuleAction::Reject] {
+                        let mut state = State::new();
+                        let id = add_application_rule(&mut state, protocol, enabled)?;
+                        let mut spec = state
+                            .rules()
+                            .find(|rule| rule.id == id)
+                            .ok_or("rule")?
+                            .spec
+                            .clone();
+                        spec.action = action;
+                        state.update_rule(id, spec)?;
+                        state.set_mode(mode)?;
+                        let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+                        assert_eq!(
+                            script.contains("queue to 1339"),
+                            protocol == TransportProtocol::Udp
+                                && mode == Mode::Enforcing
+                                && enabled
+                                && action == RuleAction::Accept
+                        );
+                    }
+                }
+            }
+        }
+        let mut state = State::new();
+        add_application_rule(&mut state, TransportProtocol::Any, true)?;
+        state.set_mode(Mode::Enforcing)?;
+        let candidates = application_reply_candidates(&state.snapshot());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].spec.protocol, TransportProtocol::Udp);
+        assert_eq!(candidates[1].spec.protocol, TransportProtocol::Icmp);
+        Ok(())
     }
 
     #[test]

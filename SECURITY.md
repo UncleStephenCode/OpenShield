@@ -19,7 +19,10 @@ OpenShield deliberately treats all protocol input as untrusted, including input
 from a local root client. The project forbids unsafe Rust in workspace code and
 rejects shell execution, configuration-selected executables, and unbounded IPC
 frames. NFQUEUE bypass is generated only for observational Learning queue 1338;
-it is forbidden for fail-closed queue 1337, `Enforcing`, and `BlockAll`. Executable
+it is forbidden for fail-closed queues 1337/1339, `Enforcing`, and `BlockAll`. Queue
+1339 only defers eligible replies and repeats the current INPUT policy after a
+bounded readiness check; its registry and retry flag never authorize delivery.
+Executable
 paths in outbound rules are bounded, typed identity selectors; the daemon never
 executes them.
 
@@ -44,11 +47,29 @@ Since v0.1.32, OpenShield amortizes procfs owner enumeration across at most 32
 already-ready NFQUEUE packets without weakening attribution. `SOCK_DIAG` stays
 per packet; two bounded owner snapshots bracket capture; reuse is confined to
 one batch; mandatory process identity must reach consensus; and one absolute
-250 ms deadline covers the whole batch, while one global owner-record cap covers
+2-second deadline covers a queue-1337 batch (5 seconds for asynchronous Learning),
+with each `SOCK_DIAG` query capped at 250 ms. One global owner-record cap covers
 all targets in each snapshot. Typed
 timeouts remain auditable. Every ambiguity or exhausted bound denies in
 `Enforcing` and inside a Learning application-deny envelope; on observational
-queue 1338 it prevents persistence after the immediate `NF_ACCEPT`. nftables runtime observation now obtains tables,
+queue 1338 it prevents persistence, not ordinary Learning admission. Queue 1338
+may hold the first eligible observation of a recently unseen flow for at most
+250 ms, with 128 pending packets and a responsive 5 ms reader poll. Repeats are
+accepted immediately; expiry/backlog cannot authorize a pending packet after a
+mode/generation change or shutdown. Every pending verdict rechecks those conditions
+under the engine lock. Fire-and-forget UDP can still outlive its sender before
+procfs attribution; this mechanism does not guarantee a rule for every short-lived
+process. Pinned, rewound fd-directory scans and reusable buffers optimize I/O
+without introducing a PID/authorization cache or weakening either owner snapshot.
+At 64 or more external tasks across multiple TGIDs and two available CPUs, the
+fd phase uses at most two workers per owner snapshot. Queues 1337 and 1338 have
+independent attribution workers, so their concurrent activity can use up to four
+scanning threads in the daemon. Each snapshot retains shared task/owner-record
+caps and one absolute deadline; complete ambiguity tracking and sorted owner-set
+comparison remain mandatory. Smaller or single-TGID scans remain serial; worker errors deny
+attribution. The 250 ms Learning deadline is not a hard real-time guarantee
+under scheduler or policy-lock contention.
+nftables runtime observation now obtains tables,
 chains, and counters from one fixed process while retaining the same checks,
 one-second cadence, and fail-closed repair policy.
 

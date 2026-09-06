@@ -311,3 +311,81 @@ A successful pair covers the scripted behavior inside disposable network and
 container namespaces on a local Unix-socket Docker engine. It does not test or
 modify the host firewall and does not certify production kernels, deployments,
 upgrades, or competing firewall configurations.
+
+## Short-lived application regression
+
+[`../e2e/short-lived-attribution.sh`](../e2e/short-lived-attribution.sh) extracts
+the static daemon from an RPM without installing it on the host. It runs a pinned
+x86-64 Tumbleweed DUT and an independent TCP/DNS/UDP peer in disposable Docker
+namespaces. Both backends are explicit:
+
+```console
+tests/e2e/short-lived-attribution.sh nftables /absolute/openshield-package.rpm
+tests/e2e/short-lived-attribution.sh iptables /absolute/openshield-package.rpm
+```
+
+Requirements are a local Unix-socket Docker engine whose kernel exposes unified
+cgroup v2 to the DUT, registry/package network access, and host tools
+`rpm2cpio`, `cpio`, `file`, `readelf`, and `sha256sum`. OpenShield and its
+firewall capabilities remain inside the DUT network namespace. Docker itself
+creates and removes the isolated bridge and may therefore manage transient host
+bridge/NAT rules. The fixture creates many same-UID and other-UID processes,
+threads, and descriptors, then checks:
+
+- real short-lived TCP and DNS-then-TCP exchanges reaching the peer in Learning;
+- persisted rules with exact UID, executable version, argv, cgroup, interface,
+  and endpoint selectors, without duplicates, foreign bindings, or substituted
+  network-only allows;
+- continued access after Enforcing and denial of an unknown same-UID executable
+  and unmatched argv for a known executable;
+- baseline/Enforcing ICMP latency and loss, zero firewall-drop counter growth
+  for allowed ping, plus a timed silent drop for an unknown ping binary;
+- fire-and-forget UDP delivery separately from best-effort rule observation.
+
+A final isolated argv stage learns and enforces TCP and UDP/DNS rules containing
+a 2,083-byte argument with newline, tab, escape, and bidi characters. Replacing
+those bytes with their visible escape spellings must not match. Peer-side counts
+prove that denied requests did not leave the DUT, rather than merely timing out
+because an inbound reply was blocked.
+
+The first-observation wait is bounded to 250 ms and cannot keep a one-way UDP
+sender alive after `sendto()` returns. Missing fire-and-forget attribution is
+reported as a limitation, not silently counted as successful learning. Request/
+response rules and fail-closed checks remain required. The script prints its
+retained `/tmp/openshield-short-evidence.*` directory containing daemon logs,
+rule/peer audits, packet-exchange, counter and ping JSON, status, and exact
+package/daemon hashes; its containers and network are removed. A cleanup
+failure fails the run and reports the exact labelled resource. This focused
+regression does not replace the full functional or
+[performance suite](../perf/README.md), and container results exercise the host
+kernel rather than a booted Tumbleweed kernel.
+
+## Delayed TCP/UDP/ICMP replies
+
+[`../e2e/delayed-icmp.sh`](../e2e/delayed-icmp.sh), despite its historical name,
+tests all three protocols using the same RPM and container prerequisites:
+
+```console
+tests/e2e/delayed-icmp.sh nftables /absolute/openshield-package.rpm
+tests/e2e/delayed-icmp.sh iptables /absolute/openshield-package.rpm
+```
+
+The independent peer delays replies by 55 ms. Under bounded procfs pressure,
+the fixture compares baseline and Enforcing at 1 and 5 requests/second: real
+ICMP echo, multiple outstanding UDP requests on one connected socket, a
+persistent TCP connection, and short TCP connections. Exact application rules
+are installed in Learning to isolate reply handling from auto-learning; the
+short-lived fixture tests automatic rule creation separately.
+
+Passing requires all expected replies, positive accepted traffic counters,
+zero unexpected firewall drops and NFQUEUE errors/drops, live peer timing
+evidence, and denial of unknown executable/argv probes. A separate
+functional latency bound permits at most 500 ms additional p95/p99 and 1000 ms
+additional maximum latency relative to baseline under this procfs pressure;
+these generous regression bounds do not replace the performance gate. A pre-switch
+TCP reply must remain denied after generation invalidation; fresh authorized
+TCP connections must work. This is not a promise that an already waiting TCP
+session survives a policy-generation change without reauthorization/reconnect.
+Evidence is retained in the printed `/tmp/openshield-delayed-evidence.*` directory.
+The peer's ICMP sysctl and firewall rules are changed only inside disposable
+containers; no host sysctl, module, or OpenShield policy is modified.

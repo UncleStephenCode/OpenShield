@@ -664,14 +664,9 @@ fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
                 openshield_core::CommandLineMatch::Exact => i18n.tr("editor.command_exact"),
                 openshield_core::CommandLineMatch::Prefix => i18n.tr("editor.command_prefix"),
             };
-            let values = command
-                .arguments
-                .iter()
-                .map(openshield_core::CommandArgument::as_str)
-                .collect::<Vec<_>>();
             (
                 mode.to_owned(),
-                serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_owned()),
+                crate::app::command_arguments_json(&command.arguments),
             )
         },
     );
@@ -1763,6 +1758,31 @@ mod tests {
         })?;
         let screen = buffer_text(terminal.backend());
         assert!(screen.contains("ARGTAIL"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn rule_details_escape_arguments_without_replacing_or_conflating_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut form = RuleForm::default();
+        form.name = "command control characters".to_owned();
+        form.protocol = TransportProtocol::Tcp;
+        form.bind_application = true;
+        form.executable = "/usr/bin/client".to_owned();
+        form.command_mode = CommandMode::Exact;
+        form.arguments =
+            r#"["client","line\nnext","line\\nnext","\u001b[31m\u202eSECRET"]"#.to_owned();
+        let i18n = I18n::test_english();
+        let rule = Rule::new(form.to_rule_spec(&i18n).map_err(std::io::Error::other)?)?;
+        let lines = rule_detail_lines(&rule, &i18n);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!text.chars().any(crate::i18n::is_unsafe_dynamic_character));
+        assert!(text.contains(r#""line\nnext","line\\nnext""#));
+        assert!(text.contains(r#""\u001b[31m\u202eSECRET""#));
         Ok(())
     }
 

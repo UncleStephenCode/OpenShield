@@ -31,12 +31,13 @@ pub use model::{
     RuleOrigin, RuleSpec, TransportProtocol, ValidationError,
 };
 pub use nftables::{
-    APPLICATION_LEARNING_QUEUE_NUMBER, APPLICATION_QUEUE_NUMBER, COUNTER_ACCEPTED_IN,
-    COUNTER_ACCEPTED_OUT, COUNTER_DROPPED_IN, COUNTER_DROPPED_OUT, COUNTER_LEARNED_OUT,
-    CompileError, LEARNED_ICMP_V4_SET, LEARNED_ICMP_V6_SET, LEARNED_TCP_V4_SET, LEARNED_TCP_V6_SET,
-    LEARNED_UDP_V4_SET, LEARNED_UDP_V6_SET, NFT_OWNERSHIP_COUNTER, NftablesCompiler,
-    NftablesPolicy, TABLE_NAME, application_flow_mark, application_handoff_mark,
-    application_pending_mark, application_reject_mark,
+    APPLICATION_LEARNING_QUEUE_NUMBER, APPLICATION_QUEUE_NUMBER, APPLICATION_REPLY_QUEUE_NUMBER,
+    COUNTER_ACCEPTED_IN, COUNTER_ACCEPTED_OUT, COUNTER_DROPPED_IN, COUNTER_DROPPED_OUT,
+    COUNTER_LEARNED_OUT, CompileError, LEARNED_ICMP_V4_SET, LEARNED_ICMP_V6_SET,
+    LEARNED_TCP_V4_SET, LEARNED_TCP_V6_SET, LEARNED_UDP_V4_SET, LEARNED_UDP_V6_SET,
+    NFT_OWNERSHIP_COUNTER, NftablesCompiler, NftablesPolicy, TABLE_NAME, application_flow_mark,
+    application_handoff_mark, application_pending_mark, application_reject_mark,
+    application_reply_retry_mark,
 };
 pub use state::{
     ApplicationInterception, ApplicationLearningAdmission, ApplicationLearningAdmissionIndex,

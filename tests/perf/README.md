@@ -84,15 +84,16 @@ the pristine baseline DUT. The cases are:
 | Case | Expected OpenShield path |
 | --- | --- |
 | `baseline` | Independent pristine DUT with the same image and veth topology; the daemon is never started |
-| `network_only` | Exact network allow is evaluated in the kernel before NFQUEUE; queue sequence delta must be zero (or the explicitly configured tiny noise bound) |
-| `application_tcp` | The first packet of every new TCP connection is attributed through NFQUEUE; established traffic must use the current conntrack generation fast-path |
-| `application_udp` | Every otherwise-unmatched outbound datagram clears the reusable conntrack generation and is attributed again |
+| `network_only` | In Enforcing, exact network allows remain in the kernel and queue delta is zero within the configured noise bound; Learning additionally observes eligible outbound flows |
+| `application_tcp` | Enforcing attributes each new TCP connection through NFQUEUE and uses the current conntrack generation for established traffic; Learning observes SYN plus bounded established samples |
+| `application_udp` | Enforcing reattributes every otherwise-unmatched outbound datagram after clearing the reusable conntrack generation; Learning observes datagrams with bounded userspace duplicate suppression |
 
 Since OpenShield 0.1.31, `StatusV2` classifies the worst-case active policy path.
 An `Enforcing` `network_only` case is L3 `KernelNative`; an `Enforcing`
 `application_tcp` case is L2 `ConntrackHybrid`; every `Learning` case and an
-`application_udp` case is L1 `Nfqueue`. Network-only packets remain in the
-kernel even when the policy-wide level is L1. `Unknown` invalidates a claim
+`application_udp` case is L1 `Nfqueue`. Network-only Enforcing packets remain in
+the kernel even when the policy-wide level is L1; Learning also exercises its
+observational queue. `Unknown` invalidates a claim
 about which OpenShield path was measured. The backend name is recorded
 separately because the nftables-to-iptables startup fallback does not change
 these levels.
@@ -419,9 +420,16 @@ A valid steady window passes capacity only when it attains the configured
 fraction of offered application operations and remains within the configured
 error, sampled UDP reply-loss, TCP retransmit, p99 latency, daemon CPU/RSS,
 interface drop/error, and NFQUEUE drop/error bounds. Path safety independently
-requires NFQUEUE sequence deltas of zero for network-only, approximately one
+requires, in Enforcing, NFQUEUE sequence deltas of zero for network-only, approximately one
 per new application TCP connection with a low keep-alive per-operation ratio,
-and approximately one per application UDP datagram. Every required steady
+and approximately one per application UDP datagram. Learning instead requires
+outbound TCP queue hits to track new connections plus bounded established samples,
+and UDP hits to track outgoing datagrams, including network-only cases. Its first
+eligible observation may wait up to 250 ms for asynchronous capture; repeat
+observations are admitted immediately. Do not interpret that bounded capture wait
+as an Enforcing fast-path latency or a guarantee of complete one-way UDP learning.
+The [short-lived application fixture](../compat/README.md#short-lived-application-regression)
+covers that separate lifetime boundary. Every required steady
 window must pass. Every burst must remain valid and fail-closed; when
 `require_burst_capacity` is true, it must pass the capacity bounds as well.
 Explicit wrong-executable fail-open behavior is tested separately by the

@@ -183,19 +183,74 @@ outbound traffic is allowed by default and offered to separate observational
 NFQUEUE 1338 with kernel `bypass` and `NFQA_CFG_F_FAIL_OPEN`: an absent or
 saturated observer must not turn Learning into accidental packet loss. For
 packets delivered to userspace, the kernel supplies a bounded packet prefix,
-socket UID, and output-interface index. Two independent packet-consumer threads
-own the fixed queues. Queue 1337 performs bounded synchronous fail-closed
-decisions. Queue 1338 immediately returns `NF_ACCEPT` and submits a bounded copy
-to a separate asynchronous attribution worker; another bounded worker persists
-successful observations. Queue 1338 loss, consumer outage, or attribution
+socket UID when available, and output-interface index. Missing packet-bound UID
+remains an attribution failure; a later socket-table lookup is not a substitute
+for proof of the queued packet's sender. Three independent packet-consumer
+threads own the fixed queues. Queue 1337 performs bounded synchronous fail-closed
+decisions. Queue 1338 submits a bounded copy to a separate asynchronous
+attribution worker; another bounded worker persists successful observations.
+Queue 1339 defers only established UDP/ICMP echo replies inside enabled outbound
+application-Accept envelopes in Enforcing, after the usual kernel allow paths.
+An outgoing non-TCP packet still clears the shared authorization mark before
+attribution. If an earlier reply arrives during that interval, a bounded
+per-flow readiness registry can wait for the pending verdicts, then return
+`NF_REPEAT` to re-evaluate the current INPUT policy. It never returns `NF_ACCEPT`.
+Before retrying, the queue-1337 reader must observe its socket empty after the
+reply was admitted and after returning every verdict from its previous batch.
+This prevents a completed old flow entry from releasing a reply while a new
+outgoing packet is still unread behind another flow's attribution batch.
+The two reserved packet-mark bits count at most three retries while preserving
+the other 30 bits; they are not a conntrack mark or an authorization token.
+At most 128 replies wait up to 2 seconds per attempt (at most 6 seconds across
+three attempts), with a 5 ms poll interval and an explicit pause before retries.
+Missing/failed/expired readiness, policy-generation changes,
+and overload remain fail-closed. This narrows the mark-reset loss window; it is
+not a per-request UDP authorization cache or a guarantee of lossless overload.
+In particular, a continuously busy outgoing queue may exhaust the bounded wait.
+
+Command arguments retain their exact UTF-8 bytes and token boundaries, including
+newlines and formatting characters. Each argument can occupy up to 8191 bytes;
+the complete NUL-delimited command line remains bounded to 8192 bytes and 64
+arguments. NUL inside an argument, non-UTF-8 procfs data, and larger command lines
+remain unsupported. Display and the TUI JSON editor escape controls and bidi
+characters reversibly rather than changing the identity used for matching.
+
+The first eligible TCP SYN or datagram for a recently unseen flow can remain
+pending for at most 250 ms, or until that attribution attempt completes. At most
+128 packets can be pending. The reader keeps receiving packets and checks pending
+completion/deadlines with a 5 ms poll interval; it never waits synchronously for
+procfs. These are userspace deadlines, not hard real-time guarantees under CPU
+starvation or policy-lock contention. Repeat observations are accepted immediately.
+The recent-flow index has at most 512 entries, a 60-second lifetime, and a policy
+generation key; it stores scheduling state, not process identities. Full attribution backlog
+or pending capacity uses the ordinary Learning allow policy, not a longer wait.
+Before any pending verdict, the reader holds the engine lock and requires the
+same current Learning mode and policy generation and no shutdown; otherwise it
+returns `DROP`. Completion tickets contain a serial and generation so a stale
+worker completion cannot release a reused packet ID. Attribution completion is
+not authorization or a guarantee that the persistence worker has committed a rule.
+Queue 1338 loss, consumer outage, or attribution
 backlog loses observation evidence, not ordinary connectivity. Attribution
 batches contain at most 32 already-ready items and never wait to fill. Every
 request retains its own `SOCK_DIAG`
 tuple-to-inode lookup. The resolver then performs one complete bounded procfs
 owner snapshot before identity capture and another after capture for all targets
-in the batch. The entire operation shares one absolute 250 ms deadline, and each
-snapshot has one global limit of 131,072 owner records across all targets. These
-bounds are not multiplied by packet count.
+in the batch, including single-item batches. The entire operation shares one
+absolute deadline: 2 seconds for queue 1337, 5 seconds for asynchronous queue
+1338 attribution. Each `SOCK_DIAG` query is additionally capped at 250 ms and
+cannot extend that deadline. Each snapshot has one global limit of 131,072 owner
+records across all targets. These work bounds are not intentional waits and
+are not multiplied by packet count.
+
+The bounded first-packet wait improves process visibility for TCP connect and UDP
+request/response clients. It cannot guarantee attribution of fire-and-forget UDP:
+`sendto()` can return and the process can exit before attribution reads procfs,
+even with its datagram still queued. No historical exec/socket event stream or
+PID authorization cache is introduced. Short-lived rules remain best-effort and
+must be reviewed before switching to Enforcing. The
+[short-lived application regression](../tests/compat/README.md#short-lived-application-regression)
+separately checks request/response learning, denied unknown executables, and the
+unavoidable one-way UDP observation limit.
 
 Identity capture can be memoized only within that batch and only for an exact
 tuple of socket inode, socket UID, and capture requirements. Duplicate requests
@@ -220,7 +275,8 @@ their captured executable path/file version, argv, filesystem-UID, and cgroup
 enforcement identities are equal. Unsupported traffic, malformed metadata, and
 any other configured-bound failure cause `DROP` in `Enforcing` and for a
 Learning application-deny candidate. On observational queue 1338, the same
-failure suppresses persistence but cannot revoke the immediate `NF_ACCEPT`;
+failure suppresses persistence but does not change the ordinary Learning allow
+policy, subject to the current mode/generation check for pending packets;
 queue saturation, a disconnected asynchronous worker, or a recoverable
 persistence failure has the same observation-only effect. Enabled explicit
 denies and concurrent mode transitions remain authoritative. An integrity
@@ -245,11 +301,42 @@ filesystem UID independently; introducing `unshare(CLONE_FILES)`/
 filesystem-UID changes requires re-auditing and, if the invariant no longer
 holds, redesigning it.
 The normal cross-UID exclusion applies when the UIDs differ. For an external
-owner, the descriptor number found for one task is tried first for later
-matching-UID tasks in the same scan. Only an exact target-symlink match followed
-by a repeated filesystem-UID check is accepted; any mismatch or read error falls
-back to that task's complete bounded fd-table scan. This local hint is not
-retained across packets. The exact fd path found by the ownership scan is
+owner, descriptor numbers found for one task are tried first for later
+matching-UID tasks in the same scan. The full walk is skipped only when every
+target inode for that UID is confirmed by an exact link and repeated filesystem
+UID check. Any missing target, mismatch, or read error falls back to the complete
+bounded fd-table scan. That scan preserves a verified preferred fd when a socket
+has duplicate descriptors, keeping before/after snapshots comparable. Hints are
+not retained across batches.
+
+The full fd walk pins an opened directory, rewinds it before each scan, and uses
+safe `rustix` `RawDir`/`readlinkat_raw` with reusable bounded buffers. Negative fd
+entries need no full-path allocation or repeated pathname lookup. Rewinding
+prevents a reused directory offset from producing a false empty snapshot.
+Truncated links cannot count as a canonical `socket:[inode]`; disappearance and
+all other read errors retain their existing checked handling. UID, fd-count,
+deadline, exact owner-set equality, and executable-version checks are unchanged.
+This is a userspace I/O optimization, not a cache of authorized processes.
+
+Owner enumeration first builds one bounded, sorted list of external PID/TID
+groups. Only when there are at least 64 tasks in at least two TGIDs and the
+runtime reports two available CPUs may the fd phase use two workers per owner
+snapshot: the calling resolver and one scoped helper. Queues 1337 and 1338 have
+independent attribution workers; when both are active, up to four scanning
+threads may run in the daemon. Whole TGIDs are assigned in PID order to the
+currently less-loaded worker by task count; this spreads sequential PID/UID
+clusters without inferring a task's filesystem UID from its leader. A single
+large process remains serial. Each worker retains only
+its own verified scan-local fd hints. Negative fd scans need no shared lock;
+positive records enter one mutex-protected owner/ambiguity accumulator, with one
+global record cap, not a cap per worker. Both workers share the original
+absolute deadline and join before a snapshot can be used. Spawn, join, poisoned
+lock, incomplete enumeration, and deadline errors fail attribution. Resulting
+owner tasks are sorted by TGID/TID before exact before/after comparison. The
+second snapshot repeats enumeration from scratch; daemon-owned socket checks
+still bracket each complete external scan. Parallelism reduces neither the
+required proof nor worst-case work and may increase instantaneous CPU usage.
+The exact fd path found by the ownership scan is
 likewise only a performance hint:
 runtime capture revalidates its symlink before reading identity metadata, falls
 back to a bounded rescan of that same task's fd table when the hint vanished or
@@ -275,7 +362,11 @@ state can still place many rules under one pin, so candidate matching is linear
 within that bucket. Learning uses a separate 512-item queue and persists at most
 256 observations per batch. This is a rule-index cache, not a process-identity or
 authorization-result cache. Apart from the established-TCP conntrack-generation
-fast path described below, every queued packet still receives fresh attribution.
+fast path described below, every enforcement packet still receives fresh
+attribution. Learning-only duplicate suppression is bounded and invalidated by
+policy generation; it may skip an observation but cannot authorize Enforcing
+traffic. Its scheduling index has at most 512 entries and retries TCP observations after one second and datagrams after
+100 ms rather than retaining failed or successful identities permanently.
 
 Both backend compilers implement an early mark-sanitization step, the main
 policy path, and a late authorization path. The following handshake describes
@@ -381,14 +472,16 @@ attestation or runtime fallback negotiation for an otherwise identical policy:
 - **L1 `Nfqueue`** applies throughout `Learning`, and in `Enforcing` when any
   enabled application-bound rule can match UDP, ICMP, ICMPv6, or `Any`.
   Enforcing and Learning application denies use mandatory fail-closed queue
-  1337. Ordinary Learning observations use immediate asynchronous queue 1338
+  1337. Ordinary Learning observations use bounded asynchronous queue 1338
   with `bypass`; their failure loses evidence rather than connectivity. This
   level dominates L2 when both kinds of rule are present.
 - **`Unknown`** is reserved for a legacy response or a runtime whose level has
   not been verified. It is never interpreted as one of the accelerated paths.
 
 Disabled application rules do not affect the level. Network-only rules and
-packets which match them remain kernel-native at L2 and L1; the reported value
+packets which match them remain kernel-native in Enforcing at L2 and L1.
+Learning additionally observes eligible traffic even behind a network allow;
+the reported value
 is a conservative daemon-wide summary, not a statement that every packet takes
 the same route. A successful mode or rule transaction recomputes the level from
 the committed snapshot. Level selection does not relax selector conjunctions,
@@ -432,8 +525,9 @@ level or change these semantics.
 : Unmatched locally originated outbound traffic is allowed, while enabled
   explicit network and application `Drop`/`Reject` rules remain active. Network
   decisions stay on the direct kernel path; application-deny candidates use
-  fail-closed queue 1337. Other eligible packets are immediately accepted by
-  observational queue 1338 with `bypass` and attributed asynchronously.
+  fail-closed queue 1337. Other eligible packets use observational queue 1338
+  with `bypass` and asynchronous attribution; only the first eligible observation
+  may await the bounded 250 ms capture opportunity described above.
   Successful attribution can persist an
   enabled, exact endpoint `Accept` rule and the disabled per-`(cgroup,path)`
   template. Failed or skipped attribution and recoverable learning persistence

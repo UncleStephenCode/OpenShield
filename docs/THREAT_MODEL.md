@@ -12,7 +12,9 @@
 4. Failed parsing, persistence, identity attribution, or firewall-backend updates
    preserve or strengthen the last known restrictive policy. The explicit
    exception is observational queue 1338 in `Learning`: it accepts ordinary
-   unmatched traffic immediately, so a later attribution failure creates no rule.
+   unmatched traffic independently of attribution success, so a failed observation
+   creates no rule. Its first-observation wait is bounded to 250 ms and pending
+   verdicts require the same current Learning mode and generation.
    Enabled explicit denies still apply through the kernel or fail-closed queue 1337.
 5. New inbound service traffic is denied unless an enabled inbound rule matches;
    only the exact built-in normal-mode DHCP/IPv6 control set is exempt.
@@ -110,10 +112,22 @@ are broader than firewall administration alone.
   after successful startup activation.
   The only automatic startup backend fallback is nftables to the complete
   iptables/ip6tables bundle when nftables cannot be validated.
-- Two independent packet consumers own the fixed kernel queues: queue 1337 has
+- Two independent outgoing packet consumers own the fixed kernel queues: queue 1337 has
   neither bypass nor `NFQA_CFG_F_FAIL_OPEN`, while observational queue 1338 has
-  both. Queue 1338 returns `NF_ACCEPT` before a bounded asynchronous attribution
-  worker runs; another bounded worker persists successful observations. Queue
+  both. A separate fail-closed reader of INPUT queue 1339 can briefly hold
+  eligible UDP/ICMP echo replies and repeat current kernel policy, never accept
+  them itself. Its drain barrier, flow readiness and three-attempt packet mark
+  are scheduling state, not an authorization cache. Bounded waits and fresh
+  mode/generation checks apply; see [the architecture](ARCHITECTURE.md).
+  Queue 1338 normally returns `NF_ACCEPT` immediately; the first eligible
+  TCP SYN or datagram of a recently unseen flow may wait for an asynchronous
+  attribution attempt, bounded by 250 ms and 128 pending packets. Its reader
+  remains responsive with a 5 ms pending-work poll. Expiry, full backlog, or full
+  pending capacity does not make successful attribution a Learning allow
+  requirement. A pending verdict is accepted only under the engine lock while
+  the same Learning mode/generation remains active and shutdown has not started;
+  otherwise it is dropped. Serial/generation tickets reject stale completions.
+  Another bounded worker persists successful observations. Queue
   1337 permits only a successful matching decision and conservatively drops an
   unresolved deny candidate, except for a kernel-UID mismatch deferred to
   best-effort observation. Attribution handles parsed TCP, UDP, ICMP echo, and
@@ -121,8 +135,10 @@ are broader than firewall administration alone.
   waits to fill a batch. Every packet independently maps its kernel UID and
   network tuple to a socket inode through `SOCK_DIAG`. One bounded external
   PID/TID owner snapshot before identity capture and another after capture are
-  shared across the batch. One absolute 250 ms deadline covers the complete
-  operation, and each snapshot has one global cap of 131,072 owner records
+  shared across the batch, including single-item batches. One absolute deadline
+  covers the complete operation: 2 seconds for queue 1337 and 5 seconds for
+  asynchronous Learning attribution; every `SOCK_DIAG` query is additionally
+  capped at 250 ms within that deadline. Each snapshot has one global cap of 131,072 owner records
   across all targets. These bounds are not multiplied by packet count. Identity
   capture is memoized only inside the batch for the
   same inode, socket UID, and capture requirements. Requests sharing a socket
@@ -139,9 +155,14 @@ are broader than firewall administration alone.
   socket or failed check produces DROP in Enforcing, and self task fd tables
   are excluded from attribution. Within one external scan, a descriptor number
   found for one task is tried first on later matching-UID tasks. Only an exact
-  target link with a repeated UID check is accepted; a mismatch or read error
-  falls back to a complete bounded fd-table scan, and the hint is not retained
-  across batches. A changed before/after owner snapshot, the absence of a matching-UID holder, different matching TGIDs,
+  target link with a repeated UID check is accepted; all target inodes for that
+  UID must be confirmed to skip the complete fd walk. A missing target, mismatch,
+  or read error falls back to the bounded scan; verified preferred descriptors
+  make duplicate-fd selection stable. The hint is not retained across batches.
+  Full walks pin and rewind the fd directory and use safe `RawDir`/`readlinkat_raw`
+  with fixed reusable buffers. A truncated link cannot be a valid socket link;
+  read errors, disappearance checks, UID checks, and all work bounds retain their
+  fail-closed meaning. A changed before/after owner snapshot, the absence of a matching-UID holder, different matching TGIDs,
   an incomplete or unavailable live process/task scan, or candidate
   descriptor-bound exhaustion fails attribution. Sibling holder TIDs in one TGID
   count as one process only if their captured executable path/file version, argv,
@@ -153,9 +174,10 @@ are broader than firewall administration alone.
   on a TGID-leader fd table is skipped only after two bounded `stat` reads
   confirm stable zombie state `Z`; every other error, non-zombie state, or
   unconfirmed state fails attribution. Any remaining failure, ambiguity, configured
-  bound, or the shared 250 ms procfs deadline produces DROP in Enforcing and
+  bound, or the shared procfs deadline produces DROP in Enforcing and
   for a Learning application-deny candidate; on queue 1338 it suppresses
-  persistence after the immediate accept. The
+  persistence without changing Learning's ordinary allow policy, subject to
+  pending-verdict mode/generation checks. The
   policy generation is rechecked under the engine lock, which remains
   held through the backend-specific verdict and packet reinjection. nftables
   returns `NF_ACCEPT` and completes authorization in a later base chain;
@@ -339,6 +361,22 @@ are broader than firewall administration alone.
   Authorization happens when a Unix connection is accepted; an authorized
   member can relay the already-connected socket fd to another process, so this
   group check is not a non-delegable confidentiality boundary.
+- At 64 or more external tasks across multiple TGIDs and two available CPUs, an
+  owner snapshot may scan fd tables with two workers. The complete PID/TID list
+  is enumerated first under the global task cap; whole TGIDs are distributed
+  greedily by task count. One positive-owner accumulator retains the global
+  record cap and cross-worker ambiguity checks. One absolute deadline covers
+  both workers, and every helper is joined before use of the sorted result.
+  Spawn/join errors and incomplete scans fail closed. This may increase
+  instantaneous CPU use; one large TGID and small process sets remain serial.
+- Learning is not a historical process/socket event collector. The first-packet
+  250 ms capture opportunity is a userspace deadline, not a hard real-time bound
+  under scheduler or policy-lock contention. It helps short-lived request/response clients, but a
+  one-way UDP sender can return from `sendto()` and exit before attribution.
+  Queuing the datagram does not pin its process identity. Such a missing rule
+  must not be filled from a stale PID or guessed identity; review the learned
+  rule set before Enforcing. Bounded duplicate suppression can also lose
+  observations under churn, without authorizing an Enforcing packet.
 - Procfs attribution is a bounded, repeated post-hoc consistency check, not an
   atomic kernel record of the process generation that initiated an operation.
   In particular, a process can enqueue a packet and then exec an allowed image
@@ -393,10 +431,11 @@ are broader than firewall administration alone.
   whose filesystem UID matches the socket UID. One directory walk inspects at
   most 4,096 fd entries per matching-UID task and fails if proof requires a later
   entry. Since v0.1.32, a batch performs two owner snapshots, each admitting at most
-  131,072 owner records globally across all of its targets; its single 250 ms
-  deadline bounds both scans and every intervening lookup and capture.
+  131,072 owner records globally across all of its targets. A single 2-second
+  deadline bounds both scans and every intervening lookup and capture for queue
+  1337; asynchronous Learning uses 5 seconds, not a 5-second packet hold.
   Process/thread floods, a matching-UID fd flood, queue pressure, or the
-  250 ms deadline can therefore deny legitimate traffic. This is an
+  attribution deadline can therefore deny legitimate traffic in Enforcing. This is an
   availability/denial-of-service risk, not a fail-open path. An incomplete live
   process/task enumeration remains globally fail-closed; an oversized fd table
   affects attribution for traffic with its matching socket UID, while unrelated

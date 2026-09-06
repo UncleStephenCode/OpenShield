@@ -31,10 +31,12 @@ workspace code.
 A machine with no state file gets a persisted `Learning` policy. This does not
 create a fail-open startup window: every daemon start first installs a temporary
 kernel `BlockAll` quarantine. The saved policy is activated only after it has
-been validated, both fixed NFQUEUE consumers are ready, and all required local
+been validated, all three fixed NFQUEUE consumers are ready, and all required local
 prerequisites are available. Queue 1337 is fail-closed for `Enforcing` and for
-explicit application-bound denies in `Learning`; queue 1338 is the immediate,
-observational `Learning` queue. An existing saved mode is preserved.
+explicit application-bound denies in `Learning`; queue 1338 is the bounded,
+observational `Learning` queue. Fail-closed queue 1339 can briefly defer eligible
+UDP/ICMP replies while an outgoing decision is pending, then repeat the current
+INPUT policy; it never authorizes a packet itself. An existing saved mode is preserved.
 While startup `BlockAll` remains active, the first v0.2.1 load of v0.2.0 state
 adds missing disabled application-group templates within the automatic-rule,
 total-rule, and 8 MiB limits; existing learned endpoint rules are never removed
@@ -51,8 +53,11 @@ ICMPv6 echo traffic, but it no longer uses successful observation as the
 default allow condition. Unmatched outbound traffic is allowed while the live
 policy remains `Learning`; missing, ambiguous, oversized, unsupported,
 timed-out, or queue-saturated observation creates no rule instead of blocking
-ordinary traffic. Queue 1338 therefore accepts immediately, performs attribution
-asynchronously, and has kernel bypass and fail-open queue flags. Enabled explicit
+ordinary traffic. Queue 1338 performs attribution asynchronously and has kernel
+bypass and fail-open queue flags. The first eligible TCP SYN or datagram of a
+recently unseen flow can wait up to 250 ms for an attribution attempt; repeat
+observations are accepted immediately. Expiry or backlog does not deny ordinary
+traffic while the same `Learning` generation remains active. Enabled explicit
 network `drop`/`reject` rules remain active in the kernel. Traffic inside an
 enabled application-deny envelope instead enters fail-closed queue 1337; a
 matching deny is applied and an unresolved candidate is conservatively dropped,
@@ -108,7 +113,7 @@ path, not weaker enforcement and not a runtime fallback for the same policy:
 | ---: | --- | --- |
 | L3 | `KernelNative` | `BlockAll`, or `Enforcing` without an enabled application-bound rule; filtering is compiled directly into the selected kernel firewall backend |
 | L2 | `ConntrackHybrid` | `Enforcing` with enabled application-bound TCP rules only; the first packet is attributed through NFQUEUE and established TCP uses the current conntrack-generation fast path |
-| L1 | `Nfqueue` | `Learning` uses immediate asynchronous observations, while `Enforcing` with an enabled application-bound UDP, ICMP, ICMPv6, or `Any` rule requires fresh userspace attribution for otherwise-unmatched packets |
+| L1 | `Nfqueue` | `Learning` uses bounded asynchronous observations, while `Enforcing` with an enabled application-bound UDP, ICMP, ICMPv6, or `Any` rule requires fresh userspace attribution for otherwise-unmatched packets |
 | — | `Unknown` | a legacy status response or an unverified runtime; the UI must not present it as an accelerated path |
 
 The level is deliberately a worst-case summary. Network-only packets continue
@@ -186,13 +191,19 @@ bounded repeated checks of `/proc` metadata. It enumerates descriptor tables
 only for tasks whose filesystem UID equals the kernel socket UID, groups matching
 holders by process. In Enforcing, incomplete candidate scans, multiple process
 owners, changing identity, or exhausted bounds deny the packet. The same
-failures in an ordinary Learning observation skip rule creation without delaying
-or denying the packet. Learning application-deny candidates are a deliberate
+failures in an ordinary Learning observation skip rule creation rather than
+deny the packet; the initial observation wait is bounded as described below.
+Learning application-deny candidates are a deliberate
 exception: they use fail-closed NFQUEUE 1337 and deny on unresolved attribution
 inside the candidate envelope, apart from a kernel-UID mismatch that is accepted
 and deferred to best-effort observation. The separate Learning NFQUEUE 1338
-accepts packets immediately and hands bounded attribution to an asynchronous
-worker; it has queue bypass and an accept-on-overflow policy. TCP authorization
+hands bounded attribution to an asynchronous worker; it has queue bypass and
+an accept-on-overflow policy. At most 128 first observations may await completion
+or a 250 ms deadline. This is a userspace deadline, not a hard real-time bound
+under scheduler starvation or policy-lock contention. The reader polls pending work at 5 ms intervals rather
+than blocking on `/proc`; later observations are accepted immediately. Releasing
+a pending packet requires the same current `Learning` mode and generation under
+the policy lock; a mode/generation change or shutdown drops it. TCP authorization
 in Enforcing is tied to a persisted 30-bit policy
 generation that increases by one and is not reused before exhaustion; UDP and
 ICMP are re-attributed for every otherwise-unmatched outbound packet.
@@ -202,17 +213,39 @@ be attributed in bounded batches of at most 32 already-ready items; neither path
 waits to fill a batch. Each item still gets an independent `SOCK_DIAG` socket
 lookup. Only the complete procfs owner
 enumerations are shared: one snapshot before identity capture and one after it.
-The entire batch has one absolute 250 ms deadline, and each shared snapshot has
-a global cap of 131,072 owner records across all targets. An identity may be
+The entire batch has one absolute deadline: 2 seconds for queue 1337 and
+5 seconds for asynchronous Learning attribution. Each `SOCK_DIAG` lookup is
+additionally capped at 250 ms, without extending the batch deadline. These are
+work limits, not intentional delays. Even a single-item batch performs both
+owner snapshots; each snapshot has a global cap of 131,072 owner records across
+all targets. An identity may be
 reused only inside that batch for the same socket
 inode, socket UID, and capture requirements, and duplicate requests must agree
 on PID, process start time, executable path and complete file version, and UID.
 A typed timeout remains visible in NFQUEUE counters. In Enforcing, and inside a
 Learning application-deny envelope, ambiguity, a changed owner snapshot, a missed
 deadline, or an exceeded bound denies the affected packet. On observational
-queue 1338 it prevents persistence but cannot revoke the already returned
-`NF_ACCEPT`. There is no cross-batch identity or authorization cache, so unmatched UDP/ICMP
+queue 1338 it prevents persistence, not Learning's ordinary allow decision.
+Pinned fd-directory handles, reusable directory/link buffers, and verified
+scan-local fd-number hints reduce filesystem lookup and allocation overhead;
+they do not replace either complete owner snapshot. There is no cross-batch
+identity or authorization cache, so otherwise-unmatched Enforcing UDP/ICMP
 traffic is attributed again in every later batch.
+
+With at least 64 external tasks across two or more processes and at least two
+available CPUs, each owner snapshot uses at most two scan workers (the resolver
+and one scoped helper). Small process sets and single-process workloads stay
+serial. All PID/TID entries are enumerated under one global task bound before
+dispatch; workers share the absolute deadline, owner-record cap, and ambiguity
+tracking. Whole-process partitions preserve sibling checks and deterministic
+owner ordering. An incomplete scan or worker failure remains fail-closed.
+
+The first-observation wait improves the chance of learning short-lived TCP and
+UDP request/response clients, but it is not an exec/socket event recorder. A
+fire-and-forget UDP sender may return from `sendto()` and exit before procfs
+attribution completes, even while its packet is queued. Such traffic remains
+allowed in Learning but may create no rule. Verify learned rules before enabling
+Enforcing; see the [isolated short-lived application regression](tests/compat/README.md#short-lived-application-regression).
 
 These selectors identify observed process metadata, not all code executing in
 the process. The version pin detects ordinary in-place rewrites through size or
@@ -523,20 +556,67 @@ comparison.
 
 Compatibility claims are intentionally scoped:
 
-- the current v0.2.1 source resolves all four workspace crates and their exact
+The September 6 v0.2.1 correction, daemon SHA-256
+`083165d4de3655b7db3ff5795da3e32dc3ed9566c588902ed90cbf580ace615a`, passed
+462 workspace Rust tests, all seven separately invoked ignored tests, formatting,
+all-target Clippy, and 230 Python tests without skips. Its exact RPM passed
+delayed ICMP/UDP/TCP reply tests, short-lived application/long-argv learning,
+server Learning-to-Enforcing, and real Privoxy regressions on both nftables and
+iptables in isolated Tumbleweed x86-64 containers. The delayed fixture had no
+loss or unexpected firewall/NFQUEUE drops; under 1,024-thread/8,192-fd procfs
+pressure, UDP/ICMP p99 was approximately 341–363 ms with a 55 ms peer delay,
+while established TCP remained near 56 ms. These are functional regression
+observations, not maximum-capacity or complete performance-smoke results.
+The full performance smoke was not rerun for this correction. See the
+[reproducible fixtures](tests/compat/README.md#delayed-tcpudpicmp-replies).
+
+The September 5 results below describe the earlier v0.2.1 artifact identified
+by its hashes, not every subsequent untagged source change. In particular, its
+ICMP fixture used immediate replies; later delayed-reply tests exposed a
+conntrack mark-reset race not covered by that result.
+
+- the earlier v0.2.1 source resolves all four workspace crates and their exact
   internal dependency pins as `0.2.1`. In the pinned Rust 1.98.0 container, the
-  locked all-target suite passed 377 tests while the normal run ignored six
-  environment-dependent tests; a separate invocation passed all six. Formatting,
+  locked workspace all-target suite passed 428 tests while the normal run ignored
+  seven tests; all seven were then executed successfully: five live `SOCK_DIAG`
+  tests, the `SCM_RIGHTS` helper test, and the synthetic fd-scan microbenchmark. Formatting,
   all-target Clippy with warnings denied, and the static-PIE musl release build
-  passed. The performance-harness unit suite passed 219 tests with 11 intentional
-  environment-dependent skips. Both local release executables report `0.2.1`.
-  The locally built Tumbleweed x86-64 RPM (SHA-256
-  `fa638b0503447a7c85815a5a51d6add653330b92e2d5e05e854eb1dc1602d373`)
-  passed package installation and the complete disposable-container E2E with
-  nftables and the iptables fallback; neither run touched the host firewall.
-  The release matrix validates 43 binary builds, 43 packages, 86 declared
-  platforms, 37 package-install jobs, and 74 firewall jobs. The GitHub release
-  workflow for v0.2.1 has not yet run;
+  passed. The Python suite passed 230 tests with no skips. Both local release
+  executables report `0.2.1`;
+- that Tumbleweed x86-64 RPM has SHA-256
+  `1036ad5fab15baf5c7c29348fdc17ce8f827d04fad2d89e9abdc74e0cad8fbd1`;
+  its daemon has SHA-256
+  `4acdb2109b14832a3cb7c9928fa374b8768ddd324d2bf6a9c95effb0f62b8796`.
+  Installation passed with default nftables selection and in an iptables-only
+  container. The complete server Learning-to-Enforcing E2E and the real Privoxy
+  regression each passed with both backends;
+- the [short-lived application fixture](tests/compat/README.md#short-lived-application-regression)
+  learned all six exact TCP/DNS application rules with both backends under
+  pressure from 1,024 threads and 8,192 descriptors. Enforcing admitted all ten
+  ICMP probes, with zero loss and zero `dropped_in`/`dropped_out` counter deltas;
+  unknown executables and changed arguments were denied. ICMP p95 was 152 ms on
+  nftables and 179 ms on iptables. The pre-optimization binary observed in
+  the same nftables fixture had learned zero of six rules, with ICMP p95 of 706 ms and
+  10% loss. These are individual fixture observations, not a statistical
+  maximum-capacity result. Fire-and-forget UDP rule creation remains best-effort:
+  its sender may exit before procfs attribution;
+- the pre-optimization and September 5 binaries both passed the complete local
+  performance smoke on nftables and iptables with the unchanged configuration
+  (SHA-256 `b52b3a390a25a6cc611fb91a2ecb1b9df2cebd1bbef86cf6615ba7144fd7ed43`).
+  Each run recorded 576 phase results, 108 independent baseline/protected pairs,
+  36 comparison groups, and four successful fail-closed overload/recovery proofs.
+  The final run is `20260905T204011Z-5e5ff23f6bd5fee5e47b6286956ed5db`.
+  Throughput/PPS, validity, and safety gates passed. Relative CPU/latency
+  increases above 10% remain recorded observations under the existing advisory
+  policy; this result does not mean every metric stayed within 10%, nor does
+  this bounded smoke certify maximum sustainable capacity;
+- the six init images passed their parser/supervisor checks. The systemd unit
+  was validated, but systemd was not booted as PID 1. Static compatibility
+  validation covers the inventory of 60 distributions and 25 Rust targets and
+  a release matrix of 43 binary builds, 43 packages, 86 declared platforms,
+  37 package-install jobs, and 74 firewall jobs. Inventory validation is not
+  execution evidence for all those distributions or architectures. These local
+  checks do not confirm the GitHub workflow result for the current source tree;
 - local v0.1.32 verification on Rust 1.98.0 passed
   `cargo fmt --all -- --check` and locked
   workspace all-target clippy with warnings denied. The complete Rust suite in
@@ -549,7 +629,8 @@ Compatibility claims are intentionally scoped:
   Tumbleweed scenario with both nftables and the iptables fallback, including Learning,
   TCP-only L2 and mixed UDP/TCP L1 application attribution, inbound default
   deny and explicit allow, fail-closed shutdown, and restart with the persisted
-  policy. Both disposable container runs left the host firewall untouched;
+  policy. OpenShield rules were confined to the disposable container network
+  namespaces; Docker manages its bridge/NAT rules on the host;
 - both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
   `tests/compat/distros.tsv`;
@@ -569,8 +650,8 @@ Compatibility claims are intentionally scoped:
   and 6 `386`;
 - each of those 37 rows runs the nftables and iptables
   Learning-to-Enforcing scenarios, for 74 firewall jobs. Both results are
-  publication requirements, not claims that an unpublished workflow run has
-  already completed;
+  publication requirements, not evidence that those jobs passed for the current
+  source tree;
 - `amd64` and `arm64` execute on native runners, while `386` uses the x86-64
   kernel's 32-bit compatibility path. The other 24 ARMv5/6/7, `ppc64le`,
   `riscv64`, and `s390x` package variants are build-only; their pinned
@@ -596,8 +677,9 @@ after the mode-generation change is attributed through NFQUEUE, then the
 daemon is paused while another exchange must complete through the established
 conntrack fast path. These 74 configured publication gates must not be read as
 results until the corresponding workflow has completed. They run in disposable
-namespaces on a Unix-socket Docker engine, do not modify the host firewall, and
-are not production or native-hardware certification.
+namespaces on a Unix-socket Docker engine. OpenShield applies rules only inside
+those namespaces; Docker itself manages host bridge/NAT rules. These checks are
+not production or native-hardware certification.
 
 ## TUI localization
 

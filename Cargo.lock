@@ -692,6 +692,7 @@ dependencies = [
  "nix",
  "openshield-core",
  "openshield-protocol",
+ "rustix",
  "serde_json",
  "tempfile",
  "tracing",

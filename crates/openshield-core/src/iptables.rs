@@ -283,6 +283,9 @@ fn append_input_chain(
 
         append_direct_rules(script, snapshot, family, Direction::Inbound);
         append_reverse_rules(script, snapshot, family, Direction::Inbound);
+        if snapshot.mode == Mode::Enforcing && interception == ApplicationInterception::PerPacket {
+            append_application_reply_queues(script, snapshot, family);
+        }
     }
     append_counted_verdict(script, IPTABLES_INPUT_CHAIN, "dropped_in", "DROP");
 }
@@ -801,6 +804,29 @@ fn append_application_rule_queues(
     }
 }
 
+fn append_application_reply_queues(
+    script: &mut String,
+    snapshot: &Snapshot,
+    family: AddressFamily,
+) {
+    for rule in crate::nftables::application_reply_candidates(snapshot)
+        .iter()
+        .filter(|rule| supports_family(rule, family))
+    {
+        append_rule_match(script, rule, Direction::Inbound, true);
+        match rule.spec.protocol {
+            TransportProtocol::Icmp => script.push_str(" -m icmp --icmp-type 0/0"),
+            TransportProtocol::IcmpV6 => script.push_str(" -m icmp6 --icmpv6-type 129/0"),
+            _ => {}
+        }
+        let _infallible = writeln!(
+            script,
+            " -m mark ! --mark 0x{APPLICATION_HANDOFF_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x} -j NFQUEUE --queue-num {}",
+            crate::APPLICATION_REPLY_QUEUE_NUMBER
+        );
+    }
+}
+
 fn append_application_candidate_guard_drops(
     script: &mut String,
     snapshot: &Snapshot,
@@ -1114,6 +1140,85 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         state.create_rule_at(id, spec, now)?;
         Ok(id)
+    }
+
+    #[test]
+    fn reply_deferral_is_selector_bound_and_never_bypasses_the_input_policy()
+    -> Result<(), Box<dyn Error>> {
+        for protocol in [
+            TransportProtocol::Udp,
+            TransportProtocol::Icmp,
+            TransportProtocol::IcmpV6,
+        ] {
+            let mut state = State::new();
+            add_application_rule(&mut state, protocol, true)?;
+            state.set_mode(Mode::Enforcing)?;
+            let policy = IptablesCompiler::compile(&state.snapshot())?;
+            let script = if protocol == TransportProtocol::IcmpV6 {
+                policy.ipv6()
+            } else {
+                policy.ipv4()
+            };
+            let retry = script
+                .lines()
+                .find(|line| line.ends_with("-j NFQUEUE --queue-num 1339"))
+                .ok_or("missing bounded reply queue")?;
+            assert!(retry.starts_with("-A OPENSHIELD_IN "));
+            assert!(retry.contains("--ctstate ESTABLISHED --ctdir REPLY"));
+            assert!(retry.contains("-m mark ! --mark 0xc0000000/0xc0000000"));
+            assert!(!retry.contains("--queue-bypass"));
+            assert!(!retry.contains(" -i "));
+            assert!(!retry.contains("-j RETURN"));
+            match protocol {
+                TransportProtocol::Udp => assert!(retry.contains("--sport 53")),
+                TransportProtocol::Icmp => assert!(retry.contains("--icmp-type 0/0")),
+                TransportProtocol::IcmpV6 => assert!(retry.contains("--icmpv6-type 129/0")),
+                _ => return Err("unexpected test protocol".into()),
+            }
+            let offset = script.find(retry).ok_or("queue offset")?;
+            assert!(script.find("-m connmark --mark").ok_or("generation")? < offset);
+            assert!(
+                script
+                    .find("-A OPENSHIELD_IN -m comment --comment openshield:dropped_in -j DROP")
+                    .ok_or("default input drop")?
+                    > offset
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reply_queue_is_absent_without_enforcing_non_tcp_application_accepts()
+    -> Result<(), Box<dyn Error>> {
+        for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
+            for mode in [Mode::BlockAll, Mode::Learning, Mode::Enforcing] {
+                for enabled in [false, true] {
+                    for action in [RuleAction::Accept, RuleAction::Drop, RuleAction::Reject] {
+                        let mut state = State::new();
+                        let id = add_application_rule(&mut state, protocol, enabled)?;
+                        let mut spec = state
+                            .rules()
+                            .find(|rule| rule.id == id)
+                            .ok_or("rule")?
+                            .spec
+                            .clone();
+                        spec.action = action;
+                        state.update_rule(id, spec)?;
+                        state.set_mode(mode)?;
+                        let policy = IptablesCompiler::compile(&state.snapshot())?;
+                        assert_eq!(
+                            policy.ipv4().contains("--queue-num 1339"),
+                            protocol == TransportProtocol::Udp
+                                && mode == Mode::Enforcing
+                                && enabled
+                                && action == RuleAction::Accept
+                        );
+                        assert!(!policy.ipv6().contains("--queue-num 1339"));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

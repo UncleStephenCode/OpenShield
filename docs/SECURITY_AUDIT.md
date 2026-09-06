@@ -98,19 +98,34 @@ The normative boundary is defined by the
   forwarding rules.
 - Independent packet-consumer threads own fail-closed NFQUEUE 1337 (Enforcing
   and Learning application-deny candidates) and observational Learning NFQUEUE
-  1338. Queue 1338 accepts immediately and delegates to a bounded asynchronous
-  attribution worker; a separate bounded worker persists successful Learning
-  observations. Both kernel queues are bounded by queue length, packet
+  1338. Queue 1338 delegates to a bounded asynchronous attribution worker.
+  The first eligible TCP SYN or datagram of a recently unseen flow may await
+  completion for at most 250 ms; at most 128 packets are pending, with a 5 ms
+  reader poll and no synchronous procfs work on that reader. Repeats are accepted
+  immediately. Expiry or full backlog retains the ordinary Learning allow
+  policy, but pending verdicts require the same current mode/generation under
+  the engine lock and no shutdown. Serial/generation tickets reject stale
+  completions. A separate bounded worker persists successful Learning
+  observations. Both outgoing queues are bounded by queue length, packet
   copy length, procfs work, and attribution time.
   Queue 1337 deliberately has no queue bypass:
   parse, ownership, identity, ambiguity, or queue-pressure failures deny the
   affected traffic. `Learning` allows unmatched traffic but retains enabled
   explicit network and application denies. Its observational queue uses
   backend-native bypass; ordinary parse, attribution, quota, or persistence
-  pressure may lose an observation after the immediate accept. A terminal
+  pressure may lose an observation without turning ordinary Learning into a
+  successful-attribution allow policy. A terminal
   queue-integrity or policy-engine failure
   still requests emergency `BlockAll` rather than continuing in an unknown
   state.
+- A third reader owns fail-closed INPUT queue 1339 for eligible delayed
+  UDP/ICMP echo replies. It returns only Drop or `NF_REPEAT`, never Accept.
+  Its bounded readiness state waits for a post-admission, post-verdict empty
+  check of queue 1337; it cannot authorize a flow. Current kernel rules and
+  conntrack generation still decide delivery on every retry. At most 128 replies
+  wait, for up to 2 seconds per attempt and three attempts per packet. The
+  attempt bits preserve all unreserved packet-mark bits. Timeouts, policy
+  changes, and exhaustion remain fail-closed; sustained load may still lose replies.
 - In the iptables fallback, the reserved-mark sanitizer is the first mangle
   OUTPUT dispatcher and the separate Learning observer is the last. The daemon
   requires each exactly once. Pre-existing host marking, QoS, and policy-routing
@@ -168,11 +183,13 @@ The normative boundary is defined by the
   holder, multiple matching TGIDs, an incomplete scan, an unstable identity, or
   exhausted bounds fails attribution. This denies in Enforcing; in Learning it
   suppresses persistence while the outbound packet remains allowed.
-- In v0.1.32 the consumer drains at most 32 already-ready NFQUEUE packets
+- Since v0.1.32 attribution batches contain at most 32 already-ready items
   without waiting to fill a batch. Each packet still performs its own
   `SOCK_DIAG` lookup. The optimization shares only two complete bounded procfs
-  owner snapshots, one before and one after identity capture, under one absolute
-  250 ms deadline. Each snapshot has a global cap of 131,072 owner records
+  owner snapshots, one before and one after identity capture, including a
+  single-item batch. The absolute operation deadline is 2 seconds for queue
+  1337 and 5 seconds for asynchronous Learning; individual `SOCK_DIAG` queries
+  remain capped at 250 ms within that deadline. Each snapshot has a global cap of 131,072 owner records
   across all targets. Identity capture is
   memoized only inside that batch for an identical inode, socket UID, and
   capture requirement. Duplicate requests must reach consensus on PID, process
@@ -183,6 +200,26 @@ The normative boundary is defined by the
   persistence in Learning. No identity or authorization result survives
   into the next batch, so otherwise-unmatched UDP/ICMP remains repeatedly
   attributed.
+- Full fd scans use pinned, rewound directories and safe `RawDir`/`readlinkat_raw`
+  with reusable bounded buffers, avoiding full-path allocation for negative fd
+  entries. Truncated links cannot satisfy the socket-inode parser. Scan-local
+  descriptor hints skip a full walk only after every target inode for that UID
+  is revalidated; fallback preserves a verified preferred descriptor for sockets
+  with duplicate fds. Both complete owner snapshots, thread/UID checks,
+  executable pins, race revalidation, and all work bounds remain mandatory.
+  This adds no PID authorization cache, eBPF tier, kernel module, `CAP_BPF`, or
+  MOK/boot configuration requirement. Selector-mismatch diagnostics report
+  bounded field categories/counts rather than argv, executable paths, or cgroups.
+- Owner snapshots may use two fd-scanning workers only at 64 or more external
+  tasks, multiple TGIDs, and two available CPUs. The caller and one scoped helper
+  scan whole TGIDs distributed by task count. Complete PID/TID enumeration
+  keeps one global task bound; a shared positive-owner accumulator keeps one
+  record cap and cross-worker ambiguity checks. Both workers share the existing
+  deadline, every helper is joined, and sorted owner sets retain exact before/
+  after equality. Small or single-TGID scans remain serial. Worker failures deny
+  attribution; parallelism does not reduce proof requirements or worst-case work.
+  Learning's 250 ms first-observation deadline and 5 ms poll are not hard
+  real-time guarantees under scheduler or policy-lock contention.
 - On cgroup v2, exactly one unified `0::/path` entry supplies the cgroup
   identity. On a v1-only host, bounded controller memberships are validated but
   no cgroup identity is returned. Executable path, full file version, filesystem
@@ -571,8 +608,11 @@ Commands and exact interpretation are documented in
   self-TGID and scan-local fd-hint optimizations reduce the common-case scan cost.
   Every completed owner snapshot still includes two shared self-table checks.
   The v0.1.32 micro-batch shares its before/after snapshots across at most 32
-  already-ready packets, retains per-packet `SOCK_DIAG`, and applies one 250 ms
-  deadline to the whole batch plus a 131,072-owner-record cap to each snapshot.
+  already-ready packets, retains per-packet `SOCK_DIAG`, and applies one 2-second
+  deadline to a queue-1337 batch (5 seconds for asynchronous Learning) plus a
+  131,072-owner-record cap to each snapshot. Per-query `SOCK_DIAG` remains capped
+  at 250 ms. Fixed-buffer, directory-relative reads reduce common-case overhead,
+  not the worst-case scan size.
   Intra-batch
   identity reuse is keyed by inode, UID, and capture requirements and is accepted
   only with mandatory-identity consensus and unchanged ownership; nothing is
@@ -589,7 +629,8 @@ Commands and exact interpretation are documented in
   observations from filling the persistence queue, but classification follows
   procfs attribution attempt. New eligible candidates can still fill the
   persistence queue and lose observations without changing Learning's allow
-  verdict; all classes retain the procfs processing cost.
+  verdict. Learning-only scheduling suppression can avoid duplicate work before
+  attribution; candidates that reach attribution retain its procfs cost.
   Nonblocking verdict delivery prevents an indefinite policy-lock stall, but
   sustained netlink send pressure can request emergency `BlockAll`; this is an
   intentional fail-closed availability tradeoff.
@@ -599,6 +640,12 @@ Commands and exact interpretation are documented in
 
 ### Identity and privilege
 
+- The bounded first-observation wait is not a historical process/socket event
+  collector. A fire-and-forget UDP process may exit after `sendto()` before
+  attribution, even while its packet is queued. Learning then allows ordinary
+  traffic without a rule; stale PIDs or guessed identities are not substitutes.
+  Request/response and one-way UDP coverage are reported separately by the
+  [short-lived regression](../tests/compat/README.md#short-lived-application-regression).
 - Procfs attribution is a repeated post-event consistency check, not an atomic
   kernel sender/exec record. An exec or descriptor transfer concurrent with
   packet processing can expose only the later observable identity. UDP

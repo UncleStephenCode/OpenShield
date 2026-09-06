@@ -2,8 +2,9 @@ use ipnet::IpNet;
 use openshield_core::{
     ApplicationPath, ApplicationSelector, CgroupPath, CommandArgument, CommandLineMatch,
     CommandLineSelector, Direction, Event, EventKind, ExecutableFileId, FirewallCounters,
-    InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_LINE_BYTES, Mode,
-    PortRange, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
+    InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_ARGUMENTS,
+    MAX_COMMAND_LINE_BYTES, Mode, PortRange, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec,
+    Snapshot, TransportProtocol,
 };
 use openshield_protocol::{ControlRequest, FirewallBackendKind, RuntimeCompatibility};
 use std::borrow::Cow;
@@ -22,7 +23,8 @@ const MAX_NETWORK_CHARS: usize = 64;
 const MAX_PORT_CHARS: usize = 11;
 const MAX_INTERFACE_CHARS: usize = 15;
 const MAX_UID_CHARS: usize = 10;
-const MAX_ARGUMENTS_JSON_BYTES: usize = MAX_COMMAND_LINE_BYTES * 3;
+// Each raw byte can expand to `\u00xx`, plus quotes and separators for argv.
+const MAX_ARGUMENTS_JSON_BYTES: usize = MAX_COMMAND_LINE_BYTES * 6 + MAX_COMMAND_ARGUMENTS * 3 + 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum View {
@@ -197,12 +199,7 @@ impl RuleForm {
         let application = rule.spec.application.as_ref();
         let command_line = application.and_then(|selector| selector.command_line.as_ref());
         let arguments = command_line.map_or_else(String::new, |selector| {
-            let values: Vec<&str> = selector
-                .arguments
-                .iter()
-                .map(CommandArgument::as_str)
-                .collect();
-            serde_json::to_string(&values).unwrap_or_default()
+            command_arguments_json(&selector.arguments)
         });
         Self {
             id: Some(rule.id),
@@ -534,6 +531,20 @@ impl RuleForm {
                 )
             })
     }
+}
+
+/// Reversible JSON suitable for both the details pane and the editable form.
+/// `CommandArgument` escapes terminal controls and invisible formatting without
+/// changing the values that are sent back to the daemon when the rule is saved.
+pub(crate) fn command_arguments_json(arguments: &[CommandArgument]) -> String {
+    format!(
+        "[{}]",
+        arguments
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn parse_command_arguments(value: &str, i18n: &I18n) -> Result<Vec<CommandArgument>, String> {
@@ -1512,6 +1523,68 @@ mod tests {
     use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 
     use super::*;
+
+    #[test]
+    fn argument_editor_round_trip_preserves_controls_and_literal_escapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let arguments = [
+            "client",
+            "line\nnext",
+            "line\\nnext",
+            "\u{1b}[31m\u{202e}name",
+            "",
+        ]
+        .into_iter()
+        .map(CommandArgument::new)
+        .collect::<Result<Vec<_>, _>>()?;
+        let json = command_arguments_json(&arguments);
+        assert!(json.chars().all(is_safe_form_character));
+        assert!(json.contains("\\u001b[31m\\u202ename"));
+        let form = RuleForm {
+            name: "escaped arguments".to_owned(),
+            protocol: TransportProtocol::Tcp,
+            bind_application: true,
+            executable: "/usr/bin/client".to_owned(),
+            command_mode: CommandMode::Exact,
+            arguments: json.clone(),
+            ..RuleForm::default()
+        };
+        let i18n = I18n::test_english();
+        let rule = Rule::new(form.to_rule_spec(&i18n).map_err(io_error)?)?;
+        let edited = RuleForm::from_rule(&rule);
+        assert_eq!(edited.arguments, json);
+        assert_eq!(
+            parse_command_arguments(&edited.arguments, &i18n).map_err(io_error)?,
+            arguments
+        );
+        assert_eq!(edited.to_rule_spec(&i18n).map_err(io_error)?, rule.spec);
+        Ok(())
+    }
+
+    #[test]
+    fn largest_escaped_argument_fits_the_editable_json_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let arguments = vec![CommandArgument::new(
+            "\u{01}".repeat(MAX_COMMAND_LINE_BYTES - 1),
+        )?];
+        let json = command_arguments_json(&arguments);
+        assert!(json.len() > MAX_COMMAND_LINE_BYTES * 3);
+        assert!(json.len() < MAX_ARGUMENTS_JSON_BYTES);
+        assert!(json.chars().all(is_safe_form_character));
+        let mut form = RuleForm {
+            active_field: FormField::Arguments,
+            ..RuleForm::default()
+        };
+        for character in json.chars() {
+            form.insert_char(character);
+        }
+        assert_eq!(form.arguments, json);
+        assert_eq!(
+            parse_command_arguments(&form.arguments, &I18n::test_english()).map_err(io_error)?,
+            arguments
+        );
+        Ok(())
+    }
 
     #[test]
     fn unprivileged_state_rejects_every_mutation_entry_point() {

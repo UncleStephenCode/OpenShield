@@ -1055,6 +1055,42 @@ mod tests {
     }
 
     #[test]
+    fn maximum_control_argument_expansion_fits_request_and_response_frames()
+    -> Result<(), Box<dyn Error>> {
+        let mut rule = largest_rule()?;
+        rule.spec
+            .application
+            .as_mut()
+            .ok_or("application selector missing")?
+            .command_line = Some(CommandLineSelector::new(
+            CommandLineMatch::Exact,
+            vec![CommandArgument::new(
+                "\u{01}".repeat(MAX_COMMAND_LINE_BYTES - 1),
+            )?],
+        )?);
+        rule.spec.validate()?;
+        let request = Request::Control(ControlRequest::CreateRule {
+            expected_revision: u64::MAX,
+            rule: rule.spec.clone(),
+        });
+        let response = Response::RulesPage {
+            revision: u64::MAX,
+            rules: vec![rule],
+            next_after: Some(Uuid::new_v4()),
+        };
+        let mut request_bytes = Vec::new();
+        write_request(&mut request_bytes, &request)?;
+        assert!(request_bytes.len() > MAX_COMMAND_LINE_BYTES * 6);
+        assert!(request_bytes.len() <= MAX_FRAME_SIZE + 4);
+        assert_eq!(read_request(&mut Cursor::new(request_bytes))?, request);
+        let mut response_bytes = Vec::new();
+        write_response(&mut response_bytes, &response)?;
+        assert!(response_bytes.len() <= MAX_FRAME_SIZE + 4);
+        assert_eq!(read_response(&mut Cursor::new(response_bytes))?, response);
+        Ok(())
+    }
+
+    #[test]
     fn unknown_request_fields_are_rejected() -> Result<(), Box<dyn Error>> {
         let payload = br#"{"type":"read","data":{"type":"status","data":{"smuggled":true}}}"#;
         let mut bytes = Vec::from(u32::try_from(payload.len())?.to_be_bytes());

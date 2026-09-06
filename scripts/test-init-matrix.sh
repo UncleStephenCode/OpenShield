@@ -328,8 +328,33 @@ run_container_checks() {
         --security-opt no-new-privileges --security-opt label=disable \
         --tmpfs /run:rw,nosuid,nodev,mode=0755 \
         --mount "type=bind,src=$temporary_directory/stage-sysvinit/etc/init.d/openshield,dst=/staged/openshield,readonly" \
-        "$devuan_image" /bin/sh -ec \
-        '/bin/sh -n /staged/openshield; start-stop-daemon --start --test --quiet --background --make-pidfile --pidfile /run/openshield-test.pid --exec /bin/true --startas /bin/true; sleep 30 & service_pid=$!; printf "%s\n" "$service_pid" > /run/openshield-test.pid; start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/sleep >/dev/null; if start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/false >/dev/null 2>&1; then exit 1; fi; kill "$service_pid"; wait "$service_pid" 2>/dev/null || true'
+        "$devuan_image" /bin/sh -ec '
+            /bin/sh -n /staged/openshield
+            start-stop-daemon --start --test --quiet --background --make-pidfile --pidfile /run/openshield-test.pid --exec /bin/true --startas /bin/true
+            /bin/sleep 30 & service_pid=$!
+            trap '\''kill "$service_pid" 2>/dev/null || true; wait "$service_pid" 2>/dev/null || true'\'' EXIT
+            printf "%s\n" "$service_pid" > /run/openshield-test.pid
+            # The background PID exists before exec completes. Wait for the
+            # actual executable, not a delay or the assertion being tested.
+            expected_executable=$(readlink -f /bin/sleep)
+            count=0
+            while [ "$(readlink "/proc/$service_pid/exe" 2>/dev/null || true)" != "$expected_executable" ]; do
+                if ! kill -0 "$service_pid" 2>/dev/null || [ "$count" -ge 50 ]; then
+                    printf "%s\n" "FAIL Devuan fixture did not exec /bin/sleep within 5 seconds" >&2
+                    exit 1
+                fi
+                sleep 0.1
+                count=$((count + 1))
+            done
+            if ! start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/sleep >/dev/null; then
+                printf "%s\n" "FAIL Devuan rejected the ready PID and matching executable" >&2
+                exit 1
+            fi
+            if start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/false >/dev/null 2>&1; then
+                printf "%s\n" "FAIL Devuan accepted a mismatched PID executable" >&2
+                exit 1
+            fi
+        ' || fail 'Devuan SysV start-stop-daemon container check failed'
     printf '%s\n' 'PASS runtime: Devuan accepted SysV options and rejected a mismatched PID executable'
 
     docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \

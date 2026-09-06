@@ -14,6 +14,7 @@ libc.workspace = true
 nix.workspace = true
 openshield-core = { version = "=0.2.1", path = "../openshield-core" }
 openshield-protocol = { version = "=0.2.1", path = "../openshield-protocol" }
+rustix.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

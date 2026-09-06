@@ -81,12 +81,14 @@ after and requires
 `openshield-daemon --install-fail-closed` action. The long-running daemon repeats
 the kernel `BlockAll` bootstrap before reading or activating policy. On a fresh
 installation it persists `Learning`; an existing saved mode remains unchanged.
-The saved policy is activated only after validation and both fixed NFQUEUE
+The saved policy is activated only after validation and all three fixed NFQUEUE
 consumers are available: fail-closed queue 1337 for Enforcing and Learning
-application denies, plus immediate observational Learning queue 1338.
+application denies, bounded asynchronous observational Learning queue 1338,
+and fail-closed reply-retry queue 1339. The last queue can only drop or repeat
+the INPUT policy; it never authorizes traffic itself.
 
 The main process uses `Type=notify` and sends `READY=1` only after the policy,
-both NFQUEUE consumers, and verified IPC sockets are active. `ExecStopPost` installs
+all NFQUEUE consumers, and verified IPC sockets are active. `ExecStopPost` installs
 kernel `BlockAll` after the main process releases its singleton lock. Graceful
 shutdown inside the daemon also installs this quarantine without changing the
 persisted mode.
@@ -128,7 +130,14 @@ boot-parameter change, or MOK enrollment to the packaged service.
 The userspace fast path introduced in v0.1.32 needs no additional capability: it batches at
 most 32 already-ready NFQUEUE packets while retaining per-packet `SOCK_DIAG`,
 bounded before/after procfs owner snapshots, mandatory identity consensus, and
-one 250 ms fail-closed deadline. nftables table/chain/counter observation uses
+one absolute deadline (2 seconds for queue 1337, 5 seconds for asynchronous
+Learning; each `SOCK_DIAG` query is capped at 250 ms). Pinned, rewound fd-directory
+walks with reusable buffers need no additional capability and preserve both owner
+snapshots. Queue 1338 separately limits the first eligible observation wait to
+250 ms, with 128 pending packets and a 5 ms reader poll; pending verdicts require
+the same current Learning mode/generation and no shutdown. It does not introduce
+an authorization cache or guarantee rules for one-way UDP senders that exit before
+procfs capture. nftables table/chain/counter observation uses
 one fixed process per second with the same integrity checks. No package, LSM,
 Secure Boot, or kernel-module configuration change is required.
 

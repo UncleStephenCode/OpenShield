@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod application;
+mod application_diagnostics;
 mod backend;
 mod compatibility;
 mod engine;
