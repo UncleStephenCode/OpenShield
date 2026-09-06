@@ -404,6 +404,13 @@ cleanup() {
                  cat /tmp/openshield.exit-status /var/lib/openshield/state.json 2>/dev/null || true
                  printf "%s\n" "--- daemon logs ---"
                  cat /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
+                 printf "%s\n" "--- TCP session ---"
+                 cat /tmp/openshield-l2-client.log /tmp/openshield-l2-client.status 2>/dev/null || true
+                 printf "%s\n" "--- application queue status ---"
+                 cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null || true
+                 python3 /opt/ipc_client.py status 2>&1 || true
+                 printf "%s\n" "--- nftables OpenShield table ---"
+                 nft -nn list table inet openshield 2>&1 || true
                  for save in \
                      /usr/sbin/iptables-legacy-save /usr/sbin/ip6tables-legacy-save \
                      /usr/sbin/iptables-nft-save /usr/sbin/ip6tables-nft-save; do
@@ -772,7 +779,7 @@ else
     }
 fi
 
-begin_stage 'verify application-bound TCP conntrack-hybrid path'
+begin_stage 'learn observable application-bound TCP session'
 docker exec --detach "$server" python3 -c '
 import socket
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -832,6 +839,15 @@ fi
 docker exec "$client" python3 /opt/ipc_client.py assert-template \
     "$l2_tcp_executable" disabled
 
+# Learning observation is asynchronous and debounced per flow. Keep real TCP
+# exchanges active until a complete learned rule is visible, then drain the
+# last echo and stop the Learning heartbeat before rotating the generation.
+# Merely increasing the polling timeout cannot help a silent one-burst client.
+docker exec "$client" touch /tmp/openshield-l2-learning-idle
+wait_for_marker "$client" /tmp/openshield-l2-learning-idle-ready \
+    'quiescent application-bound TCP session before Enforcing'
+
+begin_stage 'verify application-bound TCP conntrack-hybrid path'
 docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
 docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
     enforcing "$expected_backend_protocol" conntrack_hybrid application_tcp >/dev/null

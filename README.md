@@ -2,7 +2,7 @@
 
 # OpenShield
 
-Current source release: **v0.2.1**.
+Current source release: **v0.2.2**.
 
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
@@ -447,7 +447,7 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. Under the current v0.2.1 CI policy, relative DUT-cgroup CPU
+confidence bound. Under the current v0.2.2 CI policy, relative DUT-cgroup CPU
 and request/connect-latency crossings are explicitly advisory;
 relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
 p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
@@ -458,7 +458,7 @@ explicit action. The
 retained full v0.1.31 run was structurally valid but failed its performance
 gate. The retained full local v0.1.32 run passed its authenticated performance
 gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
-and report and is not silently promoted to v0.2.1.
+and report and is not silently promoted to v0.2.2.
 
 ## Installation and init systems
 
@@ -734,7 +734,12 @@ installs both frontends and requires nftables to win; the iptables scenario
 omits `nft` and requires the compatibility backend. Each run covers Learning,
 TCP-only application `Enforcing` at L2 `ConntrackHybrid`, mixed UDP/TCP
 application `Enforcing` at L1 `Nfqueue`, an explicit inbound allow, and
-restart. The L2 check uses a real persistent TCP socket: its first exchange
+restart. The L2 check keeps one real TCP socket exchanging data during Learning
+until the complete learned rule and disabled template are visible. An explicit
+idle handshake drains the last echo before changing mode; a single missed
+asynchronous observation cannot leave the fixture waiting on a silent flow.
+Learning has a fixed 20-second client deadline, not a timeout renewed by each
+successful exchange. Its first exchange
 after the mode-generation change is attributed through NFQUEUE, then the
 daemon is paused while another exchange must complete through the established
 conntrack fast path. These 74 configured publication gates must not be read as

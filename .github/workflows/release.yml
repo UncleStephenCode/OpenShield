@@ -277,7 +277,8 @@ jobs:
                 tests/perf/test_environment.py \
                 tests/perf/test_metrics.py \
                 tests/perf/workloads/test_workloads.py \
-                tests/e2e/test_continuous_attribution.py
+                tests/e2e/test_continuous_attribution.py \
+                tests/e2e/test_tcp_session.py
               scripts/check-target-matrix.sh validate
               scripts/test-init-matrix.sh validate
             '
