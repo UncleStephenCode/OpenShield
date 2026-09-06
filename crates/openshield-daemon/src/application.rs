@@ -27,6 +27,8 @@ use openshield_core::{
     Snapshot, TransportProtocol,
 };
 
+use crate::application_timing::{TimingScope, TimingStage, record_enumeration};
+
 const MAX_PROC_ENTRIES: usize = 131_072;
 const MAX_FDS_PER_TASK: usize = 4_096;
 const FD_DIRECTORY_BUFFER_BYTES: usize = 4_096;
@@ -40,7 +42,7 @@ const MAX_STAT_BYTES: usize = 64 * 1024;
 const MAX_CGROUP_BYTES: usize = 256 * 1024;
 // A complete, race-checked owner scan must include every relevant task twice.
 // Busy desktops can legitimately need more than the socket lookup's budget.
-const PROC_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+pub(crate) const PROC_SCAN_DEADLINE: Duration = Duration::from_secs(2);
 const LEARNING_PROC_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const SOCK_DIAG_DEADLINE: Duration = Duration::from_millis(250);
 const PARALLEL_OWNER_SCAN_MINIMUM_TASKS: usize = 64;
@@ -679,6 +681,7 @@ impl ProcfsResolver {
     /// those captures, and each unique owner must remain byte-for-byte stable.
     /// This amortizes discovery and metadata reads without a retained identity
     /// cache: a later UDP batch starts attribution again from `SOCK_DIAG`.
+    #[cfg(test)]
     pub(crate) fn resolve_batch_for_enforcement(
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
@@ -704,7 +707,7 @@ impl ProcfsResolver {
         )
     }
 
-    fn resolve_batch_for_enforcement_until(
+    pub(crate) fn resolve_batch_for_enforcement_until(
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
         deadline: Instant,
@@ -712,6 +715,7 @@ impl ProcfsResolver {
         if requests.is_empty() {
             return Vec::new();
         }
+        let batch_timing = TimingScope::new(TimingStage::Batch, requests.len());
         if requests.len() > MAX_ATTRIBUTION_BATCH_SIZE {
             return requests
                 .iter()
@@ -728,12 +732,19 @@ impl ProcfsResolver {
         let before = if targets.is_empty() {
             OwnerSnapshot::default()
         } else {
-            match self.resolve_unique_process_tasks_batch(
+            let owner_timing = TimingScope::new(TimingStage::OwnerBefore, targets.len());
+            let resolved = self.resolve_unique_process_tasks_batch(
                 &targets,
                 deadline,
                 MAX_FDS_PER_TASK,
                 MAX_PROC_ENTRIES,
-            ) {
+            );
+            owner_timing.finish(
+                resolved
+                    .as_ref()
+                    .map_or(targets.len(), |snapshot| snapshot.failures.len()),
+            );
+            match resolved {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     let error =
@@ -744,7 +755,9 @@ impl ProcfsResolver {
                             *slot = Some(failure.clone());
                         }
                     }
-                    return batch_resolution_results(errors, vec![None; requests.len()]);
+                    let results = batch_resolution_results(errors, vec![None; requests.len()]);
+                    batch_timing.finish(results.iter().filter(|result| result.is_err()).count());
+                    return results;
                 }
             }
         };
@@ -783,7 +796,9 @@ impl ProcfsResolver {
         reject_inconsistent_batch_identities(&keys, &mut errors, &mut identities);
         self.revalidate_batch_owners(&keys, &before, deadline, &mut errors, &mut identities);
 
-        batch_resolution_results(errors, identities)
+        let results = batch_resolution_results(errors, identities);
+        batch_timing.finish(results.iter().filter(|result| result.is_err()).count());
+        results
     }
 
     fn capture_batch_identities(
@@ -792,15 +807,19 @@ impl ProcfsResolver {
         before: &OwnerSnapshot,
         deadline: Instant,
     ) -> BTreeMap<SocketIdentityCaptureKey, IdentityCaptureResult> {
-        Self::capture_batch_identities_with(requests, keys, before, deadline, |task| {
-            Self::capture_process_identity(
-                &task.path,
-                task.tid,
-                task.socket_uid,
-                deadline,
-                task.requirements,
-            )
-        })
+        let timing = TimingScope::new(TimingStage::Metadata, requests.len());
+        let captures =
+            Self::capture_batch_identities_with(requests, keys, before, deadline, |task| {
+                Self::capture_process_identity(
+                    &task.path,
+                    task.tid,
+                    task.socket_uid,
+                    deadline,
+                    task.requirements,
+                )
+            });
+        timing.finish(captures.values().filter(|result| result.is_err()).count());
+        captures
     }
 
     fn capture_batch_identities_with(
@@ -880,6 +899,7 @@ impl ProcfsResolver {
         Vec<Option<BatchResolutionFailure>>,
         BTreeSet<SocketOwnerKey>,
     ) {
+        let timing = TimingScope::new(TimingStage::SocketLookup, requests.len());
         let mut keys = Vec::with_capacity(requests.len());
         let mut errors = Vec::with_capacity(requests.len());
         let mut targets = BTreeSet::new();
@@ -905,6 +925,7 @@ impl ProcfsResolver {
                 }
             }
         }
+        timing.finish(errors.iter().filter(|error| error.is_some()).count());
         (keys, errors, targets)
     }
 
@@ -924,12 +945,19 @@ impl ProcfsResolver {
         if successful_targets.is_empty() {
             return;
         }
-        let after = match self.resolve_unique_process_tasks_batch(
+        let owner_timing = TimingScope::new(TimingStage::OwnerAfter, successful_targets.len());
+        let resolved = self.resolve_unique_process_tasks_batch(
             &successful_targets,
             deadline,
             MAX_FDS_PER_TASK,
             MAX_PROC_ENTRIES,
-        ) {
+        );
+        owner_timing.finish(
+            resolved
+                .as_ref()
+                .map_or(successful_targets.len(), |snapshot| snapshot.failures.len()),
+        );
+        let after = match resolved {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let error =
@@ -1632,6 +1660,7 @@ fn enumerate_owner_task_groups(
         });
     }
     ensure_within_deadline(deadline)?;
+    record_enumeration(groups.len(), task_count);
     Ok(groups)
 }
 

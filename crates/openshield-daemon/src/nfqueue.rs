@@ -28,8 +28,12 @@ use crate::application::{
 use crate::backend::QueueVerdictStrategy;
 use crate::engine::{LearningQueueAdmission, NfqueueRuntimeCounters, SharedEngine};
 
+#[path = "nfqueue_enforcing.rs"]
+mod enforcing;
 #[path = "nfqueue_reply.rs"]
 mod reply;
+#[path = "nfqueue_scheduler.rs"]
+mod scheduler;
 
 const NFNL_SUBSYS_QUEUE: u16 = 3;
 const NFQNL_MSG_PACKET: u16 = 0;
@@ -293,7 +297,19 @@ fn packet_loop(
         reply::run(queue, engine, shutdown, counters, reply_registry);
         return;
     }
-    let resolver = ProcfsResolver::new();
+    if role == QueueRole::Enforcing {
+        enforcing::run(
+            queue,
+            engine,
+            shutdown,
+            learning,
+            attribution,
+            verdict_strategy,
+            counters,
+            reply_registry,
+        );
+        return;
+    }
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_BYTES];
     let mut errors = ErrorThrottle::default();
     let mut observations = LearningAttributionDebounce::default();
@@ -342,68 +358,7 @@ fn packet_loop(
                     );
                     return;
                 }
-                let mut drained_datagrams = 1_usize;
-                // Enforcing amortizes the bounded procfs scan across a packet
-                // batch. Learning's bounded first-packet capture runs on a
-                // separate worker: keep this reader responsive to completions
-                // and deadlines instead of draining a continuously busy queue.
-                while role == QueueRole::Enforcing
-                    && batch.len() < MAX_PACKET_BATCH_SIZE
-                    && drained_datagrams < MAX_PACKET_BATCH_SIZE
-                {
-                    match queue.receive_ready(&mut receive_buffer) {
-                        Ok(QueueReceive::Idle | QueueReceive::Interrupted) => break,
-                        Ok(QueueReceive::Overflow) => {
-                            counters.record_queue_overflow();
-                            errors.report(queue.overflow_message());
-                            drained_datagrams += 1;
-                        }
-                        Ok(QueueReceive::Datagram(ready_size)) => {
-                            drained_datagrams += 1;
-                            if let Err(error) =
-                                append_packet_datagram(&receive_buffer[..ready_size], &mut batch)
-                            {
-                                handle_packet_queue_failure(
-                                    role,
-                                    engine,
-                                    shutdown,
-                                    counters,
-                                    &mut errors,
-                                    &format!("invalid netfilter netlink message: {error:#}"),
-                                );
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            handle_packet_queue_failure(
-                                role,
-                                engine,
-                                shutdown,
-                                counters,
-                                &mut errors,
-                                &format!(
-                                    "application packet queue failed while forming a batch: {error:#}"
-                                ),
-                            );
-                            return;
-                        }
-                    }
-                }
-
                 let result = match role {
-                    QueueRole::Enforcing => return_batch_verdicts(
-                        &mut queue,
-                        batch,
-                        engine,
-                        shutdown,
-                        &resolver,
-                        learning,
-                        attribution,
-                        verdict_strategy,
-                        counters,
-                        &mut errors,
-                        reply_registry,
-                    ),
                     QueueRole::Learning => return_learning_batch_verdicts(
                         &mut queue,
                         batch,
@@ -415,7 +370,9 @@ fn packet_loop(
                         &mut observations,
                         &mut pending,
                     ),
-                    QueueRole::Reply => Err(anyhow!("reply queue reached the outbound reader")),
+                    QueueRole::Enforcing | QueueRole::Reply => {
+                        Err(anyhow!("non-Learning queue reached the Learning reader"))
+                    }
                 };
                 if let Err(error) = result {
                     handle_packet_queue_failure(
@@ -795,73 +752,67 @@ fn release_learning_verdicts(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn return_batch_verdicts(
+fn return_enforcing_verdict(
     queue: &mut QueueSocket,
-    batch: Vec<QueuedPacketWork>,
+    packet: QueuedPacketWork,
+    decision: Result<PacketAuthorization>,
+    ticket: Option<reply::OutgoingTicket>,
     engine: &SharedEngine,
     shutdown: &AtomicBool,
-    resolver: &ProcfsResolver,
-    learning: &SyncSender<LearningObservation>,
     attribution: &SyncSender<LearningAttributionWork>,
     verdict_strategy: QueueVerdictStrategy,
     counters: &NfqueueRuntimeCounters,
     errors: &mut ErrorThrottle,
     reply_registry: &reply::SharedRegistry,
 ) -> Result<()> {
-    let tickets = reply::register_outgoing_batch(reply_registry, &batch, engine)?;
-    let decisions = decide_packet_batch(&batch, engine, shutdown, resolver, learning);
-    for ((packet, decision), ticket) in batch.into_iter().zip(decisions).zip(tickets) {
-        let deferred_learning = decision
+    let timing = crate::application_timing::TimingScope::new(
+        crate::application_timing::TimingStage::QueueVerdict,
+        1,
+    );
+    let deferred_learning = decision
+        .as_ref()
+        .ok()
+        .filter(|authorization| authorization.defer_learning_attribution)
+        .map(|authorization| authorization.flow_generation);
+    let deferred_packet = deferred_learning.and_then(|_| packet.packet.ok());
+    let attribution_timed_out = match &decision {
+        Ok(authorization) => authorization
+            .observation_error
             .as_ref()
-            .ok()
-            .filter(|authorization| authorization.defer_learning_attribution)
-            .map(|authorization| authorization.flow_generation);
-        let deferred_packet = deferred_learning.and_then(|_| packet.packet.as_ref().ok().cloned());
-        let attribution_timed_out = match &decision {
-            Ok(authorization) => authorization
-                .observation_error
-                .as_ref()
-                .is_some_and(is_attribution_timeout),
-            Err(error) => is_attribution_timeout(error),
-        };
-        if attribution_timed_out {
-            counters.record_attribution_timeout();
-        }
-        let (accepted, decision_error) = return_packet_verdict(
-            queue,
-            packet.packet_id,
-            decision,
-            engine,
-            shutdown,
-            verdict_strategy,
-        )?;
-        reply::complete_outgoing(reply_registry, ticket, accepted && decision_error.is_none())?;
-        // Advance only after the actual verdict send, including denied,
-        // malformed and TCP packets that have no per-flow reply ticket.
-        reply::record_outgoing_verdict(reply_registry, packet.packet_id)?;
-        if !accepted {
-            counters.record_denied();
-        }
-        if let Some(error) = decision_error {
-            let context = if accepted {
-                "Learning admitted packet but skipped its observation"
-            } else {
-                "application packet denied"
-            };
-            errors.report(&format!("{context}: {error:#}"));
-        }
-        if accepted
-            && let (Some(flow_generation), Some(packet)) = (deferred_learning, deferred_packet)
-        {
-            enqueue_learning_attribution(
-                Ok(packet),
-                flow_generation,
-                attribution,
-                counters,
-                errors,
-            );
-        }
+            .is_some_and(is_attribution_timeout),
+        Err(error) => is_attribution_timeout(error),
+    };
+    if attribution_timed_out {
+        counters.record_attribution_timeout();
     }
+    let (accepted, decision_error) = return_packet_verdict(
+        queue,
+        packet.packet_id,
+        decision,
+        engine,
+        shutdown,
+        verdict_strategy,
+    )?;
+    reply::complete_outgoing(reply_registry, ticket, accepted && decision_error.is_none())?;
+    // Advance only after the actual verdict send, including denied,
+    // malformed and TCP packets that have no per-flow reply ticket.
+    reply::record_outgoing_verdict(reply_registry, packet.packet_id)?;
+    if !accepted {
+        counters.record_denied();
+    }
+    if let Some(error) = decision_error {
+        let context = if accepted {
+            "Learning admitted packet but skipped its observation"
+        } else {
+            "application packet denied"
+        };
+        errors.report(&format!("{context}: {error:#}"));
+    }
+    if accepted && let (Some(flow_generation), Some(packet)) = (deferred_learning, deferred_packet)
+    {
+        enqueue_learning_attribution(Ok(packet), flow_generation, attribution, counters, errors);
+    }
+    timing.finish(usize::from(!accepted));
     Ok(())
 }
 
@@ -897,13 +848,18 @@ fn return_packet_verdict(
             return Ok((false, Some(anyhow!(error.message))));
         }
     };
-    if !authorization_remains_valid(&authorization, current_mode, current_flow_generation) {
+    if !authorization_remains_valid(
+        &authorization,
+        current_mode,
+        current_flow_generation,
+        shutdown.load(Ordering::Acquire),
+    ) {
         drop(guard);
         queue.verdict(packet_id, NF_DROP)?;
         return Ok((
             false,
             Some(anyhow!(
-                "policy changed while application identity was resolved"
+                "policy changed or shutdown started while application identity was resolved"
             )),
         ));
     }
@@ -935,8 +891,11 @@ fn authorization_remains_valid(
     authorization: &PacketAuthorization,
     current_mode: Mode,
     current_flow_generation: u32,
+    stopping: bool,
 ) -> bool {
-    current_mode == authorization.mode && current_flow_generation == authorization.flow_generation
+    !stopping
+        && current_mode == authorization.mode
+        && current_flow_generation == authorization.flow_generation
 }
 
 fn authorization_verdict(
@@ -979,12 +938,31 @@ fn append_packet_datagram(bytes: &[u8], batch: &mut Vec<QueuedPacketWork>) -> Re
     Ok(())
 }
 
+#[cfg(test)]
 fn decide_packet_batch(
     batch: &[QueuedPacketWork],
     engine: &SharedEngine,
     shutdown: &AtomicBool,
     resolver: &ProcfsResolver,
     learning: &SyncSender<LearningObservation>,
+) -> Vec<Result<PacketAuthorization>> {
+    decide_packet_batch_until(
+        batch,
+        engine,
+        shutdown,
+        resolver,
+        learning,
+        Instant::now() + Duration::from_secs(2),
+    )
+}
+
+fn decide_packet_batch_until(
+    batch: &[QueuedPacketWork],
+    engine: &SharedEngine,
+    shutdown: &AtomicBool,
+    resolver: &ProcfsResolver,
+    learning: &SyncSender<LearningObservation>,
+    deadline: Instant,
 ) -> Vec<Result<PacketAuthorization>> {
     let mut decisions = (0..batch.len()).map(|_| None).collect::<Vec<_>>();
     let snapshot = (|| {
@@ -1051,7 +1029,7 @@ fn decide_packet_batch(
         }
     }
 
-    let identities = resolver.resolve_batch_for_enforcement(&requests);
+    let identities = resolver.resolve_batch_for_enforcement_until(&requests, deadline);
     for (index, identity) in request_indexes.into_iter().zip(identities) {
         let packet = batch[index]
             .packet
@@ -3743,7 +3721,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_decisions_require_an_exact_mode_and_generation_recheck() {
+    fn queued_decisions_require_an_exact_mode_generation_and_shutdown_recheck() {
         let learning = PacketAuthorization {
             mode: Mode::Learning,
             flow_generation: 7,
@@ -3752,10 +3730,36 @@ mod tests {
             observation_error: None,
             defer_learning_attribution: false,
         };
-        assert!(authorization_remains_valid(&learning, Mode::Learning, 7));
-        assert!(!authorization_remains_valid(&learning, Mode::Learning, 8));
-        assert!(!authorization_remains_valid(&learning, Mode::Enforcing, 8));
-        assert!(!authorization_remains_valid(&learning, Mode::BlockAll, 8));
+        assert!(authorization_remains_valid(
+            &learning,
+            Mode::Learning,
+            7,
+            false
+        ));
+        assert!(!authorization_remains_valid(
+            &learning,
+            Mode::Learning,
+            8,
+            false
+        ));
+        assert!(!authorization_remains_valid(
+            &learning,
+            Mode::Enforcing,
+            8,
+            false
+        ));
+        assert!(!authorization_remains_valid(
+            &learning,
+            Mode::BlockAll,
+            8,
+            false
+        ));
+        assert!(!authorization_remains_valid(
+            &learning,
+            Mode::Learning,
+            7,
+            true
+        ));
 
         let enforcing = PacketAuthorization {
             mode: Mode::Enforcing,
@@ -3765,8 +3769,24 @@ mod tests {
             observation_error: None,
             defer_learning_attribution: false,
         };
-        assert!(authorization_remains_valid(&enforcing, Mode::Enforcing, 8));
-        assert!(!authorization_remains_valid(&enforcing, Mode::Enforcing, 9));
+        assert!(authorization_remains_valid(
+            &enforcing,
+            Mode::Enforcing,
+            8,
+            false
+        ));
+        assert!(!authorization_remains_valid(
+            &enforcing,
+            Mode::Enforcing,
+            9,
+            false
+        ));
+        assert!(!authorization_remains_valid(
+            &enforcing,
+            Mode::Enforcing,
+            8,
+            true
+        ));
     }
 
     #[test]

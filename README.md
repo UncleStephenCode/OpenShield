@@ -213,7 +213,8 @@ be attributed in bounded batches of at most 32 already-ready items; neither path
 waits to fill a batch. Each item still gets an independent `SOCK_DIAG` socket
 lookup. Only the complete procfs owner
 enumerations are shared: one snapshot before identity capture and one after it.
-The entire batch has one absolute deadline: 2 seconds for queue 1337 and
+The entire batch has one absolute deadline: 2 seconds for queue 1337 (including
+userspace queue wait, not time already spent in the kernel queue) and
 5 seconds for asynchronous Learning attribution. Each `SOCK_DIAG` lookup is
 additionally capped at 250 ms, without extending the batch deadline. These are
 work limits, not intentional delays. Even a single-item batch performs both
@@ -231,6 +232,19 @@ scan-local fd-number hints reduce filesystem lookup and allocation overhead;
 they do not replace either complete owner snapshot. There is no cross-batch
 identity or authorization cache, so otherwise-unmatched Enforcing UDP/ICMP
 traffic is attributed again in every later batch.
+
+Queue 1337 now has a separate bounded reader and exactly one attribution worker.
+At most 128 packets are waiting or in flight in userspace, with one batch of at
+most 32 being resolved. Round-robin scheduling between socket UIDs and flows uses
+a four-packet quantum; these keys affect scheduling, never authorization. Safe
+decisions that need no process identity are returned at dispatch without waiting
+for that batch's procfs scan. Reply progress advances only over received packet
+IDs whose actual verdicts are all complete; reordering never skips unresolved
+packets. Policy mode, generation and shutdown are checked again before sending.
+The journal's `application attribution stage timings` aggregates report bounded
+stage wall times about every ten seconds during activity, without process names,
+arguments or network addresses. This is diagnostic evidence, not a claim that
+the remaining CPU and latency problem is resolved; no eBPF path is enabled.
 
 With at least 64 external tasks across two or more processes and at least two
 available CPUs, each owner snapshot uses at most two scan workers (the resolver

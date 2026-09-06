@@ -184,6 +184,31 @@ impl Registry {
     }
 }
 
+/// Packet progress admission is independent of flow tickets and policy mode.
+/// The OUTPUT reader must register every received ID in order before deciding,
+/// dropping, or dispatching any of these packets to an attribution worker.
+pub(super) fn register_outgoing_packet_ids(
+    registry: &SharedRegistry,
+    packet_ids: &[u32],
+) -> Result<()> {
+    registry
+        .lock()
+        .map_err(|_| anyhow!("reply readiness registry is poisoned"))?
+        .progress
+        .admit(packet_ids)
+}
+
+/// The reader can stop receiving while an older admitted packet is unresolved.
+/// Completed out-of-order slots also consume this budget until their prefix is
+/// complete; evicting them would lose the proof needed by reply barriers.
+pub(super) fn outgoing_packet_capacity(registry: &SharedRegistry) -> Result<usize> {
+    Ok(registry
+        .lock()
+        .map_err(|_| anyhow!("reply readiness registry is poisoned"))?
+        .progress
+        .remaining_capacity())
+}
+
 pub(super) fn register_outgoing_batch(
     registry: &SharedRegistry,
     batch: &[QueuedPacketWork],
@@ -674,6 +699,7 @@ mod tests {
         let engine = Arc::new(Mutex::new(engine));
         let generation = set_mode(&engine, Mode::Enforcing)?;
         let registry = shared_registry(77)?;
+        register_outgoing_packet_ids(&registry, &[1])?;
         let now = Instant::now();
         let mut pending = PendingReplies::default();
         let ticket = registry
@@ -785,6 +811,7 @@ mod tests {
     fn captured_boundary_waits_for_every_prior_actual_verdict() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1, 2])?;
         let first = registry.begin(key(5000), 1, now)?;
         let second = registry.begin(key(5000), 1, now)?;
         let mut reply = pending(key(5000), now, &registry);
@@ -812,6 +839,7 @@ mod tests {
     fn another_flow_completion_never_wakes_pending_reply() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1, 2])?;
         let other = registry.begin(key(5001), 1, now)?;
         let matching = registry.begin(key(5000), 1, now)?;
         let mut reply = pending(key(5000), now, &registry);
@@ -827,6 +855,80 @@ mod tests {
         assert_eq!(
             reply.disposition(&mut registry, Mode::Enforcing, 1, false, now),
             Disposition::Repeat
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_verdicts_without_flow_tickets_cannot_skip_a_prior_packet() -> Result<()> {
+        let now = Instant::now();
+        let registry = shared_registry(77)?;
+        let capacity = outgoing_packet_capacity(&registry)?;
+        register_outgoing_packet_ids(&registry, &[1, 2, 3])?;
+        let (ticket, mut reply) = {
+            let mut guard = registry
+                .lock()
+                .map_err(|_| anyhow!("test registry poisoned"))?;
+            // Packet progress itself creates no flow, generation, or authority.
+            assert!(guard.generation.is_none());
+            assert!(guard.flows.is_empty());
+            let ticket = guard.begin(key(5000), 1, now)?;
+            let mut reply = pending(key(5000), now, &guard);
+            reply.read_through = guard.progress.barrier_for_test(3);
+            (ticket, reply)
+        };
+        // Packet 1 may be TCP or a malformed packet without a readiness ticket.
+        // Even a completed UDP flow and another immediate DROP cannot hide it.
+        complete_outgoing(&registry, Some(ticket), true)?;
+        record_outgoing_verdict(&registry, 2)?;
+        complete_outgoing(&registry, None, false)?;
+        record_outgoing_verdict(&registry, 3)?;
+        assert_eq!(outgoing_packet_capacity(&registry)?, capacity - 3);
+        assert!(record_outgoing_verdict(&registry, 4).is_err());
+        assert!(record_outgoing_verdict(&registry, 2).is_err());
+        {
+            let mut guard = registry
+                .lock()
+                .map_err(|_| anyhow!("test registry poisoned"))?;
+            assert_eq!(
+                reply.disposition(&mut guard, Mode::Enforcing, 1, false, now),
+                Disposition::Wait
+            );
+        }
+        record_outgoing_verdict(&registry, 1)?;
+        assert_eq!(outgoing_packet_capacity(&registry)?, capacity);
+        let mut guard = registry
+            .lock()
+            .map_err(|_| anyhow!("test registry poisoned"))?;
+        assert_eq!(
+            reply.disposition(&mut guard, Mode::Enforcing, 1, false, now),
+            Disposition::Repeat
+        );
+        assert_eq!(
+            reply.disposition(&mut guard, Mode::Enforcing, 2, false, now),
+            Disposition::Drop
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_flow_stays_denied_when_later_verdict_completed_before_its_prefix() -> Result<()> {
+        let now = Instant::now();
+        let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1, 2])?;
+        let ticket = registry.begin(key(5000), 1, now)?;
+        let mut reply = pending(key(5000), now, &registry);
+        reply.read_through = registry.progress.barrier_for_test(2);
+        registry.complete(&ticket, false, now);
+        registry.progress.complete(2)?;
+        assert_eq!(
+            reply.disposition(&mut registry, Mode::Enforcing, 1, false, now),
+            Disposition::Wait
+        );
+        registry.progress.complete(1)?;
+        assert_eq!(
+            reply.disposition(&mut registry, Mode::Enforcing, 1, false, now),
+            Disposition::Drop
         );
         Ok(())
     }
@@ -899,6 +1001,7 @@ mod tests {
     fn satisfied_boundary_without_matching_flow_still_has_a_fixed_drop_deadline() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1])?;
         registry.progress.complete(1)?;
         registry.begin(key(5001), 1, now)?;
         let mut reply = pending(key(5000), now, &registry);
@@ -960,6 +1063,7 @@ mod tests {
     fn later_same_tuple_wave_uses_kernel_repeat_instead_of_discarding_reply() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1])?;
         let old = registry.begin(key(5000), 1, now)?;
         let mut reply = pending(key(5000), now, &registry);
         reply.read_through = registry.progress.barrier_for_test(1);
@@ -1254,6 +1358,7 @@ mod tests {
         let now = Instant::now();
         let admitted = now + Duration::from_millis(1);
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1, 2, 3])?;
         let old = registry.begin(key(5000), 1, now)?;
         registry.complete(&old, true, now);
         registry.progress.complete(1)?;
@@ -1289,6 +1394,7 @@ mod tests {
     fn completed_barrier_never_overrides_failed_wave_or_changed_generation() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1])?;
         let ticket = registry.begin(key(5000), 1, now)?;
         let mut reply = pending(key(5000), now, &registry);
         reply.read_through = registry.progress.barrier_for_test(1);
@@ -1333,6 +1439,7 @@ mod tests {
     fn continual_same_tuple_work_does_not_extend_boundary_or_original_deadline() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1])?;
         let first = registry.begin(key(5000), 1, now)?;
         registry.complete(&first, true, now);
         registry.progress.complete(1)?;
@@ -1363,6 +1470,7 @@ mod tests {
     fn next_retry_captures_new_boundary_and_failed_future_verdict_denies() -> Result<()> {
         let now = Instant::now();
         let mut registry = Registry::new(77)?;
+        registry.progress.admit(&[1, 2])?;
         registry.progress.complete(1)?;
         let future = registry.begin(key(5000), 1, now)?;
         let mut reply = pending(key(5000), now, &registry);

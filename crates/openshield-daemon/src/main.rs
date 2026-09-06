@@ -2,6 +2,7 @@
 
 mod application;
 mod application_diagnostics;
+mod application_timing;
 mod backend;
 mod compatibility;
 mod engine;

@@ -1,12 +1,15 @@
 //! Bounded, captured read-through barriers for the one ordered OUTPUT queue.
 //!
 //! A barrier is scheduling evidence, never an authorization. The kernel assigns
-//! packet IDs under the queue lock before ordered netlink delivery. Completing
-//! an ID after its actual verdict therefore covers earlier delivered IDs. Later
-//! traffic cannot extend an already captured barrier. Missing metadata, a queue
+//! packet IDs under the queue lock before ordered netlink delivery. Admission
+//! records that order before dispatch, while verdicts may complete out of order.
+//! Only a fully completed admission prefix advances the read-through watermark;
+//! a later verdict never hides an earlier undecided packet. Later traffic cannot
+//! extend an already captured barrier. Missing metadata, a queue
 //! replacement, ambiguous serial arithmetic, or a failed verdict cannot advance
 //! progress. Every released reply still requires current-policy `NF_REPEAT`.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -21,6 +24,7 @@ const MAX_PROC_BYTES: usize = 16 * 1024;
 const SERIAL_HALF_RANGE: u32 = 1 << 31;
 const READ_BUDGET: Duration = Duration::from_millis(100);
 const MAX_READ_CALLS: usize = 128;
+const MAX_TRACKED_OUTGOING: usize = 1024;
 
 /// The private epoch token also distinguishes successive runtime instances if
 /// Linux eventually reuses the same netlink port ID. A runtime never rebinds its
@@ -41,6 +45,9 @@ pub(super) struct ReadThroughBarrier {
 pub(super) struct QueueProgress {
     identity: QueueIdentity,
     completed: u32,
+    last_admitted: u32,
+    order: VecDeque<u32>,
+    verdicts: BTreeMap<u32, bool>,
 }
 
 impl QueueProgress {
@@ -55,6 +62,9 @@ impl QueueProgress {
                 epoch: Arc::new(()),
             },
             completed: 0,
+            last_admitted: 0,
+            order: VecDeque::new(),
+            verdicts: BTreeMap::new(),
         })
     }
 
@@ -62,13 +72,60 @@ impl QueueProgress {
         self.identity.clone()
     }
 
-    pub(super) fn complete(&mut self, packet_id: u32) -> Result<()> {
-        let advance = packet_id.wrapping_sub(self.completed);
+    pub(super) fn remaining_capacity(&self) -> usize {
+        MAX_TRACKED_OUTGOING - self.order.len()
+    }
+
+    /// Register every packet in kernel receive order before any verdict or
+    /// worker dispatch, including packets which need no application attribution.
+    /// Validate the whole batch first so an error cannot partially admit it.
+    pub(super) fn admit(&mut self, packet_ids: &[u32]) -> Result<()> {
         ensure!(
-            advance != 0 && advance < SERIAL_HALF_RANGE,
-            "OUTPUT verdict packet IDs are duplicated, reordered, or ambiguous"
+            packet_ids.len() <= self.remaining_capacity(),
+            "OUTPUT verdict progress admission bound exceeded"
         );
-        self.completed = packet_id;
+        let mut previous = self.last_admitted;
+        for &packet_id in packet_ids {
+            let advance = packet_id.wrapping_sub(previous);
+            let outstanding_span = packet_id.wrapping_sub(self.completed);
+            ensure!(
+                advance != 0
+                    && advance < SERIAL_HALF_RANGE
+                    && outstanding_span != 0
+                    && outstanding_span < SERIAL_HALF_RANGE
+                    && !self.verdicts.contains_key(&packet_id),
+                "OUTPUT received packet IDs are duplicated, reordered, or ambiguous"
+            );
+            previous = packet_id;
+        }
+        for &packet_id in packet_ids {
+            self.order.push_back(packet_id);
+            self.verdicts.insert(packet_id, false);
+        }
+        self.last_admitted = previous;
+        Ok(())
+    }
+
+    /// Called only after the actual verdict was successfully sent. Completed
+    /// later slots remain bounded and cannot release a barrier across a hole.
+    pub(super) fn complete(&mut self, packet_id: u32) -> Result<()> {
+        let completed = self
+            .verdicts
+            .get_mut(&packet_id)
+            .context("OUTPUT verdict refers to an unadmitted or retired packet ID")?;
+        ensure!(
+            !*completed,
+            "OUTPUT packet verdict completion is duplicated"
+        );
+        *completed = true;
+        while let Some(&first) = self.order.front() {
+            if self.verdicts.get(&first) != Some(&true) {
+                break;
+            }
+            self.order.pop_front();
+            self.verdicts.remove(&first);
+            self.completed = first;
+        }
         Ok(())
     }
 
@@ -220,6 +277,7 @@ mod tests {
     fn captured_target_does_not_wait_for_later_unrelated_traffic() -> Result<()> {
         let mut progress = QueueProgress::new(77)?;
         let target = barrier(&progress, 5);
+        progress.admit(&[1, 2, 3, 4, 5])?;
         for id in 1..5 {
             progress.complete(id)?;
             assert!(!progress.reached(&target));
@@ -228,6 +286,7 @@ mod tests {
         assert!(progress.reached(&target));
         for id in 6..100 {
             let _later_target = barrier(&progress, id + 7);
+            progress.admit(&[id])?;
             progress.complete(id)?;
             assert!(progress.reached(&target));
         }
@@ -240,6 +299,8 @@ mod tests {
         assert!(progress.reached(&barrier(&progress, 0)));
         assert!(!progress.reached(&barrier(&progress, 1)));
         progress.completed = u32::MAX - 1;
+        progress.last_admitted = progress.completed;
+        progress.admit(&[u32::MAX, 0, 1])?;
         let target = barrier(&progress, 0);
         assert!(!progress.reached(&target));
         progress.complete(u32::MAX)?;
@@ -254,12 +315,160 @@ mod tests {
     #[test]
     fn duplicate_backward_and_half_range_completions_never_advance() -> Result<()> {
         let mut progress = QueueProgress::new(77)?;
+        progress.admit(&[7])?;
         progress.complete(7)?;
         for id in [7, 6, 7 + SERIAL_HALF_RANGE] {
             assert!(progress.complete(id).is_err());
+            assert!(progress.admit(&[id]).is_err());
             assert_eq!(progress.completed, 7);
         }
         assert!(!progress.reached(&barrier(&progress, 7 + SERIAL_HALF_RANGE)));
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_verdicts_advance_only_the_completed_admission_prefix() -> Result<()> {
+        for order in [
+            [1, 2, 3],
+            [1, 3, 2],
+            [2, 1, 3],
+            [2, 3, 1],
+            [3, 1, 2],
+            [3, 2, 1],
+        ] {
+            let mut progress = QueueProgress::new(77)?;
+            progress.admit(&[1, 2, 3])?;
+            let first_two = barrier(&progress, 2);
+            let all = barrier(&progress, 3);
+            let mut done = [false; 3];
+            for id in order {
+                progress.complete(id)?;
+                done[usize::try_from(id - 1)?] = true;
+                assert_eq!(progress.reached(&first_two), done[0] && done[1]);
+                assert_eq!(progress.reached(&all), done.iter().all(|done| *done));
+            }
+            assert_eq!(progress.remaining_capacity(), MAX_TRACKED_OUTGOING);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_id_gaps_do_not_skip_admitted_packets_or_invent_verdicts() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        let target = barrier(&progress, 9);
+        progress.admit(&[5, 8, 11])?;
+        progress.complete(11)?;
+        assert_eq!(progress.completed, 0);
+        assert!(!progress.reached(&target));
+        assert!(progress.complete(9).is_err());
+        progress.complete(5)?;
+        assert_eq!(progress.completed, 5);
+        assert!(!progress.reached(&target));
+        progress.complete(8)?;
+        assert_eq!(progress.completed, 11);
+        assert!(progress.reached(&target));
+        Ok(())
+    }
+
+    #[test]
+    fn wrapped_out_of_order_verdicts_preserve_the_prefix() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        progress.completed = u32::MAX - 2;
+        progress.last_admitted = progress.completed;
+        progress.admit(&[u32::MAX - 1, 0, 2])?;
+        let target = barrier(&progress, 0);
+        progress.complete(0)?;
+        progress.complete(2)?;
+        assert!(!progress.reached(&target));
+        assert_eq!(progress.completed, u32::MAX - 2);
+        progress.complete(u32::MAX - 1)?;
+        assert_eq!(progress.completed, 2);
+        assert!(progress.reached(&target));
+        assert!(progress.admit(&[u32::MAX]).is_err());
+        assert!(progress.complete(0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unadmitted_or_duplicate_completions_cannot_cover_an_earlier_hole() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        assert!(progress.complete(1).is_err());
+        progress.admit(&[1, 2])?;
+        progress.complete(2)?;
+        for id in [2, 3, u32::MAX] {
+            assert!(progress.complete(id).is_err());
+            assert_eq!(progress.completed, 0);
+        }
+        assert_eq!(progress.remaining_capacity(), MAX_TRACKED_OUTGOING - 2);
+        progress.complete(1)?;
+        assert_eq!(progress.completed, 2);
+        assert!(progress.complete(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_admission_is_atomic_and_cannot_reorder_or_replay_ids() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        progress.admit(&[2])?;
+        for ids in [&[3, 3][..], &[4, 3], &[3, 2], &[3, SERIAL_HALF_RANGE]] {
+            assert!(progress.admit(ids).is_err());
+            assert_eq!(progress.last_admitted, 2);
+            assert_eq!(progress.order.iter().copied().collect::<Vec<_>>(), [2]);
+            assert_eq!(progress.verdicts.len(), 1);
+        }
+        progress.admit(&[])?;
+        progress.complete(2)?;
+        assert!(progress.admit(&[2]).is_err());
+        progress.admit(&[3, 4])?;
+        assert_eq!(progress.last_admitted, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn total_outstanding_serial_window_cannot_reach_half_range() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        progress.admit(&[1, SERIAL_HALF_RANGE - 1])?;
+        assert!(progress.admit(&[SERIAL_HALF_RANGE]).is_err());
+        assert_eq!(progress.last_admitted, SERIAL_HALF_RANGE - 1);
+        progress.complete(1)?;
+        progress.admit(&[SERIAL_HALF_RANGE])?;
+        progress.complete(SERIAL_HALF_RANGE)?;
+        assert_eq!(progress.completed, 1);
+        progress.complete(SERIAL_HALF_RANGE - 1)?;
+        assert_eq!(progress.completed, SERIAL_HALF_RANGE);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_later_slots_remain_bounded_until_the_oldest_verdict_arrives() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        let last = u32::try_from(MAX_TRACKED_OUTGOING)?;
+        progress.admit(&(1..=last).collect::<Vec<_>>())?;
+        for id in 2..=last {
+            progress.complete(id)?;
+        }
+        assert_eq!(progress.remaining_capacity(), 0);
+        assert_eq!(progress.completed, 0);
+        assert!(progress.admit(&[last + 1]).is_err());
+        assert_eq!(progress.order.len(), MAX_TRACKED_OUTGOING);
+        assert_eq!(progress.verdicts.len(), MAX_TRACKED_OUTGOING);
+        progress.complete(1)?;
+        assert_eq!(progress.remaining_capacity(), MAX_TRACKED_OUTGOING);
+        assert_eq!(progress.completed, last);
+        progress.admit(&[last + 1])?;
+        progress.complete(last + 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_barrier_captured_before_receipt_still_waits_for_every_admitted_id() -> Result<()> {
+        let mut progress = QueueProgress::new(77)?;
+        let target = capture(&progress, "1337 77 3 2 512 0 0 3 1\n")?;
+        progress.admit(&[2, 4])?;
+        progress.complete(4)?;
+        assert!(!progress.reached(&target));
+        progress.complete(2)?;
+        assert!(progress.reached(&target));
         Ok(())
     }
 
@@ -281,6 +490,7 @@ mod tests {
             &progress,
             "1338 88 0 2 512 0 0 999 1\n1337 77 7 2 512 123 456 9 1\n",
         )?;
+        progress.admit(&[8, 9])?;
         progress.complete(8)?;
         assert!(!progress.reached(&target));
         progress.complete(9)?;

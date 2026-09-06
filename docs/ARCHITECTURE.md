@@ -192,10 +192,25 @@ lengths, and complete transport headers within the 512-byte prefix; it neither
 copies the full payload nor replaces the kernel packet. A deferred checksum is
 not an attribution failure or an allow signal. GSO metadata never substitutes
 for socket UID. Unsupported queue configuration fails before activation.
-Three independent packet-consumer
-threads own the fixed queues. Queue 1337 performs bounded synchronous fail-closed
-decisions. Queue 1338 submits a bounded copy to a separate asynchronous
-attribution worker; another bounded worker persists successful observations.
+Three independent packet-consumer threads own the fixed queues. Queue 1337 has
+a separate reader and exactly one attribution worker. The reader keeps at most
+128 pending packets in total, including the single in-flight batch of at most
+32 packets. It checks completed work before receiving another bounded datagram
+and polls at 5 ms while attribution is in flight. Pending packets are selected
+round-robin by kernel socket UID and then by flow, with a quantum of four packets
+per flow; packets within a flow retain their receive order. These are scheduling
+hints, never process identities or authorization. A busy flow can fill a whole
+batch when there are no competitors, and the reader never waits for a batch to
+fill. Per-flow reply tickets are registered only when the selected batch is
+dispatched, not for the entire waiting backlog. At dispatch, malformed packets,
+expired work, and decisions requiring no process attribution receive their
+verdicts without waiting for that batch's attribution. Only the reader sends
+verdicts, subject to the final mode, policy-generation, and shutdown recheck.
+Capacity exhaustion stops further intake until completed work releases space;
+the kernel queue retains its fail-closed overflow policy. No pending identity or
+authorization is reused in a later batch. Queue 1338 submits a bounded copy to
+its separate asynchronous attribution worker; another bounded worker persists
+successful observations.
 Queue 1339 defers only established UDP/ICMP echo replies inside enabled outbound
 application-Accept envelopes in Enforcing, after the usual kernel allow paths.
 An outgoing non-TCP packet still clears the shared authorization mark before
@@ -204,13 +219,21 @@ per-flow readiness registry can wait for already queued verdicts, then return
 `NF_REPEAT` to re-evaluate the current INPUT policy. It never returns `NF_ACCEPT`.
 On admission, the reply reader captures queue 1337's kernel packet sequence
 from bounded `/proc/self/net/netfilter/nfnetlink_queue` metadata. It waits for
-the ordered outgoing reader to send verdicts through that fixed sequence,
+the outgoing reader to send verdicts through that fixed sequence,
 not for the entire outgoing queue to become empty. Later traffic, including
 new packets of the same flow, cannot extend this boundary or invalidate a
 reply merely by starting a new attribution batch. A recorded failure in the
 current flow still denies the retry. The netlink port and a private runtime epoch
 bind the boundary to this queue instance; malformed or unavailable metadata
-causes a reply to be dropped, not admitted. Sequence rollover is checked.
+causes a reply to be dropped, not admitted. Before scheduling or issuing any
+verdict, the OUTPUT reader registers every received packet ID in kernel receive
+order, including malformed packets and TCP packets with no per-flow reply ticket.
+Verdicts may complete out of order, but only a completely finished admission
+prefix advances the watermark. The tracker has 1024 fixed-capacity slots;
+completed later slots still consume capacity until earlier packets finish.
+Duplicate or unadmitted completions, replayed IDs, and ambiguous half-range serial
+arithmetic are rejected. Kernel ID gaps and rollover do not allow an admitted
+packet to be skipped. No received ID or completed slot is evicted to make room.
 This prevents a completed old flow entry from releasing a reply while an
 already queued outgoing packet is still unread behind another attribution batch.
 The two reserved packet-mark bits count at most three retries while preserving
@@ -231,7 +254,7 @@ arguments. NUL inside an argument, non-UTF-8 procfs data, and larger command lin
 remain unsupported. Display and the TUI JSON editor escape controls and bidi
 characters reversibly rather than changing the identity used for matching.
 
-The first eligible TCP SYN or datagram for a recently unseen flow can remain
+In Learning, the first eligible TCP SYN or datagram for a recently unseen flow can remain
 pending for at most 250 ms, or until that attribution attempt completes. At most
 128 packets can be pending. The reader keeps receiving packets and checks pending
 completion/deadlines with a 5 ms poll interval; it never waits synchronously for
@@ -252,8 +275,13 @@ request retains its own `SOCK_DIAG`
 tuple-to-inode lookup. The resolver then performs one complete bounded procfs
 owner snapshot before identity capture and another after capture for all targets
 in the batch, including single-item batches. The entire operation shares one
-absolute deadline: 2 seconds for queue 1337, 5 seconds for asynchronous queue
-1338 attribution. Each `SOCK_DIAG` query is additionally capped at 250 ms and
+absolute deadline. For queue 1337, the two-second budget starts when the reader
+receives the packet and includes userspace scheduling, attribution, and the
+completion check before its verdict; it does not include earlier residence in
+the kernel queue. A batch uses the earliest deadline of its non-expired members.
+Asynchronous queue 1338 attribution has a separate five-second budget. These are
+work limits, not hard real-time guarantees under CPU starvation or lock contention.
+Each `SOCK_DIAG` query is additionally capped at 250 ms and
 cannot extend that deadline. Each snapshot has one global limit of 131,072 owner
 records across all targets. These work bounds are not intentional waits and
 are not multiplied by packet count.
@@ -282,6 +310,18 @@ recorded by the NFQUEUE runtime counters. A later batch starts again with
 per-packet `SOCK_DIAG`; there is no cross-batch process-identity or authorization
 cache, so otherwise-unmatched UDP and ICMP packets continue to require fresh
 attribution.
+
+`application_timing.rs` records fixed-size, best-effort wall-time aggregates for
+`batch`, `socket_lookup`, `owner_before`, `metadata`, `owner_after`, `queue_wait`,
+`queue_decision`, and `queue_verdict`. The accumulator uses `try_lock`: contention
+skips the sample rather than waiting, and skipped samples are counted. While
+activity continues, reports are emitted no more often than once every ten seconds,
+outside the accumulator lock. Each stage contains sample, work-unit, and failure
+counts plus total and maximum wall time in microseconds. Enumeration counters
+measure completed process/task enumeration work, not unique system processes.
+The log contains no addresses, PID/TID values, or rule selectors. Stage times may
+overlap and are not CPU usage or additive latency components. Diagnostics never
+participate in authorization, and the collector adds no eBPF attribution path.
 
 For each owner snapshot, external PID/TID entries are enumerated once, every
 task's filesystem UID is read, and `/proc/TGID/task/TID/fd` is scanned only when
@@ -369,8 +409,9 @@ disappearance is confirmed.
 state, or unconfirmed state fails attribution.
 For runtime capture, `/proc/TID/exe` is opened and its complete file version is
 compared with a second path/open snapshot together with the remaining process
-metadata. Before issuing a successful backend-specific verdict, the engine
-rechecks only the current mode and generation under its lock. Its immutable
+metadata. Before issuing a successful backend-specific verdict, the reader
+rechecks the current mode, generation, and shutdown flag under the engine lock;
+the lock remains held through the actual verdict send. Its immutable
 `Arc<ApplicationDecisionPolicy>` packet-policy cache contains all enabled
 application rules in `Enforcing`, only enabled `Drop`/`Reject` application rules
 in `Learning`, and is empty in `BlockAll`; it is rebuilt after a successful policy or learning
