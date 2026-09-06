@@ -422,6 +422,43 @@ exposed 372 missing replies out of 600 steady-state UDP requests despite zero
 NFQUEUE kernel/user drops. Thus the earlier finite delayed-reply pass did not
 establish correctness under continuous attribution contention.
 
+## Packaged systemd sandbox
+
+[`../e2e/systemd-sandbox.sh`](../e2e/systemd-sandbox.sh) installs the specified
+RPM in pinned Tumbleweed x86_64 and boots real systemd as container PID 1, with
+private cgroup v2 and an independent peer. Run once per backend:
+
+```console
+sh tests/e2e/systemd-sandbox.sh nftables /absolute/openshield-package.rpm
+sh tests/e2e/systemd-sandbox.sh iptables /absolute/openshield-package.rpm
+```
+
+The test verifies the installed unit, capabilities, seccomp, mount namespace,
+read-only `/proc`, and readable queue progress. A temporary container-only
+`ProcSubset=pid` override must prevent readiness with an explicit startup error
+and keep real TCP/UDP traffic blocked. After removing the override, the original
+unit must start, allow TCP/UDP/ICMP in Learning and Enforcing using manually
+created application-bound rules, and deny an unknown executable. Automatic rule
+creation is covered by the separate short-lived/server/proxy fixtures, not this
+sandbox check. Briefly pausing only the container daemon forces
+a delayed UDP reply to overlap queued outgoing traffic, exercising the reply
+barrier. Independent peer records check that blocked traffic was not delivered.
+
+Evidence remains under the printed `/tmp/openshield-systemd-evidence.*` path.
+`report.json` describes in-container checks; only `run.txt` with `stage=complete`
+and `status=0` confirms the peer audit and wrapper cleanup also passed.
+Unsupported private cgroup/systemd startup exits with status 77, not a pass.
+The release workflow runs this after functional E2E only for Tumbleweed
+`linux/amd64`, with both backends, and preserves diagnostics on success or failure.
+The container needs `CAP_SYS_ADMIN` for systemd, but the daemon retains only its
+packaged capability set. Host PID/network namespaces and host cgroup binds are
+not used; no host service or firewall is changed. This test does not certify
+host AppArmor/SELinux policy: SELinux container labels are disabled and only the
+systemd client uses `apparmor=unconfined` so the container can mount its private
+sandbox. The peer keeps its default AppArmor profile. These are per-container
+settings, not host policy changes; see [Docker's AppArmor documentation](https://docs.docker.com/engine/security/apparmor/).
+The daemon's systemd restrictions are checked separately.
+
 ## Large TCP writes and GSO
 
 [`../e2e/gso-attribution.sh`](../e2e/gso-attribution.sh) extracts the daemon from

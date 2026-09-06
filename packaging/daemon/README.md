@@ -106,6 +106,19 @@ metadata, and locks the same persistent inode before state or firewall changes.
 
 ## Privileges and hardening
 
+The unit uses `ProcSubset=all` with `ReadOnlyPaths=/proc`, not `ProcSubset=pid`.
+The latter hides the nested `/proc/self/net/netfilter/nfnetlink_queue` entry
+needed by the bounded reply scheduler, even when direct `/proc/self/net/icmp`
+lookups work. `ProtectProc=invisible`, kernel-tunable protection, the capability
+set and syscall restrictions remain enabled. General procfs metadata becomes
+readable; this is an explicit filesystem-visibility tradeoff, not a relaxation
+of packet authorization. Do not restore `ProcSubset=pid` in a local override.
+After binding its queues and before starting workers or activating the saved
+policy, the daemon validates the real queue-progress entry and netlink owner.
+Failure leaves the bootstrap `BlockAll` policy in place, without reporting
+readiness. A stale service override or an LSM denial must be corrected before
+startup; the daemon does not guess queue progress or permit unverified replies.
+
 The service runs with UID 0 and primary group `root`, and explicitly adds the
 supplementary group `openshield`. As the socket owner it may assign that group
 to the observation socket without retaining `CAP_CHOWN`. Keeping `Group=root`

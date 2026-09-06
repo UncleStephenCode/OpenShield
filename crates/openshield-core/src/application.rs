@@ -805,6 +805,131 @@ mod tests {
     }
 
     #[test]
+    fn persisted_learned_selector_accepts_restart_with_unchanged_constraints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        let learned = original.learned_selector()?;
+        let persisted: ApplicationSelector =
+            serde_json::from_str(&serde_json::to_string(&learned)?)?;
+        for pid in [original.pid, original.pid + 1] {
+            let restarted = ApplicationIdentity {
+                pid,
+                process_start_time_ticks: original.process_start_time_ticks + 100,
+                ..original.clone()
+            };
+            restarted.validate()?;
+            assert!(persisted.matches(&restarted));
+            assert_eq!(restarted.learned_selector()?, learned);
+        }
+        // A persisted rule identifies the allowed application, not one PID
+        // lifetime. Live attribution must independently race-check each new
+        // process and its socket before evaluating this selector.
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selector_rejects_each_changed_restart_constraint_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        let learned = original.learned_selector()?;
+        let mut changed_arguments = original.command_line.clone();
+        changed_arguments.push(CommandArgument::new("--new-session-token=2")?);
+        let changed_identities = [
+            (
+                "command_line",
+                ApplicationIdentity {
+                    command_line: changed_arguments,
+                    ..original.clone()
+                },
+            ),
+            (
+                "cgroup",
+                ApplicationIdentity {
+                    cgroups: vec![CgroupPath::new("/user.slice/new-session.scope")?],
+                    ..original.clone()
+                },
+            ),
+            (
+                "uid",
+                ApplicationIdentity {
+                    uid: original.uid + 1,
+                    ..original.clone()
+                },
+            ),
+            (
+                "executable_path",
+                ApplicationIdentity {
+                    executable: ApplicationPath::new("/usr/bin/another-curl")?,
+                    ..original.clone()
+                },
+            ),
+            (
+                "executable_version_inode",
+                ApplicationIdentity {
+                    executable_file: ExecutableFileId {
+                        inode: original.executable_file.inode + 1,
+                        ..original.executable_file
+                    },
+                    ..original.clone()
+                },
+            ),
+            (
+                "executable_version_ctime",
+                ApplicationIdentity {
+                    executable_file: ExecutableFileId {
+                        ctime_seconds: original.executable_file.ctime_seconds + 1,
+                        ..original.executable_file
+                    },
+                    ..original.clone()
+                },
+            ),
+        ];
+        for (field, mut changed) in changed_identities {
+            changed.pid += 1;
+            changed.process_start_time_ticks += 100;
+            changed.validate()?;
+            assert!(!learned.matches(&changed), "changed {field} was accepted");
+            assert_ne!(changed.learned_selector()?, learned);
+        }
+        assert!(learned.matches(&original));
+        Ok(())
+    }
+
+    #[test]
+    fn manually_pinned_executable_selector_does_not_inherit_learned_constraints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        // This independent manual selector intentionally omits argv, UID and
+        // cgroup. Keep the executable pin required by enabled persisted rules;
+        // creating a learned selector must never remove its own constraints.
+        let manual = ApplicationSelector::new(
+            Some(original.executable.clone()),
+            Some(original.executable_file),
+            None,
+            None,
+            None,
+        )?;
+        let learned = original.learned_selector()?;
+        let mut restarted = ApplicationIdentity {
+            pid: original.pid + 1,
+            process_start_time_ticks: original.process_start_time_ticks + 100,
+            command_line: vec![CommandArgument::new("curl")?],
+            uid: original.uid + 1,
+            cgroups: vec![CgroupPath::new("/user.slice/new-session.scope")?],
+            ..original.clone()
+        };
+        restarted.validate()?;
+        assert!(manual.matches(&restarted));
+        assert!(!learned.matches(&restarted));
+        restarted.executable_file.inode += 1;
+        assert!(!manual.matches(&restarted));
+        restarted.executable_file = original.executable_file;
+        restarted.executable = ApplicationPath::new("/usr/bin/another-curl")?;
+        assert!(!manual.matches(&restarted));
+        Ok(())
+    }
+
+    #[test]
     fn learned_selector_omits_unavailable_v1_cgroup_but_keeps_exact_argv()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut identity = identity()?;

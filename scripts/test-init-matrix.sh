@@ -125,6 +125,12 @@ validate_sources() {
         || fail 'systemd daemon primary group is not root'
     [ "$(sed -n 's/^SupplementaryGroups=//p' "$systemd_unit")" = openshield ] \
         || fail 'systemd daemon does not have the exact observation supplementary group'
+    [ "$(sed -n 's/^ProcSubset=//p' "$systemd_unit")" = all ] \
+        || fail 'systemd procfs subset hides required nested NFQUEUE progress metadata'
+    [ "$(sed -n 's/^ReadOnlyPaths=//p' "$systemd_unit")" = /proc ] \
+        || fail 'systemd procfs is not explicitly read-only'
+    [ "$(sed -n 's/^ProtectProc=//p' "$systemd_unit")" = invisible ] \
+        || fail 'systemd process-visibility restriction is missing'
     if grep -Eq '^(RuntimeDirectory|StateDirectory)' "$systemd_unit"; then
         fail 'systemd special directories would recursively change preserved ownership'
     fi

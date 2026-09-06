@@ -556,6 +556,26 @@ comparison.
 
 Compatibility claims are intentionally scoped:
 
+The packaged-systemd correction of September 6, daemon SHA-256
+`0c9cc05f0cee9195632686482c01d45a1e20457e92f5bac8fa9a3011630639c7`,
+passed 489 ordinary Rust tests, all seven separately invoked ignored checks,
+formatting, Clippy, and 243 Python tests. Its RPM passed delayed-reply,
+short-lived/long-argv, server, Privoxy, and large TCP/GSO tests on both backends,
+plus package installation. The new [real systemd fixture](tests/compat/README.md#packaged-systemd-sandbox)
+passed on both backends: the installed unit can read queue progress through
+read-only procfs, and an incompatible `ProcSubset=pid` override prevents startup
+while preserving `BlockAll`. No host firewall or service was changed.
+
+The same candidate's continuous 10-PPS UDP contention test remains **FAIL on
+latency**. All 650 UDP, 130 TCP and 65 ICMP replies per backend arrived, and all
+3,400 unknown-application attempts were blocked, with no NFQUEUE errors or drops.
+UDP p99 was 585–788 ms for nftables and 585–591 ms for iptables, against roughly
+55 ms baseline; daemon CPU remained about 185–187%. Intra-batch metadata grouping
+has not demonstrated an overall CPU reduction in this fixture. The 500 ms
+additional-p99 limit was not relaxed. These functional results do not certify
+performance: the full performance smoke was not rerun, and these changes have
+not yet run in GitHub Actions.
+
 The later September 6 candidate, daemon SHA-256
 `0282b8ac3cf0ad4f33f7a5420de05c340b64d8b26d45a959700beb56719cb121`,
 passed 481 ordinary workspace Rust tests, all seven separately invoked ignored

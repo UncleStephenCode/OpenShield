@@ -93,7 +93,9 @@ impl QueueIdentity {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(PROC_QUEUE_PATH)
-            .context("cannot inspect OUTPUT queue read-through boundary")?;
+            .with_context(|| {
+                format!("cannot inspect OUTPUT queue read-through boundary at {PROC_QUEUE_PATH}")
+            })?;
         self.capture_from(file)
     }
 

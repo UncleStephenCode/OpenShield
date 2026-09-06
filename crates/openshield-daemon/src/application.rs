@@ -563,6 +563,21 @@ struct BatchResolutionFailure {
     attribution_timeout: bool,
 }
 
+type SocketIdentityCaptureKey = (SocketOwnerKey, IdentityCaptureRequirements);
+type IdentityCaptureResult = std::result::Result<ApplicationIdentity, BatchResolutionFailure>;
+
+/// Scheduling key for one batch, never a retained process identity. A sibling
+/// task, another socket UID, or different metadata requirements forms a separate
+/// capture, even when the process executable happens to be identical.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TaskIdentityCaptureKey {
+    process_id: u32,
+    tid: u32,
+    path: PathBuf,
+    socket_uid: u32,
+    requirements: IdentityCaptureRequirements,
+}
+
 impl BatchResolutionFailure {
     fn message(message: impl Into<String>) -> Self {
         Self {
@@ -655,15 +670,15 @@ impl ProcfsResolver {
     }
 
     /// Resolves a bounded group of independently queued packets while sharing
-    /// only the exhaustive socket-owner discovery passes.
+    /// exhaustive socket-owner discovery and identical task metadata captures.
     ///
-    /// `SOCK_DIAG` lookup remains per request. Identity capture is shared only
-    /// for requests in this batch which resolve to the same inode, UID and
-    /// capture requirements. Two complete procfs owner snapshots bracket those
-    /// captures, and every request is accepted only when its unique owner is
-    /// byte-for-byte stable across both snapshots. This amortizes directory
-    /// traversal without creating a long-lived authorization cache: a later
-    /// UDP batch starts attribution again from `SOCK_DIAG`.
+    /// `SOCK_DIAG` lookup remains per request. Metadata is shared only inside
+    /// this batch for the exact TGID, TID, task path, socket UID and capture
+    /// requirements. Every socket FD is checked before and after that capture;
+    /// all owning tasks must agree. Two complete procfs owner snapshots bracket
+    /// those captures, and each unique owner must remain byte-for-byte stable.
+    /// This amortizes discovery and metadata reads without a retained identity
+    /// cache: a later UDP batch starts attribution again from `SOCK_DIAG`.
     pub(crate) fn resolve_batch_for_enforcement(
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
@@ -735,10 +750,7 @@ impl ProcfsResolver {
         };
 
         let mut identities = vec![None; requests.len()];
-        let mut capture_results = BTreeMap::<
-            (SocketOwnerKey, IdentityCaptureRequirements),
-            std::result::Result<ApplicationIdentity, BatchResolutionFailure>,
-        >::new();
+        let capture_results = Self::capture_batch_identities(requests, &keys, &before, deadline);
         for (index, ((_, requirements), key)) in requests.iter().zip(&keys).enumerate() {
             let Some(key) = key else {
                 continue;
@@ -747,26 +759,21 @@ impl ProcfsResolver {
                 errors[index] = Some(BatchResolutionFailure::message(failure.clone()));
                 continue;
             }
-            let Some(owners) = before.unique.get(key) else {
+            if !before.unique.contains_key(key) {
                 errors[index] = Some(BatchResolutionFailure::message(
                     "batched socket-owner snapshot omitted a target",
                 ));
                 continue;
-            };
+            }
             let capture_key = (*key, *requirements);
             let captured = capture_results
-                .entry(capture_key)
-                .or_insert_with(|| {
-                    Self::capture_owner_identity(
-                        owners.clone(),
-                        key.inode,
-                        key.uid,
-                        deadline,
-                        *requirements,
-                    )
-                    .map_err(|error| BatchResolutionFailure::from_error(&error))
-                })
-                .clone();
+                .get(&capture_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err(BatchResolutionFailure::message(
+                        "attributed process has no socket-owning task",
+                    ))
+                });
             match captured {
                 Ok(identity) => identities[index] = Some(identity),
                 Err(failure) => errors[index] = Some(failure),
@@ -777,6 +784,91 @@ impl ProcfsResolver {
         self.revalidate_batch_owners(&keys, &before, deadline, &mut errors, &mut identities);
 
         batch_resolution_results(errors, identities)
+    }
+
+    fn capture_batch_identities(
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        keys: &[Option<SocketOwnerKey>],
+        before: &OwnerSnapshot,
+        deadline: Instant,
+    ) -> BTreeMap<SocketIdentityCaptureKey, IdentityCaptureResult> {
+        Self::capture_batch_identities_with(requests, keys, before, deadline, |task| {
+            Self::capture_process_identity(
+                &task.path,
+                task.tid,
+                task.socket_uid,
+                deadline,
+                task.requirements,
+            )
+        })
+    }
+
+    fn capture_batch_identities_with(
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        keys: &[Option<SocketOwnerKey>],
+        before: &OwnerSnapshot,
+        deadline: Instant,
+        mut capture_metadata: impl FnMut(&TaskIdentityCaptureKey) -> Result<ApplicationIdentity>,
+    ) -> BTreeMap<SocketIdentityCaptureKey, IdentityCaptureResult> {
+        let timed_out = || -> BTreeMap<SocketIdentityCaptureKey, IdentityCaptureResult> {
+            let failure = BatchResolutionFailure::from_error(&ProcfsAttributionTimeout.into());
+            // At most MAX_ATTRIBUTION_BATCH_SIZE requests; never walk the
+            // potentially much larger owner/task map after budget exhaustion.
+            requests
+                .iter()
+                .zip(keys)
+                .filter_map(|((_, requirements), key)| {
+                    key.map(|key| ((key, *requirements), Err(failure.clone())))
+                })
+                .collect()
+        };
+        let mut groups =
+            BTreeMap::<TaskIdentityCaptureKey, BTreeMap<SocketOwnerKey, PathBuf>>::new();
+        let mut seen = BTreeSet::new();
+        for ((_, requirements), key) in requests.iter().zip(keys) {
+            if ensure_within_deadline(deadline).is_err() {
+                return timed_out();
+            }
+            let Some(key) = key else { continue };
+            if before.failures.contains_key(key) || !seen.insert((*key, *requirements)) {
+                continue;
+            }
+            let Some(owners) = before.unique.get(key) else {
+                continue;
+            };
+            for owner in owners {
+                if ensure_within_deadline(deadline).is_err() {
+                    return timed_out();
+                }
+                groups
+                    .entry(TaskIdentityCaptureKey {
+                        process_id: owner.process_id,
+                        tid: owner.tid,
+                        path: owner.path.clone(),
+                        socket_uid: key.uid,
+                        requirements: *requirements,
+                    })
+                    .or_default()
+                    .insert(*key, owner.fd_path.clone());
+            }
+        }
+
+        let mut captures = BTreeMap::new();
+        for (task, sockets) in groups {
+            if ensure_within_deadline(deadline).is_err() {
+                return timed_out();
+            }
+            // All descriptors are checked before AND after this one metadata
+            // capture. Failures remain per socket: a short-lived neighbour must
+            // not deny another still-owned descriptor from the same process.
+            let identities = capture_task_socket_identities(&task.path, &sockets, deadline, || {
+                capture_metadata(&task)
+            });
+            for (key, identity) in identities {
+                merge_task_identity(&mut captures, (key, task.requirements), identity);
+            }
+        }
+        captures
     }
 
     fn resolve_batch_socket_keys(
@@ -904,6 +996,7 @@ impl ProcfsResolver {
         Self::capture_owner_identity(owners, inode, connection.socket_uid, deadline, requirements)
     }
 
+    #[cfg(test)]
     fn capture_owner_identity(
         owners: Vec<OwnerTask>,
         inode: u64,
@@ -1328,6 +1421,7 @@ impl ProcfsResolver {
         Ok(())
     }
 
+    #[cfg(test)]
     fn capture_identity(
         process: &Path,
         pid: u32,
@@ -1337,8 +1431,28 @@ impl ProcfsResolver {
         deadline: Instant,
         requirements: IdentityCaptureRequirements,
     ) -> Result<ApplicationIdentity> {
-        let socket_target = format!("socket:[{inode}]");
-        let fd_path = verified_socket_fd(process, fd_path, &socket_target, deadline)?;
+        let key = SocketOwnerKey {
+            inode,
+            uid: expected_uid,
+        };
+        capture_task_socket_identities(
+            process,
+            &BTreeMap::from([(key, fd_path.to_path_buf())]),
+            deadline,
+            || Self::capture_process_identity(process, pid, expected_uid, deadline, requirements),
+        )
+        .remove(&key)
+        .ok_or_else(|| anyhow!("socket identity capture omitted its descriptor"))?
+        .map_err(BatchResolutionFailure::into_error)
+    }
+
+    fn capture_process_identity(
+        process: &Path,
+        pid: u32,
+        expected_uid: u32,
+        deadline: Instant,
+        requirements: IdentityCaptureRequirements,
+    ) -> Result<ApplicationIdentity> {
         let start_before = read_start_time(process, deadline)?;
         let uid_before = read_process_fs_uid(process, deadline)?;
         ensure!(uid_before == expected_uid, "process/socket uid mismatch");
@@ -1404,16 +1518,6 @@ impl ProcfsResolver {
                 && uid_before == uid_after,
             "process identity changed while it was captured"
         );
-        ensure_within_deadline(deadline)?;
-        let final_socket_link = fs::read_link(&fd_path)
-            .ok()
-            .and_then(|link| link.to_str().map(ToOwned::to_owned));
-        ensure_within_deadline(deadline)?;
-        ensure!(
-            final_socket_link.as_deref() == Some(socket_target.as_str()),
-            "process closed or replaced the attributed socket"
-        );
-
         let identity = ApplicationIdentity {
             pid,
             process_start_time_ticks: start_before,
@@ -1425,6 +1529,79 @@ impl ProcfsResolver {
         };
         identity.validate()?;
         Ok(identity)
+    }
+}
+
+fn capture_task_socket_identities(
+    task: &Path,
+    sockets: &BTreeMap<SocketOwnerKey, PathBuf>,
+    deadline: Instant,
+    capture_metadata: impl FnOnce() -> Result<ApplicationIdentity>,
+) -> BTreeMap<SocketOwnerKey, IdentityCaptureResult> {
+    let mut captured = BTreeMap::new();
+    let mut verified = BTreeMap::new();
+    for (key, path) in sockets {
+        let target = format!("socket:[{}]", key.inode);
+        match verified_socket_fd(task, path, &target, deadline) {
+            Ok(path) => {
+                verified.insert(*key, path);
+            }
+            Err(error) => {
+                captured.insert(*key, Err(BatchResolutionFailure::from_error(&error)));
+            }
+        }
+    }
+    if verified.is_empty() {
+        return captured;
+    }
+    let metadata = capture_metadata().map_err(|error| BatchResolutionFailure::from_error(&error));
+    for (key, path) in verified {
+        let identity = match &metadata {
+            Err(error) => Err(error.clone()),
+            Ok(identity) => (|| {
+                ensure_within_deadline(deadline)?;
+                let final_socket_link = fs::read_link(&path);
+                ensure_within_deadline(deadline)?;
+                let target = format!("socket:[{}]", key.inode);
+                ensure!(
+                    final_socket_link.as_deref().ok() == Some(Path::new(&target)),
+                    "process closed or replaced the attributed socket"
+                );
+                Ok(identity.clone())
+            })()
+            .map_err(|error| BatchResolutionFailure::from_error(&error)),
+        };
+        captured.insert(key, identity);
+    }
+    captured
+}
+
+fn merge_task_identity(
+    captures: &mut BTreeMap<SocketIdentityCaptureKey, IdentityCaptureResult>,
+    key: SocketIdentityCaptureKey,
+    identity: IdentityCaptureResult,
+) {
+    match captures.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(identity);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            // Every owning task must agree. BTree ordering preserves the former
+            // representative identity (the highest owning TID), not a shortcut
+            // that trusts whichever task was discovered first.
+            if let Ok(previous) = entry.get() {
+                let identity = identity.and_then(|identity| {
+                    if equivalent_enforcement_identity(previous, &identity) {
+                        Ok(identity)
+                    } else {
+                        Err(BatchResolutionFailure::message(
+                            "socket-owning tasks have ambiguous application identities",
+                        ))
+                    }
+                });
+                *entry.get_mut() = identity;
+            }
+        }
     }
 }
 
@@ -5297,6 +5474,270 @@ mod tests {
             )?
             .is_none()
         );
+        Ok(())
+    }
+
+    type SharedIdentityCaptureFixture = (OwnerSnapshot, [SocketOwnerKey; 2], [PathBuf; 2]);
+
+    fn shared_identity_capture_fixture(
+        root: &Path,
+    ) -> Result<SharedIdentityCaptureFixture, Box<dyn Error>> {
+        let tasks = [
+            create_task_fixture(root, 100, 100, 1_000)?,
+            create_task_fixture(root, 100, 101, 1_000)?,
+        ];
+        for (task, tid) in tasks.iter().zip([100, 101]) {
+            complete_identity_fixture(task, tid)?;
+            symlink("socket:[77]", task.join("fd/3"))?;
+            symlink("socket:[88]", task.join("fd/4"))?;
+        }
+        let keys = [
+            SocketOwnerKey {
+                inode: 77,
+                uid: 1_000,
+            },
+            SocketOwnerKey {
+                inode: 88,
+                uid: 1_000,
+            },
+        ];
+        let before = ProcfsResolver::at(root).resolve_unique_process_tasks_batch(
+            &BTreeSet::from(keys),
+            Instant::now() + Duration::from_secs(2),
+            MAX_FDS_PER_TASK,
+            MAX_PROC_ENTRIES,
+        )?;
+        Ok((before, keys, tasks))
+    }
+
+    #[test]
+    fn batch_identity_metadata_is_shared_only_by_exact_task_and_requirements()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (before, keys, _) = shared_identity_capture_fixture(directory.path())?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            Ipv4Addr::LOCALHOST.into(),
+            12_345,
+            Ipv4Addr::LOCALHOST.into(),
+            54_321,
+            1_000,
+        )?;
+        let full = IdentityCaptureRequirements::full();
+        let minimal = IdentityCaptureRequirements::minimal();
+        let requests = [
+            (&connection, full),
+            (&connection, full),
+            (&connection, full),
+            (&connection, minimal),
+        ];
+        let socket_keys = [Some(keys[0]), Some(keys[1]), Some(keys[0]), Some(keys[0])];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut calls = Vec::new();
+        let captures = ProcfsResolver::capture_batch_identities_with(
+            &requests,
+            &socket_keys,
+            &before,
+            deadline,
+            |task| {
+                calls.push((task.tid, task.requirements));
+                ProcfsResolver::capture_process_identity(
+                    &task.path,
+                    task.tid,
+                    task.socket_uid,
+                    deadline,
+                    task.requirements,
+                )
+            },
+        );
+        assert_eq!(
+            calls,
+            [(100, minimal), (100, full), (101, minimal), (101, full)]
+        );
+        assert_eq!(captures.len(), 3);
+        for key in keys {
+            let identity = captures
+                .get(&(key, full))
+                .ok_or("missing full capture")?
+                .as_ref()
+                .map_err(|error| io::Error::other(error.message.clone()))?;
+            assert_eq!(identity.pid, 101);
+            assert!(!identity.command_line.is_empty());
+            assert!(!identity.cgroups.is_empty());
+        }
+        let identity = captures
+            .get(&(keys[0], minimal))
+            .ok_or("missing minimal capture")?
+            .as_ref()
+            .map_err(|error| io::Error::other(error.message.clone()))?;
+        assert!(identity.command_line.is_empty());
+        assert!(identity.cgroups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_identity_grouping_checks_deadline_before_capturing_metadata()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (before, keys, _) = shared_identity_capture_fixture(directory.path())?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            Ipv4Addr::LOCALHOST.into(),
+            12_345,
+            Ipv4Addr::LOCALHOST.into(),
+            54_321,
+            1_000,
+        )?;
+        let full = IdentityCaptureRequirements::full();
+        let requests = [(&connection, full), (&connection, full)];
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .ok_or("cannot construct expired test deadline")?;
+        let mut calls = 0;
+        let captures = ProcfsResolver::capture_batch_identities_with(
+            &requests,
+            &keys.map(Some),
+            &before,
+            deadline,
+            |_| {
+                calls += 1;
+                Err(anyhow!("expired batch must not read metadata"))
+            },
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(captures.len(), keys.len());
+        for result in captures.values() {
+            let failure = result.as_ref().err().ok_or("expired batch was accepted")?;
+            assert!(failure.attribution_timeout);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_capture_rechecks_each_fd_after_shared_metadata_and_isolates_replacement()
+    -> Result<(), Box<dyn Error>> {
+        for replaced_index in 0..2 {
+            let directory = tempfile::tempdir()?;
+            let (_, keys, tasks) = shared_identity_capture_fixture(directory.path())?;
+            let task = &tasks[0];
+            let sockets =
+                BTreeMap::from([(keys[0], task.join("fd/3")), (keys[1], task.join("fd/4"))]);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut calls = 0;
+            let captures = capture_task_socket_identities(task, &sockets, deadline, || {
+                calls += 1;
+                let identity = ProcfsResolver::capture_process_identity(
+                    task,
+                    100,
+                    1_000,
+                    deadline,
+                    IdentityCaptureRequirements::full(),
+                )?;
+                let path = &sockets[&keys[replaced_index]];
+                fs::remove_file(path)?;
+                symlink("socket:[999]", path)?;
+                Ok(identity)
+            });
+            assert_eq!(calls, 1);
+            assert!(captures[&keys[1 - replaced_index]].is_ok());
+            let failure = captures[&keys[replaced_index]]
+                .as_ref()
+                .err()
+                .ok_or("replaced socket received old metadata")?;
+            assert!(failure.message.contains("closed or replaced"));
+            assert!(!failure.attribution_timeout);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_capture_rechecks_each_fd_before_metadata_and_preserves_timeout_kind()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (_, keys, tasks) = shared_identity_capture_fixture(directory.path())?;
+        let task = &tasks[0];
+        let sockets = BTreeMap::from([(keys[0], task.join("fd/3")), (keys[1], task.join("fd/4"))]);
+        fs::remove_file(&sockets[&keys[0]])?;
+        symlink("socket:[999]", &sockets[&keys[0]])?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let captures = capture_task_socket_identities(task, &sockets, deadline, || {
+            ProcfsResolver::capture_process_identity(
+                task,
+                100,
+                1_000,
+                deadline,
+                IdentityCaptureRequirements::full(),
+            )
+        });
+        assert!(captures[&keys[0]].is_err());
+        assert!(captures[&keys[1]].is_ok());
+        let timed_out = capture_task_socket_identities(task, &sockets, deadline, || {
+            Err(ProcfsAttributionTimeout.into())
+        });
+        assert!(
+            !timed_out[&keys[0]]
+                .as_ref()
+                .err()
+                .ok_or("missing fd passed")?
+                .attribution_timeout
+        );
+        assert!(
+            timed_out[&keys[1]]
+                .as_ref()
+                .err()
+                .ok_or("timeout passed")?
+                .attribution_timeout
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_grouping_refreshes_metadata_and_rejects_disagreeing_socket_owning_tasks()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (before, keys, tasks) = shared_identity_capture_fixture(directory.path())?;
+        let connection = loopback_connection(
+            TransportProtocol::Tcp,
+            Ipv4Addr::LOCALHOST.into(),
+            12_345,
+            Ipv4Addr::LOCALHOST.into(),
+            54_321,
+            1_000,
+        )?;
+        let full = IdentityCaptureRequirements::full();
+        let requests = [(&connection, full), (&connection, full)];
+        let socket_keys = keys.map(Some);
+        let capture = || {
+            ProcfsResolver::capture_batch_identities(
+                &requests,
+                &socket_keys,
+                &before,
+                Instant::now() + Duration::from_secs(2),
+            )
+        };
+        let first = capture();
+        assert!(first.values().all(std::result::Result::is_ok));
+        for task in &tasks {
+            fs::write(task.join("cmdline"), b"fixture-executable\0--new-batch\0")?;
+        }
+        let second = capture();
+        for key in keys {
+            let previous = first[&(key, full)]
+                .as_ref()
+                .map_err(|error| io::Error::other(error.message.clone()))?;
+            let current = second[&(key, full)]
+                .as_ref()
+                .map_err(|error| io::Error::other(error.message.clone()))?;
+            assert_ne!(previous.command_line, current.command_line);
+        }
+        fs::write(tasks[1].join("cgroup"), b"0::/different-thread-cgroup\n")?;
+        for result in capture().values() {
+            let failure = result
+                .as_ref()
+                .err()
+                .ok_or("a conflicting owning TID was ignored")?;
+            assert!(failure.message.contains("ambiguous application identities"));
+        }
         Ok(())
     }
 

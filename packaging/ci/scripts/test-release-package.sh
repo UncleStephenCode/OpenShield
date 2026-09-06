@@ -284,6 +284,9 @@ RPM_INSTALL_ASSERTIONS='
       unit=/usr/lib/systemd/system/openshield-daemon.service
       [ "$(sed -n "s/^Group=//p" "$unit")" = root ]
       [ "$(sed -n "s/^SupplementaryGroups=//p" "$unit")" = openshield ]
+      [ "$(sed -n "s/^ProcSubset=//p" "$unit")" = all ]
+      [ "$(sed -n "s/^ReadOnlyPaths=//p" "$unit")" = /proc ]
+      [ "$(sed -n "s/^ProtectProc=//p" "$unit")" = invisible ]
       ! grep -Eq "^(RuntimeDirectory|StateDirectory)" "$unit"
       ! grep -Eq "^(AmbientCapabilities|CapabilityBoundingSet)=.*CAP_CHOWN" "$unit"
       runtime_probe=/run/openshield/.tmpfiles-nonrecursive-test

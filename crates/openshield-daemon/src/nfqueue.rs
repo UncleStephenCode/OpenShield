@@ -134,6 +134,13 @@ pub fn spawn(
     let reply_queue = QueueSocket::open(openshield_core::APPLICATION_REPLY_QUEUE_NUMBER, false)
         .context("cannot bind the fail-closed application reply retry queue")?;
     let reply_registry = reply::shared_registry(enforcing_queue.port_id()?)?;
+    // Validate the real service's procfs view while the bootstrap BlockAll
+    // policy is still installed, before workers or desired policy activation.
+    // A successful socket bind alone does not prove reply scheduling can work
+    // (notably with systemd ProcSubset=pid hiding nested network proc entries).
+    reply::verify_startup_progress(&reply_registry).context(
+        "cannot initialize application reply scheduling; network procfs must be readable",
+    )?;
     let (learning_sender, learning_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
     let (attribution_sender, attribution_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
     let (completion_sender, completion_receiver) = mpsc::sync_channel(LEARNING_PENDING_CAPACITY);

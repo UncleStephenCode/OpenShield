@@ -266,6 +266,12 @@ fn capture_read_through_barrier(registry: &SharedRegistry) -> Result<ReadThrough
     identity.capture()
 }
 
+/// Prove that progress metadata is readable and belongs to our OUTPUT queue
+/// before activating a policy. The probe grants nothing and advances no IDs.
+pub(super) fn verify_startup_progress(registry: &SharedRegistry) -> Result<()> {
+    capture_read_through_barrier(registry).map(|_| ())
+}
+
 #[derive(Debug)]
 struct ReplyPacket {
     key: FlowKey,

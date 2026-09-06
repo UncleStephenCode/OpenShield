@@ -37,6 +37,9 @@ jobs:
         run: |
           set -euo pipefail
           bash -n tests/perf/ci-smoke.sh
+          sh -n tests/e2e/systemd-sandbox.sh
+          sh -n tests/e2e/systemd-sandbox-init.sh
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("tests/e2e/systemd-sandbox.py").read_text())'
           python3 -m unittest -v \
             tests/perf/test_harness.py \
             tests/perf/test_environment.py \

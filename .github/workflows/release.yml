@@ -267,6 +267,9 @@ jobs:
                 tests/e2e/native-client.c
               python3 tests/ci/test_release_candidate_artifacts.py
               bash -n tests/perf/ci-smoke.sh
+              sh -n tests/e2e/systemd-sandbox.sh
+              sh -n tests/e2e/systemd-sandbox-init.sh
+              python3 -c "import ast, pathlib; ast.parse(pathlib.Path(\"tests/e2e/systemd-sandbox.py\").read_text())"
               python3 -m json.tool tests/perf/config/ci-smoke.json >/dev/null
               python3 tests/perf/run.py --help >/dev/null
               PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
@@ -684,6 +687,34 @@ jobs:
             fi
           fi
           exit "$e2e_status"
+
+      - name: Run packaged systemd sandbox regression
+        id: systemd_sandbox
+        if: ${{ matrix.family == 'tumbleweed' && matrix.platform == 'linux/amd64' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          BACKEND: ${{ matrix.backend }}
+          PACKAGE_DIR: ${{ runner.temp }}/openshield-e2e-package-${{ matrix.evidence_id }}
+          SANDBOX_LOG: ${{ runner.temp }}/openshield-systemd-${{ matrix.evidence_id }}.log
+        run: |
+          set -euo pipefail
+          mapfile -d '' packages < <(find "$PACKAGE_DIR" -mindepth 1 -maxdepth 1 -type f -print0)
+          [[ "${#packages[@]}" -eq 1 && ! -L "${packages[0]}" && "${packages[0]}" == *.rpm ]]
+          # Status 77 (unsupported private systemd/cgroup setup) is not a pass.
+          timeout --signal=TERM --kill-after=30s 12m \
+            sh tests/e2e/systemd-sandbox.sh "$BACKEND" "${packages[0]}" 2>&1 | tee "$SANDBOX_LOG"
+
+      - name: Preserve packaged systemd evidence
+        if: ${{ always() && steps.systemd_sandbox.outcome != 'skipped' && steps.systemd_sandbox.outcome != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: systemd-sandbox-${{ matrix.evidence_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/openshield-systemd-evidence.*/
+            ${{ runner.temp }}/openshield-systemd-${{ matrix.evidence_id }}.log
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Record firewall evidence
         if: ${{ success() }}

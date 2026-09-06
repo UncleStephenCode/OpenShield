@@ -187,14 +187,16 @@ The normative boundary is defined by the
   suppresses persistence while the outbound packet remains allowed.
 - Since v0.1.32 attribution batches contain at most 32 already-ready items
   without waiting to fill a batch. Each packet still performs its own
-  `SOCK_DIAG` lookup. The optimization shares only two complete bounded procfs
+  `SOCK_DIAG` lookup. The optimization shares two complete bounded procfs
   owner snapshots, one before and one after identity capture, including a
   single-item batch. The absolute operation deadline is 2 seconds for queue
   1337 and 5 seconds for asynchronous Learning; individual `SOCK_DIAG` queries
   remain capped at 250 ms within that deadline. Each snapshot has a global cap of 131,072 owner records
-  across all targets. Identity capture is
-  memoized only inside that batch for an identical inode, socket UID, and
-  capture requirement. Duplicate requests must reach consensus on PID, process
+  across all targets. Within a batch, metadata is read once per exact TGID/TID,
+  task path, socket UID, and capture requirements. Every socket FD is checked
+  before and after that read; all owning tasks must agree. Per-socket results
+  remain keyed by inode, UID, and requirements and are discarded with the batch.
+  Duplicate requests must reach consensus on PID, process
   start time, executable path and complete file version, and filesystem UID.
   The typed attribution-timeout marker is preserved into NFQUEUE accounting.
   A changed snapshot, inconsistent identity, timeout, ambiguity, or exceeded
@@ -336,6 +338,15 @@ The normative boundary is defined by the
   `/run` or `/var/lib`, writable. This preserves serialization with other
   xtables processes without recursively changing saved state. The unit reduces
   attack surface but is not a sandbox against a compromised daemon.
+  `ProcSubset=all` with `ReadOnlyPaths=/proc` is required for the nested
+  `/proc/self/net/netfilter/nfnetlink_queue` progress record. `ProcSubset=pid`
+  hides that entry even when `/proc/self/net/tcp` is readable. This change
+  expands read visibility of general procfs metadata; it does not restore procfs
+  writes or change network authorization. Queue ownership/configuration and
+  progress readability are checked before worker startup and desired-policy
+  activation. A failed check leaves bootstrap `BlockAll` in place.
+  Previously recorded systemd exposure scores below are historical, not a new
+  score for this revised procfs configuration.
 
 ## Verification evidence
 
@@ -615,9 +626,9 @@ Commands and exact interpretation are documented in
   131,072-owner-record cap to each snapshot. Per-query `SOCK_DIAG` remains capped
   at 250 ms. Fixed-buffer, directory-relative reads reduce common-case overhead,
   not the worst-case scan size.
-  Intra-batch
-  identity reuse is keyed by inode, UID, and capture requirements and is accepted
-  only with mandatory-identity consensus and unchanged ownership; nothing is
+  Intra-batch metadata grouping is keyed by TGID/TID, task path, socket UID, and
+  capture requirements. Per-socket FD checks, mandatory-identity consensus,
+  and unchanged ownership remain required; nothing is
   cached across batches. These optimizations do not alter worst-case complexity. A
   sustained packet stream or hostile procfs cardinality can still saturate the
   active consumer and deny legitimate application-bound traffic in `Enforcing`.

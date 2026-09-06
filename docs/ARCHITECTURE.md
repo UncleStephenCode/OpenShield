@@ -268,8 +268,12 @@ must be reviewed before switching to Enforcing. The
 separately checks request/response learning, denied unknown executables, and the
 unavoidable one-way UDP observation limit.
 
-Identity capture can be memoized only within that batch and only for an exact
-tuple of socket inode, socket UID, and capture requirements. Duplicate requests
+Within a batch, metadata capture is grouped by exact TGID, TID, procfs task path,
+socket UID, and capture requirements. Each socket descriptor is checked before
+and after the shared metadata read; every owning TID must agree. A failed
+descriptor does not invalidate an independently verified neighbour. Both complete
+owner snapshots remain mandatory. Per-socket results are keyed by inode, socket
+UID, and capture requirements and are discarded at the end of the batch. Duplicate requests
 for one socket must reach consensus on mandatory identity: PID, process start
 time, executable path, complete file version, and filesystem UID. The optional
 argv and cgroup fields are still captured whenever the matching policy requires
@@ -805,6 +809,14 @@ Together with `CAP_DAC_READ_SEARCH`, procfs magic links such as
 `/proc/<pid>/root` can also expose another process's mount view despite service
 mount restrictions. The retained capabilities therefore materially expand the
 impact of a daemon compromise and are inside the trusted computing base.
+
+The service exposes `ProcSubset=all` on an explicitly read-only `/proc` while
+retaining `ProtectProc=invisible`. `subset=pid` hides the nested NFQUEUE progress
+file even through `/proc/self/net`, so it is incompatible with reply scheduling.
+Queue setup validates this entry against the bound OUTPUT netlink owner before
+any worker or desired-policy activation. Failure retains bootstrap `BlockAll`
+and prevents readiness. General procfs metadata is consequently more visible;
+read-only mounts are not a substitute for the capability/LSM threat boundary.
 
 The observation API reveals firewall mode, rules, aggregate one-second counters,
 and learned network endpoints only to root and members of `openshield`. For an

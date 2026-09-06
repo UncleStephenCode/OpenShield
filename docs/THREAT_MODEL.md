@@ -483,6 +483,13 @@ are broader than firewall administration alone.
   following `/proc/<pid>/root` and related procfs magic links may additionally
   reach a target process's mount view despite the service's mount hardening. The
   daemon therefore retains broader readable-procfs and filesystem access.
+- Reply scheduling requires the nested network procfs queue-progress entry.
+  The unit therefore uses `ProcSubset=all` plus `ReadOnlyPaths=/proc`, retaining
+  `ProtectProc=invisible` and the other capability, syscall and kernel-tunable
+  restrictions. This exposes additional general procfs metadata compared with
+  `subset=pid`; it does not broaden packet authorization. Startup validates the
+  actual entry before activation. A missing/hidden/malformed entry cannot become
+  a successful readiness signal or a guessed reply grant.
 - Outbound application rules support `accept`, `drop`, and `reject`. Enabled
   network-only deny rules run first; an overlapping application candidate is
   then attributed before a broader network-only accept may be used as a
