@@ -3,9 +3,11 @@
 //! A barrier is scheduling evidence, never an authorization. The kernel assigns
 //! packet IDs under the queue lock before ordered netlink delivery. Admission
 //! records that order before dispatch, while verdicts may complete out of order.
-//! Only a fully completed admission prefix advances the read-through watermark;
-//! a later verdict never hides an earlier undecided packet. Later traffic cannot
-//! extend an already captured barrier. Missing metadata, a queue
+//! Every received packet is classified before advancing the admission watermark.
+//! Replies wait for matching-flow and unclassified verdicts through that fixed
+//! boundary. Known unrelated flows need not finish, but their slots remain until
+//! the completed prefix advances, preserving bounded accounting. Later traffic
+//! cannot extend an already captured barrier. Missing metadata, a queue
 //! replacement, ambiguous serial arithmetic, or a failed verdict cannot advance
 //! progress. Every released reply still requires current-policy `NF_REPEAT`.
 
@@ -18,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use openshield_core::APPLICATION_QUEUE_NUMBER;
+
+use super::{FlowKey, OutgoingFlow};
 
 const PROC_QUEUE_PATH: &str = "/proc/self/net/netfilter/nfnetlink_queue";
 const MAX_PROC_BYTES: usize = 16 * 1024;
@@ -47,7 +51,13 @@ pub(super) struct QueueProgress {
     completed: u32,
     last_admitted: u32,
     order: VecDeque<u32>,
-    verdicts: BTreeMap<u32, bool>,
+    verdicts: BTreeMap<u32, PacketProgress>,
+}
+
+#[derive(Debug)]
+struct PacketProgress {
+    flow: OutgoingFlow,
+    completed: bool,
 }
 
 impl QueueProgress {
@@ -79,13 +89,13 @@ impl QueueProgress {
     /// Register every packet in kernel receive order before any verdict or
     /// worker dispatch, including packets which need no application attribution.
     /// Validate the whole batch first so an error cannot partially admit it.
-    pub(super) fn admit(&mut self, packet_ids: &[u32]) -> Result<()> {
+    pub(super) fn admit_classified(&mut self, packets: &[(u32, OutgoingFlow)]) -> Result<()> {
         ensure!(
-            packet_ids.len() <= self.remaining_capacity(),
+            packets.len() <= self.remaining_capacity(),
             "OUTPUT verdict progress admission bound exceeded"
         );
         let mut previous = self.last_admitted;
-        for &packet_id in packet_ids {
+        for &(packet_id, _) in packets {
             let advance = packet_id.wrapping_sub(previous);
             let outstanding_span = packet_id.wrapping_sub(self.completed);
             ensure!(
@@ -98,28 +108,50 @@ impl QueueProgress {
             );
             previous = packet_id;
         }
-        for &packet_id in packet_ids {
+        for (packet_id, flow) in packets {
+            let packet_id = *packet_id;
             self.order.push_back(packet_id);
-            self.verdicts.insert(packet_id, false);
+            self.verdicts.insert(
+                packet_id,
+                PacketProgress {
+                    flow: flow.clone(),
+                    completed: false,
+                },
+            );
         }
         self.last_admitted = previous;
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn admit(&mut self, packet_ids: &[u32]) -> Result<()> {
+        self.admit_classified(
+            &packet_ids
+                .iter()
+                .map(|&id| (id, OutgoingFlow::Unknown))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     /// Called only after the actual verdict was successfully sent. Completed
-    /// later slots remain bounded and cannot release a barrier across a hole.
+    /// later slots remain bounded until the global prefix crosses the hole;
+    /// inspecting flow-specific readiness never retires those slots early.
     pub(super) fn complete(&mut self, packet_id: u32) -> Result<()> {
-        let completed = self
+        let packet = self
             .verdicts
             .get_mut(&packet_id)
             .context("OUTPUT verdict refers to an unadmitted or retired packet ID")?;
         ensure!(
-            !*completed,
+            !packet.completed,
             "OUTPUT packet verdict completion is duplicated"
         );
-        *completed = true;
+        packet.completed = true;
         while let Some(&first) = self.order.front() {
-            if self.verdicts.get(&first) != Some(&true) {
+            if !self
+                .verdicts
+                .get(&first)
+                .is_some_and(|packet| packet.completed)
+            {
                 break;
             }
             self.order.pop_front();
@@ -133,6 +165,34 @@ impl QueueProgress {
         self.identity.port_id == barrier.identity.port_id
             && Arc::ptr_eq(&self.identity.epoch, &barrier.identity.epoch)
             && self.completed.wrapping_sub(barrier.sequence) < SERIAL_HALF_RANGE
+    }
+
+    pub(super) fn reached_for_flow(&self, barrier: &ReadThroughBarrier, key: &FlowKey) -> bool {
+        if self.reached(barrier) {
+            return true;
+        }
+        if self.identity.port_id != barrier.identity.port_id
+            || !Arc::ptr_eq(&self.identity.epoch, &barrier.identity.epoch)
+            || self.last_admitted.wrapping_sub(barrier.sequence) >= SERIAL_HALF_RANGE
+        {
+            return false;
+        }
+        // Receipt through the captured ID proves that no older original is
+        // still unread. Admission/classification is atomic under the registry
+        // lock; it carries no process identity or policy authorization.
+        self.order
+            .iter()
+            .take_while(|&&id| barrier.sequence.wrapping_sub(id) < SERIAL_HALF_RANGE)
+            .all(|id| {
+                self.verdicts.get(id).is_some_and(|packet| {
+                    packet.completed
+                        || match &packet.flow {
+                            OutgoingFlow::Reply(flow) => flow != key,
+                            OutgoingFlow::Unrelated => true,
+                            OutgoingFlow::Unknown => false,
+                        }
+                })
+            })
     }
 
     #[cfg(test)]
@@ -271,6 +331,120 @@ mod tests {
         progress
             .identity()
             .capture_from(Cursor::new(text.as_bytes()))
+    }
+
+    fn flow(port: u16) -> Result<FlowKey> {
+        Ok(FlowKey {
+            local: "192.0.2.1".parse()?,
+            local_port: port,
+            remote: "198.51.100.1".parse()?,
+            remote_port: Some(53),
+            protocol: openshield_core::TransportProtocol::Udp,
+        })
+    }
+
+    #[test]
+    fn flow_barrier_waits_for_matching_and_unknown_verdicts_in_every_completion_order() -> Result<()>
+    {
+        let key = flow(5000)?;
+        for order in [
+            [1, 2, 3],
+            [1, 3, 2],
+            [2, 1, 3],
+            [2, 3, 1],
+            [3, 1, 2],
+            [3, 2, 1],
+        ] {
+            let mut progress = QueueProgress::new(77)?;
+            let target = barrier(&progress, 4);
+            progress.admit_classified(&[
+                (1, OutgoingFlow::Reply(flow(5001)?)),
+                (2, OutgoingFlow::Reply(key.clone())),
+                (3, OutgoingFlow::Unknown),
+                (4, OutgoingFlow::Unrelated),
+                // Even later matching or unknown packets cannot extend target.
+                (5, OutgoingFlow::Reply(key.clone())),
+                (6, OutgoingFlow::Unknown),
+            ])?;
+            let mut done = [false; 3];
+            assert!(!progress.reached_for_flow(&target, &key));
+            for id in order {
+                progress.complete(id)?;
+                done[usize::try_from(id - 1)?] = true;
+                assert_eq!(progress.reached_for_flow(&target, &key), done[1] && done[2]);
+            }
+            // The separate global prefix/backpressure proof still waits for 4.
+            assert!(!progress.reached(&target));
+            assert_eq!(progress.remaining_capacity(), MAX_TRACKED_OUTGOING - 3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flow_barrier_cannot_reuse_old_flow_before_new_original_is_classified() -> Result<()> {
+        let key = flow(5000)?;
+        let mut progress = QueueProgress::new(77)?;
+        progress.admit_classified(&[(1, OutgoingFlow::Reply(key.clone()))])?;
+        progress.complete(1)?;
+        let target = barrier(&progress, 3);
+        assert!(!progress.reached_for_flow(&target, &key));
+        progress.admit_classified(&[(2, OutgoingFlow::Unrelated)])?;
+        assert!(!progress.reached_for_flow(&target, &key));
+        progress.admit_classified(&[(3, OutgoingFlow::Reply(key.clone()))])?;
+        assert!(!progress.reached_for_flow(&target, &key));
+        progress.complete(3)?;
+        assert!(progress.reached_for_flow(&target, &key));
+        assert!(!progress.reached(&target));
+        Ok(())
+    }
+
+    #[test]
+    fn flow_barrier_wrap_and_gaps_never_hide_matching_or_unknown_packets() -> Result<()> {
+        let key = flow(5000)?;
+        let mut progress = QueueProgress::new(77)?;
+        progress.completed = u32::MAX - 3;
+        progress.last_admitted = progress.completed;
+        let target = barrier(&progress, 0);
+        progress.admit_classified(&[
+            (u32::MAX - 2, OutgoingFlow::Unrelated),
+            (u32::MAX - 1, OutgoingFlow::Reply(key.clone())),
+        ])?;
+        progress.complete(u32::MAX - 1)?;
+        assert!(!progress.reached_for_flow(&target, &key));
+        // IDs MAX and 0 never arrived. Ordered receipt past them covers the
+        // gap, but an unknown packet before another captured ID must finish.
+        progress.admit_classified(&[(1, OutgoingFlow::Unknown)])?;
+        assert!(progress.reached_for_flow(&target, &key));
+        let later = barrier(&progress, 2);
+        progress.admit_classified(&[(3, OutgoingFlow::Unrelated)])?;
+        assert!(!progress.reached_for_flow(&later, &key));
+        progress.complete(1)?;
+        assert!(progress.reached_for_flow(&later, &key));
+        assert!(!progress.reached(&target));
+        assert!(progress.complete(0).is_err());
+        assert!(!progress.reached_for_flow(
+            &barrier(
+                &progress,
+                progress.completed.wrapping_add(SERIAL_HALF_RANGE)
+            ),
+            &key
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn flow_classification_never_releases_another_runtime_epoch() -> Result<()> {
+        let key = flow(5000)?;
+        let original = QueueProgress::new(77)?;
+        let target = barrier(&original, 1);
+        for port in [77, 78] {
+            let mut replacement = QueueProgress::new(port)?;
+            replacement.admit_classified(&[(1, OutgoingFlow::Unrelated)])?;
+            assert!(!replacement.reached_for_flow(&target, &key));
+            replacement.complete(1)?;
+            assert!(!replacement.reached_for_flow(&target, &key));
+        }
+        Ok(())
     }
 
     #[test]

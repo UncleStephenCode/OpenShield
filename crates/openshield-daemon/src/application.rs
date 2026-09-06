@@ -522,6 +522,56 @@ struct OwnerSnapshot {
     failures: BTreeMap<SocketOwnerKey, String>,
 }
 
+// Borrow only positive descriptor names from this batch's first snapshot.
+// Every task and link is examined afresh; these are not cached owners or
+// negative answers. Per-task keys keep duplicate-fd selection stable.
+type OwnerFdHints<'a> = BTreeMap<(u32, u32), BTreeMap<SocketOwnerKey, &'a OsStr>>;
+
+fn owner_fd_hints<'a>(
+    snapshot: &'a OwnerSnapshot,
+    targets: &BTreeSet<SocketOwnerKey>,
+    deadline: Instant,
+) -> Result<OwnerFdHints<'a>> {
+    let mut hints = OwnerFdHints::new();
+    for key in targets {
+        for owner in snapshot.unique.get(key).into_iter().flatten() {
+            ensure_within_deadline(deadline)?;
+            let name = owner
+                .fd_path
+                .file_name()
+                .ok_or_else(|| anyhow!("socket descriptor path has no file name"))?;
+            hints
+                .entry((owner.process_id, owner.tid))
+                .or_default()
+                .insert(*key, name);
+        }
+    }
+    Ok(hints)
+}
+
+#[derive(Clone, Copy)]
+struct TaskFdHints<'a> {
+    discovered: &'a BTreeMap<SocketOwnerKey, OsString>,
+    previous: Option<&'a BTreeMap<SocketOwnerKey, &'a OsStr>>,
+}
+
+impl<'a> TaskFdHints<'a> {
+    fn get(self, key: &SocketOwnerKey) -> Option<&'a OsStr> {
+        self.previous
+            .and_then(|hints| hints.get(key).copied())
+            .or_else(|| self.discovered.get(key).map(OsString::as_os_str))
+    }
+}
+
+impl<'a> From<&'a BTreeMap<SocketOwnerKey, OsString>> for TaskFdHints<'a> {
+    fn from(discovered: &'a BTreeMap<SocketOwnerKey, OsString>) -> Self {
+        Self {
+            discovered,
+            previous: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OwnerScanLimits {
     maximum_fds: usize,
@@ -551,6 +601,7 @@ struct OwnerScanRequest<'a> {
     targets_by_uid: &'a BTreeMap<u32, BTreeSet<u64>>,
     deadline: Instant,
     limits: OwnerScanLimits,
+    previous_hints: Option<&'a OwnerFdHints<'a>>,
 }
 
 /// Per-request failure retained while a batched attribution is assembled.
@@ -946,12 +997,21 @@ impl ProcfsResolver {
             return;
         }
         let owner_timing = TimingScope::new(TimingStage::OwnerAfter, successful_targets.len());
-        let resolved = self.resolve_unique_process_tasks_batch(
-            &successful_targets,
-            deadline,
-            MAX_FDS_PER_TASK,
-            MAX_PROC_ENTRIES,
-        );
+        let resolved = owner_fd_hints(before, &successful_targets, deadline).and_then(|hints| {
+            let workers = thread::available_parallelism().map_or(1, |count| count.get().min(2));
+            self.resolve_owner_snapshot_with_hints(
+                &successful_targets,
+                deadline,
+                OwnerScanLimits {
+                    maximum_fds: MAX_FDS_PER_TASK,
+                    maximum_owner_records: MAX_PROC_ENTRIES,
+                    maximum_tasks: MAX_PROC_ENTRIES,
+                    parallel_task_threshold: PARALLEL_OWNER_SCAN_MINIMUM_TASKS,
+                },
+                workers,
+                Some(&hints),
+            )
+        });
         owner_timing.finish(
             resolved
                 .as_ref()
@@ -1267,6 +1327,17 @@ impl ProcfsResolver {
         limits: OwnerScanLimits,
         workers: usize,
     ) -> Result<OwnerSnapshot> {
+        self.resolve_owner_snapshot_with_hints(targets, deadline, limits, workers, None)
+    }
+
+    fn resolve_owner_snapshot_with_hints(
+        &self,
+        targets: &BTreeSet<SocketOwnerKey>,
+        deadline: Instant,
+        limits: OwnerScanLimits,
+        workers: usize,
+        previous_hints: Option<&OwnerFdHints<'_>>,
+    ) -> Result<OwnerSnapshot> {
         ensure!(!targets.is_empty(), "socket-owner batch is empty");
         ensure!(
             targets.len() <= MAX_ATTRIBUTION_BATCH_SIZE,
@@ -1302,6 +1373,7 @@ impl ProcfsResolver {
             targets_by_uid: &targets_by_uid,
             deadline,
             limits,
+            previous_hints,
         };
         let accumulated = scan_owner_task_groups(request, &groups, workers)?;
 
@@ -1744,7 +1816,12 @@ fn scan_owner_partition<'a>(
                 group.process_id,
                 *tid,
                 request.targets_by_uid,
-                &preferred_fd_names,
+                TaskFdHints {
+                    discovered: &preferred_fd_names,
+                    previous: request
+                        .previous_hints
+                        .and_then(|hints| hints.get(&(group.process_id, *tid))),
+                },
                 request.deadline,
                 request.limits.maximum_fds,
             )?
@@ -2015,7 +2092,7 @@ fn task_socket_fds_for_batch(
     process_id: u32,
     task_id: u32,
     targets_by_uid: &BTreeMap<u32, BTreeSet<u64>>,
-    preferred_fd_names: &BTreeMap<SocketOwnerKey, OsString>,
+    preferred_fd_names: TaskFdHints<'_>,
     deadline: Instant,
     maximum_fds: usize,
 ) -> Result<Option<(u32, BTreeMap<u64, PathBuf>)>> {
@@ -2072,7 +2149,7 @@ fn prefer_verified_socket_fd_hints(
     task_id: u32,
     observed_fsuid: u32,
     matches: &mut BTreeMap<u64, PathBuf>,
-    preferred_fd_names: &BTreeMap<SocketOwnerKey, OsString>,
+    preferred_fd_names: TaskFdHints<'_>,
     deadline: Instant,
 ) -> Result<()> {
     let mut changed = false;
@@ -2102,7 +2179,7 @@ fn prefer_verified_socket_fd_hints(
     Ok(())
 }
 
-/// Positive hints are local to one exhaustive owner snapshot. They do not
+/// Positive hints are local to one attribution batch. They do not
 /// assert that sibling tasks share an fd table: each target link and the task
 /// UID are checked again. Only finding every target for this UID permits
 /// skipping the directory walk; any miss or link error uses the full scan.
@@ -2111,7 +2188,7 @@ fn hinted_task_socket_fds_for_inodes(
     task_id: u32,
     observed_fsuid: u32,
     target_inodes: &BTreeSet<u64>,
-    preferred_fd_names: &BTreeMap<SocketOwnerKey, OsString>,
+    preferred_fd_names: TaskFdHints<'_>,
     deadline: Instant,
 ) -> Result<Option<BTreeMap<u64, PathBuf>>> {
     let mut matches = BTreeMap::new();
@@ -3058,8 +3135,46 @@ fn verified_socket_fd(
 }
 
 fn read_process_fs_uid(process: &Path, deadline: Instant) -> Result<u32> {
-    let bytes = read_bounded(&process.join("status"), MAX_STATUS_BYTES, deadline)?;
-    let text = std::str::from_utf8(&bytes).context("process status is not UTF-8 ASCII")?;
+    let path = process.join("status");
+    ensure_within_deadline(deadline)?;
+    let mut file = File::open(&path).with_context(|| format!("cannot open {}", path.display()))?;
+    ensure_within_deadline(deadline)?;
+    // Most status files fit in one chunk. Read directly into that storage so
+    // every task's fresh UID check avoids allocating and copying its contents.
+    // Still consume the whole file: a valid UID prefix must not hide invalid
+    // UTF-8, an oversized suffix, or a later read/deadline error.
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut length = 0;
+    let mut overflow: Option<Vec<u8>> = None;
+    loop {
+        ensure_within_deadline(deadline)?;
+        let destination = if overflow.is_some() {
+            &mut buffer[..]
+        } else {
+            &mut buffer[length..]
+        };
+        let count = file
+            .read(destination)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        ensure_within_deadline(deadline)?;
+        if count == 0 {
+            break;
+        }
+        if let Some(bytes) = &mut overflow {
+            ensure!(
+                bytes.len().saturating_add(count) <= MAX_STATUS_BYTES,
+                "bounded procfs file is oversized"
+            );
+            bytes.extend_from_slice(&buffer[..count]);
+        } else {
+            length += count;
+            if length == buffer.len() {
+                overflow = Some(buffer.to_vec());
+            }
+        }
+    }
+    let bytes = overflow.as_deref().unwrap_or(&buffer[..length]);
+    let text = std::str::from_utf8(bytes).context("process status is not UTF-8 ASCII")?;
     let line = text
         .lines()
         .find(|line| line.starts_with("Uid:"))
@@ -4613,6 +4728,74 @@ mod tests {
     }
 
     #[test]
+    fn fsuid_status_reader_preserves_full_file_bounds_and_utf8() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("status");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for length in [8 * 1024 - 1, 8 * 1024, 8 * 1024 + 1, MAX_STATUS_BYTES] {
+            let mut bytes = b"Uid:\t1000\t1001\t1002\t1003\n".to_vec();
+            bytes.resize(length, b' ');
+            fs::write(&path, &bytes)?;
+            assert_eq!(read_process_fs_uid(directory.path(), deadline)?, 1_003);
+        }
+
+        let mut bytes = b"Uid:\t1000\t1001\t1002\t1003\n".to_vec();
+        bytes.resize(MAX_STATUS_BYTES + 1, b' ');
+        fs::write(&path, &bytes)?;
+        let error = read_process_fs_uid(directory.path(), deadline)
+            .err()
+            .ok_or("a valid UID prefix hid an oversized status suffix")?;
+        assert!(
+            error
+                .to_string()
+                .contains("bounded procfs file is oversized")
+        );
+
+        for length in [64, 8 * 1024 + 1] {
+            bytes.truncate(length);
+            bytes.push(0xff);
+            fs::write(&path, &bytes)?;
+            let error = read_process_fs_uid(directory.path(), deadline)
+                .err()
+                .ok_or("a valid UID prefix hid invalid UTF-8")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("process status is not UTF-8 ASCII")
+            );
+            bytes.pop();
+            bytes.resize(8 * 1024 + 1, b' ');
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fsuid_status_reader_handles_split_fields_and_fresh_reads() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("status");
+        let mut bytes = vec![b'x'; 8 * 1024 - 3];
+        bytes.extend_from_slice(b"\nUid:\t1000\t1001\t1002\t1003\n");
+        fs::write(&path, &bytes)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(read_process_fs_uid(directory.path(), deadline)?, 1_003);
+
+        fs::write(&path, b"Uid:\t1000\t1001\t1002\t2003\n")?;
+        assert_eq!(read_process_fs_uid(directory.path(), deadline)?, 2_003);
+
+        fs::write(&path, b"Uid:\t1000\t1001\t1002\tinvalid\n")?;
+        let error = read_process_fs_uid(directory.path(), deadline)
+            .err()
+            .ok_or("an invalid UID reused an earlier value")?;
+        assert!(error.to_string().contains("process fsuid is invalid"));
+
+        let error = read_process_fs_uid(directory.path(), Instant::now())
+            .err()
+            .ok_or("an expired UID read succeeded")?;
+        assert!(is_attribution_timeout(&error));
+        Ok(())
+    }
+
+    #[test]
     fn cgroup_identity_uses_only_the_qualified_v2_unified_hierarchy() -> Result<(), Box<dyn Error>>
     {
         let directory = tempfile::tempdir()?;
@@ -4891,6 +5074,147 @@ mod tests {
             relative.as_millis(),
             relative.as_secs_f64() / standard.as_secs_f64()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn final_snapshot_hints_recheck_links_uids_and_all_other_tasks() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        let unrelated = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        let key = SocketOwnerKey {
+            inode: 77,
+            uid: 1_000,
+        };
+        let targets = BTreeSet::from([key]);
+        symlink("socket:[77]", owner.join("fd/3"))?;
+        let resolver = ProcfsResolver::at(directory.path());
+        let deadline = Instant::now() + PROC_SCAN_DEADLINE;
+        let limits = OwnerScanLimits {
+            maximum_fds: 4,
+            maximum_owner_records: 4,
+            maximum_tasks: 4,
+            parallel_task_threshold: 0,
+        };
+        let before = resolver.resolve_owner_snapshot_with_workers(&targets, deadline, limits, 1)?;
+        let hints = owner_fd_hints(&before, &targets, deadline)?;
+        for workers in [1, 2] {
+            // The positive shortcut really skips the owner fd walk: its
+            // table is now larger than the deliberately tiny scan bound.
+            for fd in 4..9 {
+                symlink("/dev/null", owner.join(format!("fd/{fd}")))?;
+            }
+            let after = resolver.resolve_owner_snapshot_with_hints(
+                &targets,
+                deadline,
+                limits,
+                workers,
+                Some(&hints),
+            )?;
+            assert_eq!(before, after);
+            for fd in 4..9 {
+                fs::remove_file(owner.join(format!("fd/{fd}")))?;
+            }
+
+            // A new same-UID holder, including an unshared sibling of an
+            // unrelated process, must still make attribution ambiguous.
+            let sibling = create_task_fixture(directory.path(), 200, 201, 1_000)?;
+            symlink("socket:[77]", sibling.join("fd/9"))?;
+            let after = resolver.resolve_owner_snapshot_with_hints(
+                &targets,
+                deadline,
+                limits,
+                workers,
+                Some(&hints),
+            )?;
+            assert!(!after.unique.contains_key(&key));
+            assert!(after.failures[&key].contains("multiple processes"));
+            fs::remove_file(sibling.join("fd/9"))?;
+
+            // The old descriptor may point to a different socket. Fresh
+            // enumeration finds its new location instead of trusting a hint.
+            fs::rename(owner.join("fd/3"), owner.join("fd/8"))?;
+            symlink("socket:[999]", owner.join("fd/3"))?;
+            let after = resolver.resolve_owner_snapshot_with_hints(
+                &targets,
+                deadline,
+                limits,
+                workers,
+                Some(&hints),
+            )?;
+            assert_ne!(before, after);
+            assert_eq!(after.unique[&key][0].fd_path, owner.join("fd/8"));
+            fs::remove_file(owner.join("fd/3"))?;
+            fs::rename(owner.join("fd/8"), owner.join("fd/3"))?;
+        }
+        // A positive descriptor does not bypass the current filesystem UID.
+        fs::write(owner.join("status"), "Uid:\t2000\t2000\t2000\t2000\n")?;
+        let after = resolver.resolve_owner_snapshot_with_hints(
+            &targets,
+            deadline,
+            limits,
+            2,
+            Some(&hints),
+        )?;
+        assert!(!after.unique.contains_key(&key));
+        // Unknown negative tables remain bounded and exhaustive.
+        for fd in 0..5 {
+            symlink("/dev/null", unrelated.join(format!("fd/{fd}")))?;
+        }
+        assert!(
+            resolver
+                .resolve_owner_snapshot_with_hints(&targets, deadline, limits, 2, Some(&hints),)
+                .is_err()
+        );
+        assert!(owner_fd_hints(&before, &targets, Instant::now()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn final_snapshot_hints_are_task_specific_and_incomplete_hints_never_skip_walks()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let leader = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        let sibling = create_task_fixture(directory.path(), 100, 101, 1_000)?;
+        symlink("socket:[77]", leader.join("fd/3"))?;
+        symlink("socket:[77]", sibling.join("fd/8"))?;
+        let keys = [77, 78].map(|inode| SocketOwnerKey { inode, uid: 1_000 });
+        let targets = BTreeSet::from([keys[0]]);
+        let resolver = ProcfsResolver::at(directory.path());
+        let deadline = Instant::now() + PROC_SCAN_DEADLINE;
+        let limits = OwnerScanLimits {
+            maximum_fds: 1,
+            maximum_owner_records: 4,
+            maximum_tasks: 4,
+            parallel_task_threshold: 0,
+        };
+        let before = resolver.resolve_owner_snapshot_with_workers(&targets, deadline, limits, 1)?;
+        let hints = owner_fd_hints(&before, &targets, deadline)?;
+        // A new duplicate is neither proof of shared tables nor a reason to
+        // choose a different descriptor from the one already validated.
+        symlink("socket:[77]", sibling.join("fd/3"))?;
+        for workers in [1, 2] {
+            let after = resolver.resolve_owner_snapshot_with_hints(
+                &targets,
+                deadline,
+                limits,
+                workers,
+                Some(&hints),
+            )?;
+            assert_eq!(before, after);
+            // One known target cannot hide a second target behind a bound.
+            assert!(
+                resolver
+                    .resolve_owner_snapshot_with_hints(
+                        &BTreeSet::from(keys),
+                        deadline,
+                        limits,
+                        workers,
+                        Some(&hints),
+                    )
+                    .is_err()
+            );
+        }
         Ok(())
     }
 
@@ -5487,7 +5811,7 @@ mod tests {
                 100,
                 1_000,
                 &inodes,
-                &hints,
+                (&hints).into(),
                 Instant::now() + Duration::from_secs(1),
             )
             .is_err()
@@ -5498,7 +5822,7 @@ mod tests {
                 100,
                 2_000,
                 &inodes,
-                &hints,
+                (&hints).into(),
                 Instant::now() + Duration::from_secs(1),
             )?
             .is_none()
@@ -5842,7 +6166,7 @@ mod tests {
             100,
             1_000,
             &mut matches,
-            &hints,
+            (&hints).into(),
             Instant::now() + Duration::from_secs(1),
         )?;
         assert_eq!(matches.get(&77), Some(&original));
@@ -5858,7 +6182,7 @@ mod tests {
                 100,
                 1_000,
                 &mut matches,
-                &hints,
+                (&hints).into(),
                 Instant::now() + Duration::from_secs(1),
             )
             .is_err()

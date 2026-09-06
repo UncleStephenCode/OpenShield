@@ -228,13 +228,9 @@ impl Runtime<'_> {
                 let received = Instant::now();
                 let mut batch = Vec::with_capacity(MAX_PACKET_BATCH_SIZE);
                 append_packet_datagram(&buffer[..size], &mut batch)?;
-                // Admission precedes ALL scheduling, including malformed and
-                // early-denied packets without per-flow reply tickets.
-                let ids = batch
-                    .iter()
-                    .map(|packet| packet.packet_id)
-                    .collect::<Vec<_>>();
-                reply::register_outgoing_packet_ids(self.registry, &ids)?;
+                // Classification/admission precedes ALL scheduling, including
+                // malformed and early-denied packets without reply tickets.
+                reply::register_outgoing_packets(self.registry, &batch)?;
                 for work in batch {
                     pending.push(PendingPacket { work, received })?;
                 }

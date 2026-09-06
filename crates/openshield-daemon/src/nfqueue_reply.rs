@@ -53,6 +53,43 @@ struct FlowKey {
     protocol: TransportProtocol,
 }
 
+/// Parsed packet tuples are scheduling evidence only. An unclassified packet
+/// may belong to any reply flow, so it remains a blocker until its verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OutgoingFlow {
+    Reply(FlowKey),
+    Unrelated,
+    Unknown,
+}
+
+fn classify_outgoing(work: &QueuedPacketWork) -> OutgoingFlow {
+    let Ok(packet) = &work.packet else {
+        return OutgoingFlow::Unknown;
+    };
+    let connection = &packet.connection;
+    match connection.protocol {
+        TransportProtocol::Tcp => OutgoingFlow::Unrelated,
+        TransportProtocol::Udp | TransportProtocol::Icmp | TransportProtocol::IcmpV6 => {
+            let Some(local_port) = connection.source_port else {
+                return OutgoingFlow::Unknown;
+            };
+            if connection.protocol == TransportProtocol::Udp
+                && connection.destination_port.is_none()
+            {
+                return OutgoingFlow::Unknown;
+            }
+            OutgoingFlow::Reply(FlowKey {
+                local: connection.source_address,
+                local_port,
+                remote: connection.destination_address,
+                remote_port: connection.destination_port,
+                protocol: connection.protocol,
+            })
+        }
+        TransportProtocol::Any => OutgoingFlow::Unknown,
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct OutgoingTicket {
     key: FlowKey,
@@ -173,8 +210,8 @@ impl Registry {
         if wave.failed {
             Disposition::Drop
         } else {
-            // disposition() already checked actual verdict progress through
-            // the boundary captured for this reply. New same-tuple packets
+            // disposition() already checked matching/unknown actual verdicts
+            // through the boundary captured for this reply. New same-tuple packets
             // may be active, or start a new wave, but must not extend that
             // boundary indefinitely. Repeating never stamps a connmark or
             // accepts anything: a later original's mark reset causes another
@@ -185,8 +222,25 @@ impl Registry {
 }
 
 /// Packet progress admission is independent of flow tickets and policy mode.
-/// The OUTPUT reader must register every received ID in order before deciding,
-/// dropping, or dispatching any of these packets to an attribution worker.
+/// The OUTPUT reader must classify every received ID in order before deciding,
+/// dropping, or dispatching any of these packets to an attribution worker. The
+/// registry lock publishes classifications and the read watermark atomically.
+pub(super) fn register_outgoing_packets(
+    registry: &SharedRegistry,
+    packets: &[QueuedPacketWork],
+) -> Result<()> {
+    let classified = packets
+        .iter()
+        .map(|work| (work.packet_id, classify_outgoing(work)))
+        .collect::<Vec<_>>();
+    registry
+        .lock()
+        .map_err(|_| anyhow!("reply readiness registry is poisoned"))?
+        .progress
+        .admit_classified(&classified)
+}
+
+#[cfg(test)]
 pub(super) fn register_outgoing_packet_ids(
     registry: &SharedRegistry,
     packet_ids: &[u32],
@@ -402,10 +456,14 @@ impl PendingReply {
             return Disposition::Wait;
         }
         // A previous matching wave may be settled while this original is
-        // unread behind unrelated traffic. Wait for verdicts through the
-        // kernel sequence captured on admission, not for a globally empty
-        // queue: subsequent traffic must not indefinitely extend this wait.
-        if !registry.progress.reached(&self.read_through) {
+        // unread behind unrelated traffic. First require classification through
+        // the captured kernel ID, then matching or unknown packets' verdicts.
+        // Known unrelated work need not finish; later work cannot extend this
+        // boundary. Only the repeated current kernel policy grants delivery.
+        if !registry
+            .progress
+            .reached_for_flow(&self.read_through, &self.packet.key)
+        {
             return Disposition::Wait;
         }
         registry.readiness(self, now)
@@ -805,6 +863,132 @@ mod tests {
             not_before: now,
             read_through: registry.progress.barrier_for_test(0),
         }
+    }
+
+    fn outgoing(packet_id: u32, key: &FlowKey) -> Result<QueuedPacketWork> {
+        Ok(QueuedPacketWork {
+            packet_id,
+            packet: Ok(super::super::QueuedPacket {
+                connection: crate::application::OutboundConnection {
+                    source_address: key.local,
+                    source_port: Some(key.local_port),
+                    destination_address: key.remote,
+                    destination_port: key.remote_port,
+                    protocol: key.protocol,
+                    output_interface: openshield_core::InterfaceName::new("eth0")?,
+                    socket_uid: 1000,
+                },
+                packet_mark: 7,
+                initial_observation: true,
+            }),
+        })
+    }
+
+    #[test]
+    fn received_flow_classification_preserves_unknowns_and_reply_protocols() -> Result<()> {
+        for protocol in [
+            TransportProtocol::Udp,
+            TransportProtocol::Icmp,
+            TransportProtocol::IcmpV6,
+        ] {
+            let mut expected = key(5000);
+            expected.protocol = protocol;
+            if protocol != TransportProtocol::Udp {
+                expected.remote_port = None;
+            }
+            let mut work = outgoing(1, &expected)?;
+            assert_eq!(classify_outgoing(&work), OutgoingFlow::Reply(expected));
+            work.packet
+                .as_mut()
+                .map_err(|error| anyhow!(error.clone()))?
+                .connection
+                .source_port = None;
+            assert_eq!(classify_outgoing(&work), OutgoingFlow::Unknown);
+        }
+        let mut tcp = key(5000);
+        tcp.protocol = TransportProtocol::Tcp;
+        assert_eq!(
+            classify_outgoing(&outgoing(1, &tcp)?),
+            OutgoingFlow::Unrelated
+        );
+        let mut incomplete = key(5000);
+        incomplete.remote_port = None;
+        assert_eq!(
+            classify_outgoing(&outgoing(1, &incomplete)?),
+            OutgoingFlow::Unknown
+        );
+        assert_eq!(
+            classify_outgoing(&QueuedPacketWork {
+                packet_id: 1,
+                packet: Err("unclassifiable packet".to_owned()),
+            }),
+            OutgoingFlow::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn classified_reply_skips_unrelated_verdicts_but_keeps_failures_and_policy_checks() -> Result<()>
+    {
+        let now = Instant::now();
+        for succeeded in [false, true] {
+            let registry = shared_registry(77)?;
+            let mut tcp = key(5001);
+            tcp.protocol = TransportProtocol::Tcp;
+            let packets = [
+                outgoing(1, &tcp)?,
+                outgoing(2, &key(5000))?,
+                outgoing(3, &key(5002))?,
+                QueuedPacketWork {
+                    packet_id: 4,
+                    packet: Err("unknown".to_owned()),
+                },
+            ];
+            register_outgoing_packets(&registry, &packets)?;
+            let mut registry = registry
+                .lock()
+                .map_err(|_| anyhow!("test registry poisoned"))?;
+            let ticket = registry.begin(key(5000), 1, now)?;
+            let mut reply = pending(key(5000), now, &registry);
+            reply.read_through = registry.progress.barrier_for_test(4);
+            registry.complete(&ticket, succeeded, now);
+            // A completed flow ticket is not yet an actual verdict.
+            assert_eq!(
+                reply.disposition(&mut registry, Mode::Enforcing, 1, false, now),
+                Disposition::Wait
+            );
+            registry.progress.complete(2)?;
+            assert_eq!(
+                reply.disposition(&mut registry, Mode::Enforcing, 1, false, now),
+                Disposition::Wait
+            );
+            registry.progress.complete(4)?;
+            assert!(!registry.progress.reached(&reply.read_through));
+            assert_eq!(
+                reply.disposition(&mut registry, Mode::Enforcing, 1, false, now),
+                if succeeded {
+                    Disposition::Repeat
+                } else {
+                    Disposition::Drop
+                }
+            );
+            for (mode, generation, stopping) in [
+                (Mode::BlockAll, 1, false),
+                (Mode::Learning, 1, false),
+                (Mode::Enforcing, 2, false),
+                (Mode::Enforcing, 1, true),
+            ] {
+                assert_eq!(
+                    reply.disposition(&mut registry, mode, generation, stopping, now),
+                    Disposition::Drop
+                );
+            }
+            assert_eq!(
+                reply.disposition(&mut registry, Mode::Enforcing, 1, false, now + LIFETIME),
+                Disposition::Drop
+            );
+        }
+        Ok(())
     }
 
     #[test]

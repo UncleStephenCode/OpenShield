@@ -218,22 +218,29 @@ attribution. If an earlier reply arrives during that interval, a bounded
 per-flow readiness registry can wait for already queued verdicts, then return
 `NF_REPEAT` to re-evaluate the current INPUT policy. It never returns `NF_ACCEPT`.
 On admission, the reply reader captures queue 1337's kernel packet sequence
-from bounded `/proc/self/net/netfilter/nfnetlink_queue` metadata. It waits for
-the outgoing reader to send verdicts through that fixed sequence,
-not for the entire outgoing queue to become empty. Later traffic, including
+from bounded `/proc/self/net/netfilter/nfnetlink_queue` metadata. It waits until
+the OUTPUT reader has received and classified packets through that fixed
+sequence. Within this boundary, matching UDP/ICMP flow packets and unclassified
+packets must have their actual verdicts sent; known unrelated TCP or UDP/ICMP
+flows may remain pending. Classification records only parsed scheduling tuples,
+never process identity or authorization. Later traffic, including
 new packets of the same flow, cannot extend this boundary or invalidate a
 reply merely by starting a new attribution batch. A recorded failure in the
 current flow still denies the retry. The netlink port and a private runtime epoch
 bind the boundary to this queue instance; malformed or unavailable metadata
 causes a reply to be dropped, not admitted. Before scheduling or issuing any
-verdict, the OUTPUT reader registers every received packet ID in kernel receive
-order, including malformed packets and TCP packets with no per-flow reply ticket.
-Verdicts may complete out of order, but only a completely finished admission
-prefix advances the watermark. The tracker has 1024 fixed-capacity slots;
+verdict, the OUTPUT reader atomically registers every received packet ID and its
+classification in kernel receive order, including malformed packets and TCP
+packets with no per-flow reply ticket. Verdicts may complete out of order. Only
+a completely finished admission prefix retires slots from the global tracker;
+flow-specific readiness never retires unrelated unfinished work. The tracker
+has 1024 fixed-capacity slots;
 completed later slots still consume capacity until earlier packets finish.
 Duplicate or unadmitted completions, replayed IDs, and ambiguous half-range serial
-arithmetic are rejected. Kernel ID gaps and rollover do not allow an admitted
-packet to be skipped. No received ID or completed slot is evicted to make room.
+arithmetic are rejected. Ordered receipt beyond a dropped-ID gap covers that
+gap without inventing a verdict; an admitted matching or unclassified packet
+within the boundary still has to finish, including across rollover. No received
+ID or completed slot is evicted to make room.
 This prevents a completed old flow entry from releasing a reply while an
 already queued outgoing packet is still unread behind another attribution batch.
 The two reserved packet-mark bits count at most three retries while preserving
@@ -244,8 +251,8 @@ Missing/failed/expired readiness, policy-generation changes,
 and overload remain fail-closed. This narrows the mark-reset loss window; it is
 not a per-request UDP authorization cache or a guarantee of lossless overload.
 Attribution overload and repeated mark resets on the same flow can still
-exhaust the bounded wait; removing the global empty-queue condition does not
-make per-packet attribution a kernel fast path.
+exhaust the bounded wait. Flow-specific reply waiting does not remove the
+request's own attribution or OUTPUT intake backpressure.
 
 Command arguments retain their exact UTF-8 bytes and token boundaries, including
 newlines and formatting characters. Each argument can occupy up to 8191 bytes;
@@ -367,7 +374,19 @@ target inode for that UID is confirmed by an exact link and repeated filesystem
 UID check. Any missing target, mismatch, or read error falls back to the complete
 bounded fd-table scan. That scan preserves a verified preferred fd when a socket
 has duplicate descriptors, keeping before/after snapshots comparable. Hints are
-not retained across batches.
+not retained across batches. The final owner snapshot also borrows positive
+descriptor names from the first snapshot of the same batch, keyed by TGID, TID,
+socket UID, and inode. It enumerates all tasks again and freshly checks each
+task's UID and every hinted link. A miss uses the full bounded fd walk, and
+tasks without positive evidence are still checked exhaustively; no negative
+owner result or identity is reused. Task-specific names keep duplicate-fd
+selection stable without assuming that sibling tasks share their fd tables.
+
+Fresh filesystem-UID checks read `status` into an 8 KiB stack buffer, allocating
+bounded overflow storage only for larger files. The reader still consumes the
+whole file and retains the 256 KiB limit, UTF-8 validation, and checks for read
+errors and the original deadline; a valid UID prefix cannot hide an invalid or
+oversized suffix.
 
 The full fd walk pins an opened directory, rewinds it before each scan, and uses
 safe `rustix` `RawDir`/`readlinkat_raw` with reusable bounded buffers. Negative fd
@@ -386,8 +405,9 @@ independent attribution workers; when both are active, up to four scanning
 threads may run in the daemon. Whole TGIDs are assigned in PID order to the
 currently less-loaded worker by task count; this spreads sequential PID/UID
 clusters without inferring a task's filesystem UID from its leader. A single
-large process remains serial. Each worker retains only
-its own verified scan-local fd hints. Negative fd scans need no shared lock;
+large process remains serial. Each worker retains its own verified scan-local
+fd hints and can read the batch's task-specific first-snapshot hints during
+the final snapshot. Negative fd scans need no shared lock;
 positive records enter one mutex-protected owner/ambiguity accumulator, with one
 global record cap, not a cap per worker. Both workers share the original
 absolute deadline and join before a snapshot can be used. Spawn, join, poisoned

@@ -228,7 +228,7 @@ Learning application-deny envelope, ambiguity, a changed owner snapshot, a misse
 deadline, or an exceeded bound denies the affected packet. On observational
 queue 1338 it prevents persistence, not Learning's ordinary allow decision.
 Pinned fd-directory handles, reusable directory/link buffers, and verified
-scan-local fd-number hints reduce filesystem lookup and allocation overhead;
+batch-local fd-number hints reduce filesystem lookup and allocation overhead;
 they do not replace either complete owner snapshot. There is no cross-batch
 identity or authorization cache, so otherwise-unmatched Enforcing UDP/ICMP
 traffic is attributed again in every later batch.
@@ -238,9 +238,13 @@ At most 128 packets are waiting or in flight in userspace, with one batch of at
 most 32 being resolved. Round-robin scheduling between socket UIDs and flows uses
 a four-packet quantum; these keys affect scheduling, never authorization. Safe
 decisions that need no process identity are returned at dispatch without waiting
-for that batch's procfs scan. Reply progress advances only over received packet
-IDs whose actual verdicts are all complete; reordering never skips unresolved
-packets. Policy mode, generation and shutdown are checked again before sending.
+for that batch's procfs scan. A reply waits until OUTPUT has received and
+classified packets through its fixed kernel sequence boundary, and actual
+verdicts for the matching flow and all unclassified packets through that boundary
+are complete. Known unrelated flows do not delay it. The global completed prefix
+still controls bounded slot retirement. Release uses only `NF_REPEAT`, not an
+allow verdict; current kernel policy decides delivery. Policy mode, generation
+and shutdown are checked again before sending.
 The journal's `application attribution stage timings` aggregates report bounded
 stage wall times about every ten seconds during activity, without process names,
 arguments or network addresses. This is diagnostic evidence, not a claim that
