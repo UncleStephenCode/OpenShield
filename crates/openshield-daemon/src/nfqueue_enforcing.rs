@@ -26,6 +26,45 @@ struct Job {
     deadline: Instant,
 }
 
+struct ImmediatePacket {
+    work: QueuedPacketWork,
+    ticket: Option<reply::OutgoingTicket>,
+    decision: Result<PacketAuthorization>,
+    timed_out: bool,
+}
+
+impl Job {
+    fn admit(
+        &mut self,
+        snapshot: &ApplicationDecisionPolicy,
+        work: QueuedPacketWork,
+        ticket: Option<reply::OutgoingTicket>,
+        deadline: Instant,
+        now: Instant,
+    ) -> Option<ImmediatePacket> {
+        let timed_out = now >= deadline;
+        let immediate = if timed_out {
+            Some(Err(anyhow!("bounded application queue wait timed out")))
+        } else {
+            immediate_decision(snapshot, &work)
+        };
+        if let Some(decision) = immediate {
+            return Some(ImmediatePacket {
+                work,
+                ticket,
+                decision,
+                timed_out,
+            });
+        }
+        // Only packets that need attribution may constrain its shared budget.
+        // Preserve every admitted packet's original receive-time deadline.
+        self.deadline = self.deadline.min(deadline);
+        self.batch.push(work);
+        self.tickets.push(ticket);
+        None
+    }
+}
+
 struct Completion {
     job: Job,
     decisions: Vec<Result<PacketAuthorization>>,
@@ -247,18 +286,14 @@ impl Runtime<'_> {
         errors: &mut ErrorThrottle,
     ) -> Result<usize> {
         let selected = pending.take_batch();
-        let mut deadline = Instant::now() + DECISION_BUDGET;
         let mut batch = Vec::with_capacity(selected.len());
-        let mut expired = Vec::with_capacity(selected.len());
+        let mut deadlines = Vec::with_capacity(selected.len());
         for pending in selected {
             let elapsed = pending.received.elapsed();
             let timed_out = elapsed >= DECISION_BUDGET;
             record_elapsed(TimingStage::QueueWait, elapsed, 1, usize::from(timed_out));
-            if !timed_out {
-                deadline = deadline.min(pending.received + DECISION_BUDGET);
-            }
             batch.push(pending.work);
-            expired.push(timed_out);
+            deadlines.push(pending.received + DECISION_BUDGET);
         }
         // Only one wave (<=32 packets) is dispatched at a time. All previous
         // wave verdicts have been sent before beginning these flow tickets.
@@ -272,20 +307,21 @@ impl Runtime<'_> {
         let mut job = Job {
             batch: Vec::new(),
             tickets: Vec::new(),
-            deadline,
+            deadline: Instant::now() + DECISION_BUDGET,
         };
-        for ((packet, ticket), expired) in batch.into_iter().zip(tickets).zip(expired) {
-            let immediate = if expired {
-                self.counters.record_attribution_timeout();
-                Some(Err(anyhow!("bounded application queue wait timed out")))
-            } else {
-                immediate_decision(&snapshot, &packet)
-            };
-            if let Some(decision) = immediate {
-                self.verdict(queue, packet, decision, ticket, errors)?;
-            } else {
-                job.batch.push(packet);
-                job.tickets.push(ticket);
+        for ((packet, ticket), deadline) in batch.into_iter().zip(tickets).zip(deadlines) {
+            if let Some(immediate) = job.admit(&snapshot, packet, ticket, deadline, Instant::now())
+            {
+                if immediate.timed_out {
+                    self.counters.record_attribution_timeout();
+                }
+                self.verdict(
+                    queue,
+                    immediate.work,
+                    immediate.decision,
+                    immediate.ticket,
+                    errors,
+                )?;
             }
         }
         let count = job.batch.len();
@@ -382,7 +418,76 @@ fn immediate_decision(
 
 #[cfg(test)]
 mod tests {
+    use openshield_core::{
+        ApplicationPath, ApplicationSelector, Direction, ExecutableFileId, InterfaceName, Mode,
+        PortRange, RuleName, RuleOrigin, RuleSpec, State, TransportProtocol,
+        application_pending_mark,
+    };
+
     use super::*;
+    use crate::application::OutboundConnection;
+    use crate::nfqueue::QueuedPacket;
+
+    fn policy() -> Result<ApplicationDecisionPolicy> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        for (port, application) in [(443, true), (80, false)] {
+            let mut rule = RuleSpec::new(
+                RuleName::new(format!("allow {port}"))?,
+                Direction::Outbound,
+                TransportProtocol::Tcp,
+                None,
+                Some(PortRange::single(port)?),
+                None,
+                RuleOrigin::Manual,
+                true,
+            )?;
+            if application {
+                rule.application = Some(ApplicationSelector::new(
+                    Some(ApplicationPath::new("/usr/bin/test-client")?),
+                    Some(ExecutableFileId {
+                        device: 1,
+                        inode: 2,
+                        size: 3,
+                        ctime_seconds: 4,
+                        ctime_nanoseconds: 5,
+                    }),
+                    None,
+                    Some(1000),
+                    None,
+                )?);
+            }
+            state.create_rule(rule)?;
+        }
+        Ok(ApplicationDecisionPolicy::new(state.snapshot()))
+    }
+
+    fn packet(id: u32, port: u16) -> Result<QueuedPacketWork> {
+        Ok(QueuedPacketWork {
+            packet_id: id,
+            packet: Ok(QueuedPacket {
+                connection: OutboundConnection {
+                    source_address: "192.0.2.1".parse()?,
+                    source_port: Some(50000),
+                    destination_address: "203.0.113.1".parse()?,
+                    destination_port: Some(port),
+                    protocol: TransportProtocol::Tcp,
+                    output_interface: InterfaceName::new("eth0")?,
+                    socket_uid: 1000,
+                },
+                packet_mark: application_pending_mark(0),
+                initial_observation: true,
+            }),
+        })
+    }
+
+    fn job(now: Instant) -> Job {
+        Job {
+            batch: Vec::new(),
+            tickets: Vec::new(),
+            deadline: now + DECISION_BUDGET,
+        }
+    }
 
     #[test]
     fn intake_reserves_a_full_datagram_including_in_flight_work() {
@@ -391,5 +496,79 @@ mod tests {
         assert!(!can_receive(64, 32, 31));
         assert!(!can_receive(usize::MAX, 32, 1024));
         assert!(can_receive(0, 0, 32));
+    }
+
+    #[test]
+    fn old_immediate_packets_do_not_shorten_fresh_attribution_deadline() -> Result<()> {
+        let policy = policy()?;
+        let now = Instant::now();
+        let old_deadline = now + Duration::from_millis(1);
+        let fresh_deadline = now + DECISION_BUDGET;
+        let malformed = QueuedPacketWork {
+            packet_id: 1,
+            packet: Err("malformed packet".to_owned()),
+        };
+        for (old, accepted) in [
+            (malformed, false),
+            (packet(2, 22)?, false),
+            (packet(3, 80)?, true),
+        ] {
+            let mut job = job(now);
+            let immediate = job
+                .admit(&policy, old, None, old_deadline, now)
+                .ok_or_else(|| anyhow!("old packet unexpectedly requires attribution"))?;
+            assert_eq!(immediate.decision.is_ok(), accepted);
+            assert!(!immediate.timed_out);
+            assert!(
+                job.admit(&policy, packet(4, 443)?, None, fresh_deadline, now)
+                    .is_none()
+            );
+            assert_eq!(job.batch.len(), 1);
+            assert_eq!(job.batch[0].packet_id, 4);
+            assert_eq!(job.tickets.len(), 1);
+            assert_eq!(job.deadline, fresh_deadline);
+            // Finishing after the old packet's deadline still leaves the
+            // attributed packet within its own unchanged two-second ceiling.
+            assert!(old_deadline + Duration::from_millis(1) < job.deadline);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn attribution_batch_keeps_earliest_admitted_packet_deadline() -> Result<()> {
+        let policy = policy()?;
+        let now = Instant::now();
+        let mut job = job(now);
+        let earlier = now + Duration::from_millis(100);
+        assert!(
+            job.admit(&policy, packet(1, 443)?, None, now + DECISION_BUDGET, now)
+                .is_none()
+        );
+        assert!(
+            job.admit(&policy, packet(2, 443)?, None, earlier, now)
+                .is_none()
+        );
+        assert_eq!(job.deadline, earlier);
+        assert_eq!(job.batch.len(), 2);
+        assert_eq!(job.tickets.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_rechecks_expiry_before_attribution_or_immediate_accept() -> Result<()> {
+        let policy = policy()?;
+        let now = Instant::now();
+        for port in [443, 80] {
+            let mut job = job(now);
+            let expired = job
+                .admit(&policy, packet(1, port)?, None, now, now)
+                .ok_or_else(|| anyhow!("expired packet unexpectedly requires attribution"))?;
+            assert!(expired.timed_out);
+            assert!(expired.decision.is_err());
+            assert!(job.batch.is_empty());
+            assert!(job.tickets.is_empty());
+            assert_eq!(job.deadline, now + DECISION_BUDGET);
+        }
+        Ok(())
     }
 }
