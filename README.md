@@ -137,6 +137,52 @@ from restoring Learning. A recoverable save failure retains the previous state
 and pauses automatic persistence; an unsafe outcome enters fail-closed
 `BlockAll` quarantine.
 
+## Strict and Fast enforcement
+
+The mode menu is `m` → `3. Enforcing` → `3.1 Fast` or `3.2 Strict`;
+there is no separate `S` shortcut. Only root can select a strategy, and Fast
+requires explicit confirmation of its weaker ownership guarantee. Strict is
+the default. Learning and BlockAll keep their existing behavior and use the
+strict attribution path where attribution is needed; a remembered Fast choice
+is effective only in Enforcing. A legacy `SetMode(Enforcing)` selects Strict.
+
+Fast keeps up to 256 positive process-owner hints per resolver for 30 seconds
+after a fully successful Strict attribution batch; cache hits do not extend that lifetime.
+Each queued attribution request still gets fresh socket resolution: `SOCK_DIAG` for TCP/UDP and
+the existing procfs lookup for ICMP/ICMPv6. The hinted owner is checked
+again using its socket fd, UID, TGID/TID, process start time, executable path and
+file version, plus argv/cgroup when the policy requires them. Two owner passes
+and race-checked metadata capture remain, but those owner passes inspect only
+cached TGIDs. A miss, expiry, ambiguity, or failed validation clears the hints
+before falling back to Strict; only a fully successful Strict batch reseeds them.
+Packet verdicts are never cached: current rules, actions, and policy
+generation still determine the decision.
+
+This is a deliberate security/performance tradeoff, not an equivalent
+optimization of Strict. A new uncached owner of a shared socket—for example
+after `fork` or `SCM_RIGHTS` transfer—can remain outside Fast's owner search.
+The 30-second lifetime bounds a hint, not the time until all owners are found:
+a Strict lookup of another socket can seed that process again.
+Even a same-UID extra owner that Strict would detect
+may then be missed. Use Strict when exhaustive matching-UID owner discovery
+is required. Neither strategy proves which holder actually sent a shared socket's
+packet. No measured CPU or latency improvement is claimed for this new path.
+
+Both strategies use the same nftables/iptables, NFQUEUE, and conntrack-generation
+policy; Fast adds no queue bypass, kernel module, or new kernel requirement.
+`StatusV4` and the TUI expose the remembered strategy separately from backend,
+mode, and L1/L2/L3 classification. State omits `enforcement_strategy` for Strict
+and stores `"fast"` for Fast. Older daemons reject that new field: before
+downgrading, select Strict as root with the current daemon and verify that it
+was persisted. All existing protected-console and state-backup precautions
+still apply.
+
+The idea of narrowing repeated process searches was informed by the local
+OpenSnitch revision named above, especially
+`../opensnitch/daemon/procmon/find.go` and
+`../opensnitch/daemon/procmon/cache.go` in the sibling checkout. This is not a
+line-for-line copy or a claim of identical cache semantics.
+
 ## Dynamic active-policy path
 
 Since OpenShield 0.1.31, the daemon reports a dynamically recomputed
@@ -245,6 +291,8 @@ in Enforcing is tied to a persisted 30-bit policy
 generation that increases by one and is not reused before exhaustion; UDP and
 ICMP are re-attributed for every otherwise-unmatched outbound packet.
 
+The exhaustive-owner discovery below describes Strict and Learning; Fast uses
+the explicitly narrower owner search described above.
 Since v0.1.32, fail-closed decisions and asynchronous Learning observations can
 be attributed in bounded batches of at most 32 already-ready items; neither path
 waits to fill a batch. Each item still gets an independent `SOCK_DIAG` socket
@@ -266,7 +314,7 @@ deadline, or an exceeded bound denies the affected packet. On observational
 queue 1338 it prevents persistence, not Learning's ordinary allow decision.
 Pinned fd-directory handles, reusable directory/link buffers, and verified
 batch-local fd-number hints reduce filesystem lookup and allocation overhead;
-they do not replace either complete owner snapshot. There is no cross-batch
+they do not replace either complete owner snapshot in Strict. Strict has no cross-batch
 identity or authorization cache, so otherwise-unmatched Enforcing UDP/ICMP
 traffic is attributed again in every later batch.
 
@@ -420,8 +468,8 @@ inbound traffic not matched by an enabled inbound allow or an exact built-in
 host-bootstrap/control exception remains denied; Block All overrides every rule
 and contains no such exception. Stateful replies follow the policy-mode rules above,
 including only the narrowly authenticated native `Reject` replies in
-`Enforcing`. `m` opens the mode selector from any
-tab. Mode changes and every rule mutation require root. A non-root member of
+`Enforcing`. `m` opens the mode selector from any tab; its Enforcing entry
+opens the Fast/Strict submenu described above. Mode changes and every rule mutation require root. A non-root member of
 the `openshield` group can use the same navigation for read-only monitoring,
 but receives server-redacted application identity and cannot mutate policy.
 

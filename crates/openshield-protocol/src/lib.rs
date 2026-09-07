@@ -6,7 +6,8 @@ use std::io::{self, Read, Write};
 
 use ipnet::IpNet;
 use openshield_core::{
-    ApplicationInterception, ApplicationPath, CgroupPath, Direction, Event, Mode, Rule, RuleSpec,
+    ApplicationInterception, ApplicationPath, CgroupPath, Direction, EnforcementStrategy, Event,
+    Mode, Rule, RuleSpec,
 };
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeStruct;
@@ -323,6 +324,9 @@ pub enum ReadRequest {
     /// Returns `StatusV2` fields plus aggregate learning quotas. Older status
     /// response shapes remain unchanged for existing observers.
     StatusV3,
+    /// Returns `StatusV3` fields plus the remembered userspace enforcement strategy.
+    /// Existing status and event wire shapes remain unchanged.
+    StatusV4,
     /// Returns rules ordered by UUID strictly after `after`.
     ///
     /// `limit` is a bounded client hint. Servers may choose any positive page
@@ -345,6 +349,11 @@ pub enum ControlRequest {
     SetMode {
         expected_revision: u64,
         mode: Mode,
+    },
+    /// Atomically selects Enforcing with an explicit userspace strategy.
+    SetEnforcement {
+        expected_revision: u64,
+        strategy: EnforcementStrategy,
     },
     CreateRule {
         expected_revision: u64,
@@ -448,6 +457,9 @@ impl ControlRequest {
             Self::SetMode {
                 expected_revision, ..
             }
+            | Self::SetEnforcement {
+                expected_revision, ..
+            }
             | Self::CreateRule {
                 expected_revision, ..
             }
@@ -502,6 +514,16 @@ pub enum Response {
         nfqueue: NfqueueCounters,
         runtime_compatibility: RuntimeCompatibility,
         learning: LearningStatus,
+    },
+    StatusV4 {
+        revision: u64,
+        mode: Mode,
+        rule_count: u32,
+        backend: FirewallBackendKind,
+        nfqueue: NfqueueCounters,
+        runtime_compatibility: RuntimeCompatibility,
+        learning: LearningStatus,
+        enforcement_strategy: EnforcementStrategy,
     },
     RulesPage {
         revision: u64,
@@ -889,6 +911,48 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_request_round_trip_preserves_strategy_and_revision() -> Result<(), Box<dyn Error>>
+    {
+        for strategy in [EnforcementStrategy::Strict, EnforcementStrategy::Fast] {
+            let control = ControlRequest::SetEnforcement {
+                expected_revision: 41,
+                strategy,
+            };
+            assert_eq!(control.expected_revision(), 41);
+            let request = Request::Control(control);
+            let mut bytes = Vec::new();
+            write_request(&mut bytes, &request)?;
+            assert_eq!(read_request(&mut Cursor::new(bytes))?, request);
+            let value = serde_json::to_value(&request)?;
+            assert_eq!(value["data"]["type"], "set_enforcement");
+            assert_eq!(
+                value["data"]["data"]["strategy"],
+                if strategy.is_strict() {
+                    "strict"
+                } else {
+                    "fast"
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_request_rejects_missing_unknown_and_ambiguous_strategy() {
+        for payload in [
+            r#"{"type":"set_enforcement","data":{"expected_revision":1}}"#,
+            r#"{"type":"set_enforcement","data":{"expected_revision":1,"strategy":"auto"}}"#,
+            r#"{"type":"set_enforcement","data":{"expected_revision":1,"strategy":"Fast"}}"#,
+            r#"{"type":"set_enforcement","data":{"expected_revision":1,"strategy":null}}"#,
+            r#"{"type":"set_enforcement","data":{"expected_revision":1,"strategy":"fast","mode":"learning"}}"#,
+            r#"{"type":"set_enforcement","data":{"expected_revision":1,"strategy":"fast","strategy":"strict"}}"#,
+            r#"{"type":"set_enforcement","data":{"strategy":"fast"}}"#,
+        ] {
+            assert!(serde_json::from_str::<ControlRequest>(payload).is_err());
+        }
+    }
+
+    #[test]
     fn outbound_group_requests_round_trip_all_scopes_and_actions() -> Result<(), Box<dyn Error>> {
         let executable = ApplicationPath::new("/usr/bin/client")?;
         let cgroup = CgroupPath::new("/system.slice/client.service")?;
@@ -1112,6 +1176,67 @@ mod tests {
         let mut value = serde_json::to_value(&response)?;
         value["data"]["learning"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Response>(value).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn status_v4_round_trip_requires_strategy_and_preserves_v3_shape() -> Result<(), Box<dyn Error>>
+    {
+        let request = Request::Read(ReadRequest::StatusV4);
+        let mut request_bytes = Vec::new();
+        write_request(&mut request_bytes, &request)?;
+        assert_eq!(read_request(&mut Cursor::new(request_bytes))?, request);
+        let learning = LearningStatus {
+            per_uid_limit: 4_096,
+            per_application_limit: 1_024,
+            automatic_rule_limit: 7_500,
+            total_rule_limit: 10_000,
+            automatic_rules: 0,
+            saturated_uids: 0,
+            saturated_applications: 0,
+            quota_skipped_observations: u64::MAX,
+        };
+        let legacy = Response::StatusV3 {
+            revision: 9,
+            mode: Mode::Enforcing,
+            rule_count: 0,
+            backend: FirewallBackendKind::Nftables,
+            nfqueue: NfqueueCounters::default(),
+            runtime_compatibility: RuntimeCompatibility::default(),
+            learning,
+        };
+        let legacy_value = serde_json::to_value(&legacy)?;
+        assert!(legacy_value["data"].get("enforcement_strategy").is_none());
+        for strategy in [EnforcementStrategy::Strict, EnforcementStrategy::Fast] {
+            let response = Response::StatusV4 {
+                revision: 9,
+                mode: Mode::Enforcing,
+                rule_count: 0,
+                backend: FirewallBackendKind::Nftables,
+                nfqueue: NfqueueCounters::default(),
+                runtime_compatibility: RuntimeCompatibility::default(),
+                learning,
+                enforcement_strategy: strategy,
+            };
+            let mut bytes = Vec::new();
+            write_response(&mut bytes, &response)?;
+            assert!(bytes.len() < 1_024);
+            assert_eq!(read_response(&mut Cursor::new(bytes))?, response);
+            let mut value = serde_json::to_value(&response)?;
+            value["data"]
+                .as_object_mut()
+                .ok_or("missing status data")?
+                .remove("enforcement_strategy");
+            assert!(serde_json::from_value::<Response>(value.clone()).is_err());
+            value["type"] = serde_json::json!("status_v3");
+            assert_eq!(value, legacy_value);
+            assert_eq!(serde_json::from_value::<Response>(value)?, legacy);
+            for invalid in [serde_json::json!("auto"), serde_json::json!(null)] {
+                let mut value = serde_json::to_value(&response)?;
+                value["data"]["enforcement_strategy"] = invalid;
+                assert!(serde_json::from_value::<Response>(value).is_err());
+            }
+        }
         Ok(())
     }
 

@@ -28,7 +28,7 @@ pub use iptables::{
 };
 pub use learning_limits::{LearningLimits, LearningLimitsError, LearningQuotaSummary};
 pub use model::{
-    CounterValue, Direction, FirewallCounters, InterfaceName, LearnedEndpoint,
+    CounterValue, Direction, EnforcementStrategy, FirewallCounters, InterfaceName, LearnedEndpoint,
     MAX_INTERFACE_NAME_BYTES, MAX_RULE_NAME_BYTES, Mode, PortRange, Rule, RuleAction, RuleName,
     RuleOrigin, RuleSpec, TransportProtocol, ValidationError,
 };

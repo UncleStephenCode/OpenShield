@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "高速",
+  "enforcement.strict": "厳格",
+  "enforcement.title": " ルール適用方式 ",
+  "enforcement.unavailable": "高速は利用できません。デーモンが方式の選択に非対応か、状態の取得待ちです。",
+  "enforcement.fast_confirm": " 高速を有効にしますか？ ",
+  "enforcement.fast_warning": "高速はプロセスのヒントを使います。共有・譲渡されたソケットの他の所有者を検出できない場合があります。ソケット、プロセスの識別情報、ルールは再確認します。所有者を網羅的に検索するには厳格を選んでください。\n\nY：リスクを承諾して有効化  N/Enter/Esc：取消",
+  "enforcement.hint": "1/2、↑/↓：選択  Enter：次へ  Esc：戻る",
   "learning.limits": "学習上限：UID {uid}、アプリ {application}、自動ルール {automatic}、合計 {total}",
   "learning.counts": "自動ルール：{rules}、上限に達した UID/アプリ：{uids}/{applications}",
   "learning.skipped": "デーモン起動後に割り当て上限のため省略した観測：{skipped}",

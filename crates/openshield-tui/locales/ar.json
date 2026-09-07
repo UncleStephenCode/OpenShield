@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "سريع",
+  "enforcement.strict": "صارم",
+  "enforcement.title": " تطبيق القواعد ",
+  "enforcement.unavailable": "السريع غير متاح: الخدمة لا تدعم اختيار الاستراتيجية أو الحالة قيد الانتظار.",
+  "enforcement.fast_confirm": " تفعيل السريع؟ ",
+  "enforcement.fast_warning": "السريع يستخدم قرائن عن العمليات. قد لا يُكتشف مالكون آخرون للمقابس المشتركة أو المنقولة. يستمر التحقق من المقبس وهوية العملية والقواعد. اختر الصارم للبحث الكامل عن المالكين.\n\nY: قبول الخطر والتفعيل  N/Enter/Esc: إلغاء",
+  "enforcement.hint": "1/2، ↑/↓: اختيار  Enter: متابعة  Esc: رجوع",
   "learning.limits": "حدود التعلم: UID {uid}؛ التطبيق {application}؛ التلقائية {automatic}؛ الإجمالي {total}",
   "learning.counts": "القواعد التلقائية: {rules}؛ معرّفات UID/التطبيقات التي بلغت الحد: {uids}/{applications}",
   "learning.skipped": "الملاحظات المتجاوزة بسبب الحصص منذ بدء الخدمة: {skipped}",

@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Rapide",
+  "enforcement.strict": "Rigoureux",
+  "enforcement.title": " Application des règles ",
+  "enforcement.unavailable": "Rapide indisponible : le démon ne gère pas ce choix ou le statut est en attente.",
+  "enforcement.fast_confirm": " Activer Rapide ? ",
+  "enforcement.fast_warning": "Rapide utilise des indications sur les processus. D’autres propriétaires de sockets partagés ou transférés peuvent rester inconnus. Socket, identité du processus et règles restent vérifiés. Rigoureux recherche tous les propriétaires.\n\nY : accepter le risque et activer  N/Enter/Esc : annuler",
+  "enforcement.hint": "1/2, ↑/↓ : choisir  Enter : continuer  Esc : retour",
   "learning.limits": "Limites d’apprentissage : UID {uid} ; application {application} ; automatiques {automatic} ; total {total}",
   "learning.counts": "Règles automatiques : {rules} ; UID/applications à la limite : {uids}/{applications}",
   "learning.skipped": "Observations ignorées à cause des quotas depuis le démarrage du démon : {skipped}",

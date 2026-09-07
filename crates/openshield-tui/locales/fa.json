@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "سریع",
+  "enforcement.strict": "سختگیرانه",
+  "enforcement.title": " اعمال قواعد ",
+  "enforcement.unavailable": "سریع در دسترس نیست: دیمن انتخاب راهبرد را پشتیبانی نمی‌کند یا وضعیت هنوز دریافت نشده است.",
+  "enforcement.fast_confirm": " فعال کردن سریع؟ ",
+  "enforcement.fast_warning": "سریع از سرنخ‌های فرایند استفاده می‌کند. ممکن است مالکان دیگر سوکت‌های مشترک یا منتقل‌شده شناسایی نشوند. سوکت، هویت فرایند و قواعد همچنان بررسی می‌شوند. برای جستجوی کامل مالکان، سختگیرانه را انتخاب کنید.\n\nY: پذیرش خطر و فعال کردن  N/Enter/Esc: لغو",
+  "enforcement.hint": "1/2، ↑/↓: انتخاب  Enter: ادامه  Esc: بازگشت",
   "learning.limits": "محدودیت‌های یادگیری: UID {uid}؛ برنامه {application}؛ خودکار {automatic}؛ کل {total}",
   "learning.counts": "قواعد خودکار: {rules}؛ UID/برنامه‌های رسیده به سقف: {uids}/{applications}",
   "learning.skipped": "مشاهدات نادیده گرفته‌شده به دلیل سهمیه از شروع دیمن: {skipped}",

@@ -152,6 +152,41 @@ The normative boundary is defined by the
   Verdict delivery is nonblocking, and a terminal send error requests emergency
   `BlockAll` instead of indefinitely retaining the policy lock.
 
+### Explicit Strict/Fast enforcement strategy
+
+Strict remains the default. Root may choose Fast through `m` → `3. Enforcing`
+→ `3.1 Fast` / `3.2 Strict`; Fast has an explicit risk confirmation, not an
+`S` shortcut. The implementation retains up to 256 positive owner
+UID/TGID/TID/start-time hints per resolver with a fixed 30-second lifetime since
+a fully successful Strict attribution batch, without renewing it on hits.
+Socket resolution for each queued attribution request
+(`SOCK_DIAG` for TCP/UDP, procfs for ICMP/ICMPv6),
+fd/UID/process-start/executable-version checks and required
+argv/cgroup capture stay fresh. Both owner passes search only hinted TGIDs;
+misses, expiry, errors, or detected ambiguity clear the hints before the Strict
+fallback. Only a fully successful Strict batch reseeds them.
+Rule matching, actions, revocation, and current generation remain mandatory.
+There is no cached authorization verdict or change to NFQUEUE bypass flags,
+backend rules, or conntrack acceleration.
+
+Fast deliberately weakens exhaustive-owner guarantees. A new same-UID holder
+of a shared, inherited, or `SCM_RIGHTS`-transferred socket outside the hints
+can be missed; checking the known process again does not detect every competing
+holder. Hint TTL is not a discovery deadline: a Strict lookup of another socket
+can seed that process again. It must not be described as security-equivalent to
+Strict. The local OpenSnitch `daemon/procmon/find.go` and `cache.go` at
+revision `a1353848ba1b660320e90cefea782c3fba272c00` informed the search/cache
+idea, not an identical implementation. Performance gains require separate
+measurements and are not asserted by this change.
+
+Learning and BlockAll do not use Fast, even when it is remembered. The new
+`SetEnforcement` control uses root authorization and expected revision;
+successful strategy selection advances revision and flow generation.
+`StatusV4` adds the remembered strategy without changing older status or
+event shapes. Strict omits the state field, missing state data defaults to
+Strict, and older daemons reject a state that explicitly stores Fast. Root
+must persist Strict with the current daemon before a downgrade.
+
 ### Application identity and learning
 
 - An outbound persisted application selector requires a canonical absolute
@@ -165,7 +200,7 @@ The normative boundary is defined by the
   five version fields to remain stable. It fills an omitted pin and rejects a
   stale supplied pin. Older two-field persisted application identities are
   rejected rather than silently repinned; network-only state is unaffected.
-- Attribution maps the queued packet tuple and kernel UID to one socket inode
+- Strict attribution maps the queued packet tuple and kernel UID to one socket inode
   and one stable process identity. Every attribution attempt that reaches owner
   resolution receives a fresh bounded enumeration of external PID/TID entries;
   no userspace cross-packet identity or authorization-result cache was introduced.
@@ -209,7 +244,7 @@ The normative boundary is defined by the
   entries. Truncated links cannot satisfy the socket-inode parser. Scan-local
   descriptor hints skip a full walk only after every target inode for that UID
   is revalidated; fallback preserves a verified preferred descriptor for sockets
-  with duplicate fds. Both complete owner snapshots, thread/UID checks,
+  with duplicate fds. In Strict, both complete owner snapshots, thread/UID checks,
   executable pins, race revalidation, and all work bounds remain mandatory.
   This adds no PID authorization cache, eBPF tier, kernel module, `CAP_BPF`, or
   MOK/boot configuration requirement. Selector-mismatch diagnostics report
@@ -639,8 +674,9 @@ Commands and exact interpretation are documented in
   not the worst-case scan size.
   Intra-batch metadata grouping is keyed by TGID/TID, task path, socket UID, and
   capture requirements. Per-socket FD checks, mandatory-identity consensus,
-  and unchanged ownership remain required; nothing is
-  cached across batches. These optimizations do not alter worst-case complexity. A
+  and unchanged ownership remain required; in Strict, nothing is
+  cached across batches. Fast's separate bounded owner hints and their weaker
+  discovery guarantee are described above. These optimizations do not alter worst-case complexity. A
   sustained packet stream or hostile procfs cardinality can still saturate the
   active consumer and deny legitimate application-bound traffic in `Enforcing`.
   The
@@ -685,7 +721,7 @@ Commands and exact interpretation are documented in
   code attestation.
 - argv and cgroup are mutable metadata. On cgroup v1, application attribution
   remains available, but exact cgroup-path selectors cannot match.
-- Stable shared, inherited, or `SCM_RIGHTS`-passed descriptors are denied when
+- In Strict, stable shared, inherited, or `SCM_RIGHTS`-passed descriptors are denied when
   they create ambiguity among matching-UID TGIDs, but procfs fallback is not
   proof of which process performed the actual send. A cross-UID recipient is
   skipped before fd inspection; without an original matching-UID holder the
@@ -693,6 +729,10 @@ Commands and exact interpretation are documented in
   invisible and the original holder can be attributed. After an established TCP flow is authorized,
   identity is not recaptured for every packet; a later exec or fd transfer can
   retain the connection until reconnection or policy-generation change.
+- Fast additionally permits a gap in matching-UID ambiguity discovery: an
+  uncached new shared-socket holder has no guaranteed discovery deadline.
+  Current rules still apply to the freshly checked known holder,
+  which is not equivalent to establishing the actual sender.
 - `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` materially expand the impact of a
   daemon compromise. The syscall deny list does not prevent ordinary I/O to a
   successfully opened `/proc/pid/mem` or every traversal through procfs magic

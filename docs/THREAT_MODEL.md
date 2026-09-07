@@ -35,6 +35,38 @@
     active and stops startup. A live read-only emergency quarantine is reported
     as `EmergencyBlockAll`, not as a healthy operator-selected `BlockAll`.
 
+## Explicit Fast-strategy exception
+
+Strict is the default. Root can explicitly select Fast in the Enforcing submenu
+after acknowledging a weaker socket-owner discovery guarantee. Fast caches at
+most 256 positive UID/TGID/TID/start-time hints per resolver for 30 seconds since
+a fully successful Strict attribution batch; hits never renew their lifetime.
+Each queued attribution request retains fresh
+socket resolution (`SOCK_DIAG` for TCP/UDP, procfs for ICMP/ICMPv6),
+fd/UID/start-time/executable checks, required argv/cgroup capture,
+and current rule/action/generation checks remain. Both owner passes are limited
+to hinted TGIDs; misses, expiry, errors, or detected ambiguity clear the hints
+before falling back to Strict. Only a fully successful Strict batch reseeds them.
+There is no verdict cache, new queue bypass, or relaxation of kernel rules.
+
+A previously uncached process sharing the same socket through inheritance,
+`fork`, or `SCM_RIGHTS` can remain invisible to Fast, even for the same UID.
+The 30-second TTL limits hint retention, not a guaranteed detection window;
+a successful Strict lookup of another socket can seed the same process again.
+Thus Fast does not offer Strict's global matching-UID
+ambiguity detection. In the goals above, rejection of ambiguous identity means
+ambiguity actually detected by the selected strategy, not proof that Fast has
+discovered every holder. Strict remains the choice for exhaustive owner search.
+Learning and BlockAll are unchanged and do not use this exception.
+
+`StatusV4` reports the remembered strategy without process identifiers.
+Strategy changes require root and a revision-checked transaction that advances
+the flow generation. Missing persisted strategy defaults to Strict; selecting
+legacy Enforcing resets it to Strict. Before downgrading to an older daemon,
+root must persist Strict so that the new Fast-only state field is omitted.
+Fast neither establishes actual-sender identity nor promises measured
+CPU/latency gains.
+
 ## Attacker model
 
 The design assumes an attacker may:
@@ -130,7 +162,7 @@ are broader than firewall administration alone.
   Another bounded worker persists successful observations. Queue
   1337 permits only a successful matching decision and conservatively drops an
   unresolved deny candidate, except for a kernel-UID mismatch deferred to
-  best-effort observation. Attribution handles parsed TCP, UDP, ICMP echo, and
+  best-effort observation. The Strict path handles parsed TCP, UDP, ICMP echo, and
   ICMPv6 echo traffic in batches of no more than 32 ready items and never
   waits to fill a batch. Every packet independently maps its kernel UID and
   network tuple to a socket inode through `SOCK_DIAG`. One bounded external
@@ -144,7 +176,7 @@ are broader than firewall administration alone.
   same inode, socket UID, and capture requirements. Requests sharing a socket
   must agree on PID, process start time, executable path and complete file
   version, and filesystem UID. The typed timeout marker is preserved for
-  NFQUEUE accounting. There is no cross-batch process-identity or
+  NFQUEUE accounting. In Strict there is no cross-batch process-identity or
   authorization-result cache; a later UDP/ICMP batch starts with new per-packet
   `SOCK_DIAG` lookups and fresh owner snapshots. The resolver scans a task's fd table only when
   its filesystem UID equals the kernel socket UID; matching holders are grouped
@@ -425,7 +457,7 @@ are broader than firewall administration alone.
   host can still attribute executable path, full file version, filesystem UID, and
   argv after validating bounded v1 memberships, but reports no cgroup identity;
   an explicit cgroup-path rule therefore fails closed.
-- At initial attribution, stable shared, inherited, or `SCM_RIGHTS`-passed
+- At initial Strict attribution, stable shared, inherited, or `SCM_RIGHTS`-passed
   descriptors can make procfs ownership differ from the process that actually
   sent the packet. Multiple matching-UID TGIDs are denied. A task whose
   filesystem UID differs from the kernel socket UID is excluded before its fd
@@ -434,6 +466,10 @@ are broader than firewall administration alone.
   recipient is invisible to this fallback and the original holder can be
   attributed. Kernel-LSM sender attribution is not implemented; procfs ownership
   is not proof of the actual sender.
+- Fast can additionally miss a new matching-UID shared-socket holder outside
+  its cached TGIDs, without a guaranteed discovery deadline. Fresh checks of the known
+  holder do not close this gap; the explicit Fast confirmation accepts it.
+  This is a security tradeoff, not an equivalent replacement for Strict.
 - Process identity is resolved for the first queued packet of an established TCP
   connection rather than every subsequent TCP packet. A later exec,
   filesystem-UID/cgroup change, or descriptor transfer can continue that

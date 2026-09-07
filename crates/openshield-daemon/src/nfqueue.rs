@@ -1029,7 +1029,12 @@ fn decide_packet_batch_until(
         }
     }
 
-    let identities = resolver.resolve_batch_for_enforcement_until(&requests, deadline);
+    let identities = resolver.resolve_batch_with_strategy_until(
+        &requests,
+        deadline,
+        snapshot.enforcement_strategy(),
+        snapshot.flow_generation,
+    );
     for (index, identity) in request_indexes.into_iter().zip(identities) {
         let packet = batch[index]
             .packet

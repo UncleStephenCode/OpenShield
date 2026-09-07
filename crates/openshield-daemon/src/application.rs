@@ -22,12 +22,15 @@ use nix::sys::socket::{
     recvfrom, sendto, socket,
 };
 use openshield_core::{
-    ApplicationIdentity, ApplicationPath, CgroupPath, CommandArgument, ExecutableFileId,
-    InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule, RuleAction, RuleSpec,
-    Snapshot, TransportProtocol,
+    ApplicationIdentity, ApplicationPath, CgroupPath, CommandArgument, EnforcementStrategy,
+    ExecutableFileId, InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule,
+    RuleAction, RuleSpec, Snapshot, TransportProtocol,
 };
 
 use crate::application_timing::{TimingScope, TimingStage, record_enumeration};
+
+#[path = "application_fast.rs"]
+mod fast;
 
 const MAX_PROC_ENTRIES: usize = 131_072;
 const MAX_FDS_PER_TASK: usize = 4_096;
@@ -237,6 +240,7 @@ pub fn matching_application_rule<'a>(
 /// evaluated in policy order so matching semantics remain unchanged.
 #[derive(Clone, Debug)]
 pub struct ApplicationDecisionPolicy {
+    enforcement_strategy: EnforcementStrategy,
     snapshot: Snapshot,
     rules_by_executable: HashMap<ExecutableFileId, Vec<usize>>,
     network_accept_rules: Vec<usize>,
@@ -268,10 +272,22 @@ impl ApplicationDecisionPolicy {
             }
         }
         Self {
+            enforcement_strategy: EnforcementStrategy::Strict,
             snapshot,
             rules_by_executable,
             network_accept_rules,
         }
+    }
+
+    #[must_use]
+    pub fn with_enforcement_strategy(mut self, strategy: EnforcementStrategy) -> Self {
+        self.enforcement_strategy = strategy;
+        self
+    }
+
+    #[must_use]
+    pub const fn enforcement_strategy(&self) -> EnforcementStrategy {
+        self.enforcement_strategy
     }
 
     #[must_use]
@@ -485,6 +501,7 @@ fn outbound_network_selectors_match(rule: &Rule, connection: &OutboundConnection
 #[derive(Debug)]
 pub struct ProcfsResolver {
     root: PathBuf,
+    fast_owners: RefCell<fast::OwnerCache>,
     sock_diag: RefCell<Option<SockDiagSocket>>,
     /// Synthetic procfs roots cannot answer netlink queries. Keeping this
     /// switch test-only makes a production TCP/UDP downgrade unrepresentable.
@@ -676,6 +693,7 @@ impl ProcfsResolver {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("/proc"),
+            fast_owners: RefCell::new(fast::OwnerCache::default()),
             sock_diag: RefCell::new(None),
             #[cfg(test)]
             use_procfs_socket_lookup: false,
@@ -688,6 +706,7 @@ impl ProcfsResolver {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            fast_owners: RefCell::new(fast::OwnerCache::default()),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: true,
             daemon_process_id: None,
@@ -699,6 +718,7 @@ impl ProcfsResolver {
     pub(crate) fn at_with_daemon_process(root: impl Into<PathBuf>, daemon_process_id: u32) -> Self {
         Self {
             root: root.into(),
+            fast_owners: RefCell::new(fast::OwnerCache::default()),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: true,
             daemon_process_id: Some(daemon_process_id),
@@ -762,6 +782,18 @@ impl ProcfsResolver {
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
         deadline: Instant,
+    ) -> Vec<Result<ApplicationIdentity>> {
+        if let Ok(mut cache) = self.fast_owners.try_borrow_mut() {
+            cache.clear();
+        }
+        self.resolve_batch_strict_until(requests, deadline, false)
+    }
+
+    fn resolve_batch_strict_until(
+        &self,
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        deadline: Instant,
+        seed_fast_hints: bool,
     ) -> Vec<Result<ApplicationIdentity>> {
         if requests.is_empty() {
             return Vec::new();
@@ -848,6 +880,9 @@ impl ProcfsResolver {
         self.revalidate_batch_owners(&keys, &before, deadline, &mut errors, &mut identities);
 
         let results = batch_resolution_results(errors, identities);
+        if seed_fast_hints && let Ok(mut cache) = self.fast_owners.try_borrow_mut() {
+            cache.seed(&before, &keys, &results, Instant::now());
+        }
         batch_timing.finish(results.iter().filter(|result| result.is_err()).count());
         results
     }
@@ -3384,7 +3419,7 @@ mod tests {
         Ok(())
     }
 
-    fn create_task_fixture(
+    pub(super) fn create_task_fixture(
         root: &Path,
         process_id: u32,
         task_id: u32,
@@ -3416,7 +3451,7 @@ mod tests {
         Ok(process)
     }
 
-    fn complete_identity_fixture(task: &Path, pid: u32) -> Result<(), Box<dyn Error>> {
+    pub(super) fn complete_identity_fixture(task: &Path, pid: u32) -> Result<(), Box<dyn Error>> {
         let executable = task
             .parent()
             .and_then(Path::parent)
@@ -3435,7 +3470,7 @@ mod tests {
         Ok(())
     }
 
-    fn loopback_connection(
+    pub(super) fn loopback_connection(
         protocol: TransportProtocol,
         source_address: IpAddr,
         source_port: u16,
@@ -3454,7 +3489,7 @@ mod tests {
         })
     }
 
-    fn write_udp_socket_table(
+    pub(super) fn write_udp_socket_table(
         root: &Path,
         sockets: &[(u16, u16, u32, u64)],
     ) -> Result<(), Box<dyn Error>> {
@@ -4242,6 +4277,7 @@ mod tests {
         )?;
         let resolver = ProcfsResolver {
             root: PathBuf::from("/proc"),
+            fast_owners: RefCell::new(fast::OwnerCache::default()),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: false,
             daemon_process_id: None,

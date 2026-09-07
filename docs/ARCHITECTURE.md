@@ -129,6 +129,50 @@ The daemon still independently enforces root-only control;
 authorized non-root `openshield` observers can navigate only the redacted,
 read-only projection.
 
+## Enforcement strategy and compatibility
+
+Enforcing has two explicit userspace strategies. Strict is the default and the
+exhaustive-owner discovery described below. Root selects them through
+`m` → `3. Enforcing` → `3.1 Fast` / `3.2 Strict`; Fast requires a
+confirmation of its weaker guarantee. There is no `S` shortcut. Learning and
+BlockAll use the unchanged strict path regardless of the remembered choice.
+
+Fast retains only positive UID/TGID/TID/start-time owner hints: at most 256 TGIDs
+per resolver, with a fixed 30-second lifetime since a fully successful Strict attribution batch.
+Hits do not renew it. Every queued attribution request has fresh socket resolution (`SOCK_DIAG`
+for TCP/UDP, the existing procfs lookup for ICMP/ICMPv6), and
+fresh fd ownership, UID, PID/start-time, executable path/file-version and
+policy-required argv/cgroup checks. Identity metadata is captured twice with
+the existing race checks; both owner passes cover only hinted TGIDs. Misses,
+expiry, validation errors, and detected ambiguity clear the hints before using
+the Strict path; only a fully successful Strict batch reseeds them.
+No packet verdict or authorization result is cached. Current rule matching,
+action precedence, revocation, deadlines, and flow generation remain mandatory.
+Backend compilation, NFQUEUE flags, and established-TCP conntrack fast paths do
+not change; this is not a new L1/L2/L3 level, kernel extension, or queue bypass.
+
+The narrower search is a real assurance reduction: a newly shared socket owner
+outside the hinted TGIDs can be missed, including after `fork` or
+`SCM_RIGHTS` transfer to another same-UID process. A successful local recheck
+need not reveal global ambiguity that Strict would reject. The 30-second TTL
+bounds hint retention, not an owner-discovery deadline: a Strict lookup of a
+different socket can seed the same process again. Fast is opt-in, not security-equivalent to Strict or a faithful copy of
+OpenSnitch's procmon caches. No measured performance gain is asserted here.
+
+`ControlRequest::SetEnforcement` carries an explicit strategy and expected
+revision. It atomically selects Enforcing, advances revision and flow generation,
+and retains the existing `ModeChanged` event shape. Legacy
+`SetMode(Enforcing)` always selects Strict; other modes remember the strategy
+without applying Fast. `StatusV4` adds `enforcement_strategy` to V3; older
+status responses and `Snapshot` remain unchanged. Reconstructing mutable
+state from a legacy snapshot therefore defaults to Strict.
+
+Persisted `State` omits `enforcement_strategy` for Strict, defaults a missing
+field to Strict, and writes `"fast"` for Fast. Unknown values are rejected.
+Older daemons reject the new field; root must select and persist Strict with
+the current daemon before attempting a downgrade. This prerequisite does not
+replace the protected-console, state-backup, and compatibility precautions below.
+
 ## Application attribution
 
 An application selector is valid only on an outbound rule. The executable path
@@ -323,10 +367,12 @@ must be reviewed before switching to Enforcing. The
 separately checks request/response learning, denied unknown executables, and the
 unavoidable one-way UDP observation limit.
 
+The exhaustive scan implementation below describes Strict; the reduced Fast
+owner-search scope and its limits are specified above.
 Within a batch, metadata capture is grouped by exact TGID, TID, procfs task path,
 socket UID, and capture requirements. Each socket descriptor is checked before
 and after the shared metadata read; every owning TID must agree. A failed
-descriptor does not invalidate an independently verified neighbour. Both complete
+descriptor does not invalidate an independently verified neighbour. In Strict, both complete
 owner snapshots remain mandatory. Per-socket results are keyed by inode, socket
 UID, and capture requirements and are discarded at the end of the batch. Duplicate requests
 for one socket must reach consensus on mandatory identity: PID, process start
@@ -334,8 +380,8 @@ time, executable path, complete file version, and filesystem UID. The optional
 argv and cgroup fields are still captured whenever the matching policy requires
 them. The typed procfs timeout marker survives batched error propagation and is
 recorded by the NFQUEUE runtime counters. A later batch starts again with
-per-packet `SOCK_DIAG`; there is no cross-batch process-identity or authorization
-cache, so otherwise-unmatched UDP and ICMP packets continue to require fresh
+per-packet `SOCK_DIAG`; Strict has no cross-batch process-identity or authorization
+cache. Fast retains only the bounded owner hints described above. Otherwise-unmatched UDP and ICMP packets continue to require fresh
 attribution.
 
 `application_timing.rs` records fixed-size, best-effort wall-time aggregates for

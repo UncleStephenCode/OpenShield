@@ -391,7 +391,10 @@ fn handle_observe_client(
         };
 
         match request {
-            request @ (ReadRequest::Status | ReadRequest::StatusV2 | ReadRequest::StatusV3) => {
+            request @ (ReadRequest::Status
+            | ReadRequest::StatusV2
+            | ReadRequest::StatusV3
+            | ReadRequest::StatusV4) => {
                 if pages_started || status_requests >= 2 {
                     write_error(
                         &mut stream,
@@ -402,7 +405,9 @@ fn handle_observe_client(
                 }
                 status_requests += 1;
                 let response = lock_engine(engine).map_or_else(Response::Error, |engine| {
-                    if matches!(request, ReadRequest::StatusV3) {
+                    if matches!(request, ReadRequest::StatusV4) {
+                        engine.status_v4_response()
+                    } else if matches!(request, ReadRequest::StatusV3) {
                         engine.status_v3_response()
                     } else if matches!(request, ReadRequest::StatusV2) {
                         engine.status_v2_response()
@@ -1438,6 +1443,7 @@ mod tests {
             ReadRequest::Status,
             ReadRequest::StatusV2,
             ReadRequest::StatusV3,
+            ReadRequest::StatusV4,
         ] {
             let temporary = tempdir()?;
             let store = AtomicStateStore::for_owner(
@@ -1479,7 +1485,8 @@ mod tests {
             match (&status_request, &response) {
                 (ReadRequest::Status, Response::Status { .. })
                 | (ReadRequest::StatusV2, Response::StatusV2 { .. }) => {}
-                (ReadRequest::StatusV3, Response::StatusV3 { learning, .. }) => {
+                (ReadRequest::StatusV3, Response::StatusV3 { learning, .. })
+                | (ReadRequest::StatusV4, Response::StatusV4 { learning, .. }) => {
                     assert_eq!(learning.automatic_rules, 0);
                     assert_eq!(learning.quota_skipped_observations, 0);
                     assert!(learning.per_uid_limit > 512);
@@ -1491,6 +1498,7 @@ mod tests {
                 Response::Status { rule_count: 0, .. }
                     | Response::StatusV2 { rule_count: 0, .. }
                     | Response::StatusV3 { rule_count: 0, .. }
+                    | Response::StatusV4 { rule_count: 0, .. }
             ));
             write_request(
                 &mut client_stream,

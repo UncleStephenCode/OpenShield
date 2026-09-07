@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Sürətli",
+  "enforcement.strict": "Ciddi",
+  "enforcement.title": " Qaydaların tətbiqi ",
+  "enforcement.unavailable": "Sürətli əlçatan deyil: demon strategiya seçimini dəstəkləmir və ya vəziyyət gözlənilir.",
+  "enforcement.fast_confirm": " Sürətli aktivləşdirilsin? ",
+  "enforcement.fast_warning": "Sürətli proses ipuclarından istifadə edir. Paylaşılan və ya ötürülən soketlərin digər sahibləri aşkarlanmaya bilər. Soket, proses kimliyi və qaydalar yenə yoxlanılır. Bütün sahibləri axtarmaq üçün Ciddi seçin.\n\nY: riski qəbul et və aktivləşdir  N/Enter/Esc: ləğv et",
+  "enforcement.hint": "1/2, ↑/↓: seç  Enter: davam et  Esc: geri",
   "learning.limits": "Öyrənmə limitləri: UID {uid}; tətbiq {application}; avtomatik {automatic}; cəmi {total}",
   "learning.counts": "Avtomatik qaydalar: {rules}; limitə çatmış UID/tətbiqlər: {uids}/{applications}",
   "learning.skipped": "Demon başlayandan kvotaya görə buraxılmış müşahidələr: {skipped}",

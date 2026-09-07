@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Hızlı",
+  "enforcement.strict": "Sıkı",
+  "enforcement.title": " Kural uygulama stratejisi ",
+  "enforcement.unavailable": "Hızlı kullanılamıyor: daemon strateji seçimini desteklemiyor veya durum bekleniyor.",
+  "enforcement.fast_confirm": " Hızlı etkinleştirilsin mi? ",
+  "enforcement.fast_warning": "Hızlı, süreç ipuçlarını kullanır. Paylaşılan veya aktarılan soketlerin diğer sahipleri tespit edilemeyebilir. Soket, süreç kimliği ve kurallar yine denetlenir. Tüm sahipleri aramak için Sıkı seçin.\n\nY: riski kabul et ve etkinleştir  N/Enter/Esc: iptal",
+  "enforcement.hint": "1/2, ↑/↓: seç  Enter: devam  Esc: geri",
   "learning.limits": "Öğrenme sınırları: UID {uid}; uygulama {application}; otomatik {automatic}; toplam {total}",
   "learning.counts": "Otomatik kurallar: {rules}; sınırdaki UID/uygulamalar: {uids}/{applications}",
   "learning.skipped": "Daemon başlangıcından beri kota nedeniyle atlanan gözlemler: {skipped}",

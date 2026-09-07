@@ -2,8 +2,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use openshield_core::{
-    CounterValue, Direction, Event, EventKind, Mode, Rule, RuleAction, RuleOrigin,
-    TransportProtocol,
+    CounterValue, Direction, EnforcementStrategy, Event, EventKind, Mode, Rule, RuleAction,
+    RuleOrigin, TransportProtocol,
 };
 use openshield_protocol::{CompatibilityLevel, CompatibilityReason, OutboundGroupAction};
 use ratatui::{
@@ -67,9 +67,21 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         View::Events => 3,
         View::Help => 4,
     };
+    let title = if app
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.mode == Mode::Enforcing)
+    {
+        format!(
+            " OpenShield | {} ",
+            observed_mode_label(Mode::Enforcing, app)
+        )
+    } else {
+        " OpenShield ".to_owned()
+    };
     let tabs = Tabs::new(titles)
         .select(selected)
-        .block(Block::default().borders(Borders::ALL).title(" OpenShield "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -102,7 +114,7 @@ fn draw_status(
         || (i18n.tr("common.unknown").to_owned(), 0, 0, 0),
         |snapshot| {
             (
-                mode_label(snapshot.mode, i18n).to_owned(),
+                observed_mode_label(snapshot.mode, app),
                 snapshot.revision,
                 snapshot.rules.len(),
                 snapshot
@@ -970,6 +982,13 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
             i18n.tr("overlay.block_all_body"),
             Color::Red,
         ),
+        Overlay::EnforcementPicker { selected } => draw_enforcement_picker(frame, app, *selected),
+        Overlay::ConfirmFast => draw_group_dialog(
+            frame,
+            i18n.tr("enforcement.fast_confirm"),
+            Text::from(i18n.tr("enforcement.fast_warning").to_owned()),
+            Color::Yellow,
+        ),
         Overlay::ConfirmDelete { name, .. } => draw_confirmation(
             frame,
             i18n.tr("overlay.delete_title"),
@@ -1005,6 +1024,74 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
                 area,
             );
         }
+    }
+}
+
+fn draw_enforcement_picker(frame: &mut Frame<'_>, app: &App, selected: EnforcementStrategy) {
+    let i18n = &app.i18n;
+    let mut lines = Vec::new();
+    for (index, strategy) in [EnforcementStrategy::Fast, EnforcementStrategy::Strict]
+        .into_iter()
+        .enumerate()
+    {
+        let available =
+            strategy == EnforcementStrategy::Strict || app.enforcement_strategy.is_some();
+        let style = if !available {
+            Style::default().fg(Color::DarkGray)
+        } else if selected == strategy {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "3.{}. {}",
+                index + 1,
+                enforcement_label(Some(strategy), i18n)
+            ),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(i18n.tr("enforcement.hint").to_owned()));
+    if app.enforcement_strategy.is_none() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(i18n.tr("enforcement.unavailable").to_owned()));
+    }
+    if app.learning_needs_attention() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            i18n.tr("learning.warning").to_owned(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    draw_group_dialog(
+        frame,
+        i18n.tr("enforcement.title"),
+        Text::from(lines),
+        Color::Cyan,
+    );
+}
+
+pub fn enforcement_label(strategy: Option<EnforcementStrategy>, i18n: &I18n) -> &str {
+    match strategy {
+        Some(EnforcementStrategy::Fast) => i18n.tr("enforcement.fast"),
+        Some(EnforcementStrategy::Strict) => i18n.tr("enforcement.strict"),
+        None => i18n.tr("common.unknown"),
+    }
+}
+
+fn observed_mode_label(mode: Mode, app: &App) -> String {
+    if mode == Mode::Enforcing {
+        format!(
+            "{} — {}",
+            mode_label(mode, &app.i18n),
+            enforcement_label(app.enforcement_strategy, &app.i18n)
+        )
+    } else {
+        mode_label(mode, &app.i18n).to_owned()
     }
 }
 
@@ -1703,6 +1790,85 @@ mod tests {
                 assert!(
                     compact(&screen).contains(&compact(app.i18n.tr("learning.warning"))),
                     "missing {} warning: {screen}",
+                    locale.code()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_menus_and_risk_warning_fit_all_locales_at_80_by_24()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|character| {
+                    !character.is_whitespace()
+                        && !matches!(character, '│' | '─' | '┌' | '┐' | '└' | '┘')
+                })
+                .collect::<String>()
+        };
+        for &locale in Locale::SUPPORTED {
+            let mut app = App::new(false, I18n::load(locale)?);
+            app.set_snapshot(Snapshot {
+                revision: 1,
+                flow_generation: 1,
+                mode: Mode::Enforcing,
+                rules: Vec::new(),
+            });
+            app.set_enforcement_strategy(1, Some(EnforcementStrategy::Strict));
+            let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+            app.overlay = Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict,
+            };
+            terminal.draw(|frame| draw_overlay(frame, &app))?;
+            let screen = compact(&buffer_text(terminal.backend()));
+            for value in [
+                "3.1.",
+                "3.2.",
+                app.i18n.tr("enforcement.fast"),
+                app.i18n.tr("enforcement.strict"),
+                app.i18n.tr("enforcement.hint"),
+            ] {
+                assert!(
+                    screen.contains(&compact(value)),
+                    "missing {value:?} in {}",
+                    locale.code()
+                );
+            }
+            app.overlay = Overlay::ConfirmFast;
+            terminal.draw(|frame| draw_overlay(frame, &app))?;
+            let screen = compact(&buffer_text(terminal.backend()));
+            assert!(
+                screen.contains(&compact(app.i18n.tr("enforcement.fast_warning"))),
+                "risk warning clipped in {}: {screen}",
+                locale.code()
+            );
+
+            app.set_enforcement_strategy(1, None);
+            app.overlay = Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict,
+            };
+            terminal.draw(|frame| draw_overlay(frame, &app))?;
+            assert!(
+                compact(&buffer_text(terminal.backend()))
+                    .contains(&compact(app.i18n.tr("enforcement.unavailable")))
+            );
+            app.overlay = Overlay::None;
+            for strategy in [
+                None,
+                Some(EnforcementStrategy::Strict),
+                Some(EnforcementStrategy::Fast),
+            ] {
+                app.set_enforcement_strategy(1, strategy);
+                // Test each header on a fresh surface: this test checks fit,
+                // not TestBackend's retained cells beneath previous wide glyphs.
+                let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+                terminal.draw(|frame| draw_tabs(frame, &app, Rect::new(0, 0, 80, 3)))?;
+                let screen = compact(&buffer_text(terminal.backend()));
+                assert!(
+                    screen.contains(&compact(&observed_mode_label(Mode::Enforcing, &app))),
+                    "strategy missing from {} header: {screen}",
                     locale.code()
                 );
             }

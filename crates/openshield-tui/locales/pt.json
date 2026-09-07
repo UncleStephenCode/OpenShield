@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Rápido",
+  "enforcement.strict": "Estrito",
+  "enforcement.title": " Aplicação de regras ",
+  "enforcement.unavailable": "Rápido indisponível: o daemon não permite escolher a estratégia ou o estado está pendente.",
+  "enforcement.fast_confirm": " Ativar Rápido? ",
+  "enforcement.fast_warning": "Rápido usa pistas sobre processos. Outros proprietários de sockets partilhados ou transferidos podem não ser detetados. O socket, a identidade do processo e as regras continuam a ser verificados. Estrito procura todos os proprietários.\n\nY: aceitar o risco e ativar  N/Enter/Esc: cancelar",
+  "enforcement.hint": "1/2, ↑/↓: escolher  Enter: continuar  Esc: voltar",
   "learning.limits": "Limites de aprendizagem: UID {uid}; aplicação {application}; automáticas {automatic}; total {total}",
   "learning.counts": "Regras automáticas: {rules}; UID/aplicações no limite: {uids}/{applications}",
   "learning.skipped": "Observações ignoradas por quotas desde o início do daemon: {skipped}",

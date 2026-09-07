@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Rapido",
+  "enforcement.strict": "Rigoroso",
+  "enforcement.title": " Applicazione delle regole ",
+  "enforcement.unavailable": "Rapido non disponibile: il demone non supporta la scelta della strategia o lo stato è in attesa.",
+  "enforcement.fast_confirm": " Attivare Rapido? ",
+  "enforcement.fast_warning": "Rapido usa indizi sui processi. Altri proprietari di socket condivisi o trasferiti possono non essere rilevati. Socket, identità del processo e regole restano verificati. Rigoroso cerca tutti i proprietari.\n\nY: accettare il rischio e attivare  N/Enter/Esc: annullare",
+  "enforcement.hint": "1/2, ↑/↓: scegliere  Enter: continuare  Esc: indietro",
   "learning.limits": "Limiti di apprendimento: UID {uid}; applicazione {application}; automatiche {automatic}; totale {total}",
   "learning.counts": "Regole automatiche: {rules}; UID/applicazioni al limite: {uids}/{applications}",
   "learning.skipped": "Osservazioni saltate per le quote dall’avvio del demone: {skipped}",

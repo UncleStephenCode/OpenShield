@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "รวดเร็ว",
+  "enforcement.strict": "เข้มงวด",
+  "enforcement.title": " การบังคับใช้กฎ ",
+  "enforcement.unavailable": "รวดเร็วไม่พร้อมใช้: ดีมอนไม่รองรับการเลือกวิธีหรือกำลังรอสถานะ",
+  "enforcement.fast_confirm": " เปิดใช้รวดเร็วหรือไม่? ",
+  "enforcement.fast_warning": "รวดเร็วใช้ข้อมูลแนะนำเกี่ยวกับโพรเซส อาจตรวจไม่พบเจ้าของอื่นของซ็อกเก็ตที่ใช้ร่วมกันหรือส่งต่อ ยังคงตรวจสอบซ็อกเก็ต ตัวตนของโพรเซส และกฎ เลือกเข้มงวดเพื่อค้นหาเจ้าของทั้งหมด\n\nY: ยอมรับความเสี่ยงและเปิดใช้  N/Enter/Esc: ยกเลิก",
+  "enforcement.hint": "1/2, ↑/↓: เลือก  Enter: ดำเนินการต่อ  Esc: กลับ",
   "learning.limits": "ขีดจำกัดการเรียนรู้: UID {uid}; แอป {application}; อัตโนมัติ {automatic}; รวม {total}",
   "learning.counts": "กฎอัตโนมัติ: {rules}; UID/แอปที่ถึงขีดจำกัด: {uids}/{applications}",
   "learning.skipped": "การสังเกตที่ข้ามเพราะโควตาตั้งแต่เริ่มดีมอน: {skipped}",

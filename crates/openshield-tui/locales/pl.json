@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Szybko",
+  "enforcement.strict": "Ściśle",
+  "enforcement.title": " Stosowanie reguł ",
+  "enforcement.unavailable": "Szybko jest niedostępne: demon nie obsługuje wyboru strategii lub brak stanu.",
+  "enforcement.fast_confirm": " Włączyć Szybko? ",
+  "enforcement.fast_warning": "Szybko korzysta ze wskazówek o procesach. Inni właściciele współdzielonych lub przekazanych gniazd mogą pozostać niewykryci. Gniazdo, tożsamość procesu i reguły nadal są sprawdzane. Ściśle wyszukuje wszystkich właścicieli.\n\nY: zaakceptuj ryzyko i włącz  N/Enter/Esc: anuluj",
+  "enforcement.hint": "1/2, ↑/↓: wybór  Enter: dalej  Esc: wstecz",
   "learning.limits": "Limity uczenia: UID {uid}; aplikacja {application}; automatyczne {automatic}; łącznie {total}",
   "learning.counts": "Reguły automatyczne: {rules}; UID/aplikacje na limicie: {uids}/{applications}",
   "learning.skipped": "Obserwacje pominięte przez limity od uruchomienia demona: {skipped}",

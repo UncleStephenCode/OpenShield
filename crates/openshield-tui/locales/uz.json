@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Tez",
+  "enforcement.strict": "Qat’iy",
+  "enforcement.title": " Qoidalarni qo‘llash ",
+  "enforcement.unavailable": "Tez mavjud emas: demon strategiya tanlashni qo‘llamaydi yoki holat kutilmoqda.",
+  "enforcement.fast_confirm": " Tez yoqilsinmi? ",
+  "enforcement.fast_warning": "Tez jarayon ko‘rsatmalaridan foydalanadi. Umumiy yoki uzatilgan soketlarning boshqa egalari aniqlanmay qolishi mumkin. Soket, jarayon identifikatsiyasi va qoidalar qayta tekshiriladi. Barcha egalarni qidirish uchun Qat’iy tanlang.\n\nY: xavfni qabul qilish va yoqish  N/Enter/Esc: bekor qilish",
+  "enforcement.hint": "1/2, ↑/↓: tanlash  Enter: davom etish  Esc: orqaga",
   "learning.limits": "O‘rganish chegaralari: UID {uid}; ilova {application}; avtomatik {automatic}; jami {total}",
   "learning.counts": "Avtomatik qoidalar: {rules}; chegaraga yetgan UID/ilovalar: {uids}/{applications}",
   "learning.skipped": "Demon ishga tushganidan beri kvota sabab o‘tkazib yuborilgan kuzatuvlar: {skipped}",

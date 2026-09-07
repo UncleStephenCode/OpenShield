@@ -16,7 +16,7 @@ use crossterm::event::{
     self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use nix::unistd::geteuid;
-use openshield_core::Mode;
+use openshield_core::{EnforcementStrategy, Mode};
 use openshield_protocol::{Ack, ControlRequest, ErrorCode, OutboundGroupAction};
 
 use crate::app::{App, FormField, GROUP_ACTIONS, Overlay, View};
@@ -127,8 +127,13 @@ fn drain_observer_updates(observer: &Observer, app: &mut App) -> bool {
             ObserverUpdate::TelemetryDisconnected(reason) => {
                 app.set_telemetry_disconnected(reason);
             }
-            ObserverUpdate::LearningStatus { revision, learning } => {
+            ObserverUpdate::LearningStatus {
+                revision,
+                learning,
+                enforcement_strategy,
+            } => {
                 app.set_learning_status(revision, learning);
+                app.set_enforcement_strategy(revision, enforcement_strategy);
             }
             ObserverUpdate::Snapshot {
                 snapshot,
@@ -249,6 +254,7 @@ fn request_resync_notice(observer: &Observer, i18n: &I18n) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlAction {
     SetMode(Mode),
+    SetEnforcement(EnforcementStrategy),
     CreateRule,
     UpdateRule,
     DeleteRule,
@@ -260,6 +266,7 @@ impl ControlAction {
     const fn from_request(request: &ControlRequest) -> Self {
         match request {
             ControlRequest::SetMode { mode, .. } => Self::SetMode(*mode),
+            ControlRequest::SetEnforcement { strategy, .. } => Self::SetEnforcement(*strategy),
             ControlRequest::CreateRule { .. } => Self::CreateRule,
             ControlRequest::UpdateRule { .. } => Self::UpdateRule,
             ControlRequest::DeleteRule { .. } => Self::DeleteRule,
@@ -273,6 +280,17 @@ impl ControlAction {
 
 fn ack_message(ack: &Ack, action: ControlAction, i18n: &I18n) -> String {
     let revision = ack.revision.to_string();
+    if let ControlAction::SetEnforcement(strategy) = action {
+        let mode = format!(
+            "{} — {}",
+            i18n.tr("mode.enforcing"),
+            ui::enforcement_label(Some(strategy), i18n)
+        );
+        return i18n.format(
+            "control.mode_changed",
+            &[("mode", &mode), ("revision", &revision)],
+        );
+    }
     if let ControlAction::SetMode(mode) = action {
         let mode = match mode {
             Mode::BlockAll => i18n.tr("mode.block_all"),
@@ -303,7 +321,9 @@ fn ack_message(ack: &Ack, action: ControlAction, i18n: &I18n) -> String {
         ControlAction::DeleteRule => "control.rule_deleted",
         ControlAction::SetRuleEnabled(true) => "control.rule_enabled",
         ControlAction::SetRuleEnabled(false) => "control.rule_disabled",
-        ControlAction::SetMode(_) | ControlAction::ManageOutboundGroup(_) => {
+        ControlAction::SetMode(_)
+        | ControlAction::SetEnforcement(_)
+        | ControlAction::ManageOutboundGroup(_) => {
             unreachable!("non-rule action returned above")
         }
     };
@@ -323,6 +343,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
     match &app.overlay {
         Overlay::None => handle_normal_key(app, key),
         Overlay::ModePicker { .. } => handle_mode_picker_key(app, key),
+        Overlay::EnforcementPicker { .. } => handle_enforcement_picker_key(app, key),
+        Overlay::ConfirmFast => handle_fast_confirmation_key(app, key),
         Overlay::ConfirmBlockAll => handle_block_confirmation_key(app, key),
         Overlay::ConfirmDelete { .. } => handle_delete_confirmation_key(app, key),
         Overlay::GroupMenu { .. } => handle_group_menu_key(app, key),
@@ -421,6 +443,44 @@ fn handle_block_confirmation_key(app: &mut App, key: KeyEvent) -> Option<Control
         KeyCode::Char('y' | 'Y' | 'д' | 'Д') => app.confirm_block_all(true),
         KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Esc | KeyCode::Enter => {
             app.confirm_block_all(false)
+        }
+        _ => None,
+    }
+}
+
+fn handle_enforcement_picker_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    let Overlay::EnforcementPicker { selected } = app.overlay else {
+        return None;
+    };
+    let choice = match key.code {
+        KeyCode::Esc => {
+            app.back_to_mode_picker();
+            None
+        }
+        KeyCode::Char('1') => Some(EnforcementStrategy::Fast),
+        KeyCode::Char('2') => Some(EnforcementStrategy::Strict),
+        KeyCode::Enter => Some(selected),
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+            app.overlay = Overlay::EnforcementPicker {
+                selected: match selected {
+                    EnforcementStrategy::Fast => EnforcementStrategy::Strict,
+                    EnforcementStrategy::Strict => EnforcementStrategy::Fast,
+                },
+            };
+            None
+        }
+        _ => None,
+    };
+    choice.and_then(|strategy| app.request_enforcement(strategy))
+}
+
+fn handle_fast_confirmation_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    match key.code {
+        KeyCode::Char('y' | 'Y' | 'д' | 'Д') => app.confirm_fast(true),
+        KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Enter => app.confirm_fast(false),
+        KeyCode::Esc => {
+            app.back_to_mode_picker();
+            None
         }
         _ => None,
     }
@@ -566,16 +626,173 @@ mod tests {
         });
         assert!(app.learning_needs_attention());
         app.open_mode_picker();
-        assert_eq!(
+        assert!(
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            app.overlay,
+            Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict
+            }
+        );
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
             ),
             Some(ControlRequest::SetMode {
                 expected_revision: 4,
                 mode: Mode::Enforcing
             })
         );
+    }
+
+    fn enforcement_test_app(read_only: bool) -> App {
+        let mut app = App::new(read_only, I18n::test_english());
+        app.set_snapshot(openshield_core::Snapshot {
+            revision: 7,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        });
+        app.set_enforcement_strategy(7, Some(EnforcementStrategy::Strict));
+        app
+    }
+
+    fn press(app: &mut App, key: KeyCode) -> Option<ControlRequest> {
+        handle_key(app, KeyEvent::new(key, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn enforcing_submenu_uses_m_three_not_s_and_fast_requires_explicit_confirmation() {
+        let mut app = enforcement_test_app(false);
+        for key in ['s', 'S'] {
+            assert!(press(&mut app, KeyCode::Char(key)).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+        }
+        assert!(press(&mut app, KeyCode::Char('m')).is_none());
+        assert!(press(&mut app, KeyCode::Char('3')).is_none());
+        assert_eq!(
+            app.overlay,
+            Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict
+            }
+        );
+        assert!(press(&mut app, KeyCode::Up).is_none());
+        assert_eq!(
+            app.overlay,
+            Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Fast
+            }
+        );
+        assert!(press(&mut app, KeyCode::Enter).is_none());
+        assert_eq!(app.overlay, Overlay::ConfirmFast);
+        assert!(press(&mut app, KeyCode::Enter).is_none());
+        assert_eq!(
+            app.overlay,
+            Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict
+            }
+        );
+        assert!(press(&mut app, KeyCode::Char('1')).is_none());
+        assert_eq!(app.overlay, Overlay::ConfirmFast);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(ControlRequest::SetEnforcement {
+                expected_revision: 7,
+                strategy: EnforcementStrategy::Fast,
+            })
+        );
+        assert_eq!(
+            app.enforcement_strategy,
+            Some(EnforcementStrategy::Strict),
+            "request does not attest runtime change"
+        );
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn enforcement_submenu_escape_returns_to_mode_picker_and_strict_needs_no_risk_confirmation() {
+        let mut app = enforcement_test_app(false);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.overlay,
+            Overlay::ModePicker {
+                selected: Mode::Enforcing
+            }
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.overlay,
+            Overlay::ModePicker {
+                selected: Mode::Enforcing
+            }
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('2')),
+            Some(ControlRequest::SetEnforcement {
+                expected_revision: 7,
+                strategy: EnforcementStrategy::Strict,
+            })
+        );
+    }
+
+    #[test]
+    fn read_only_user_cannot_enter_or_confirm_enforcement_submenus() {
+        let mut app = enforcement_test_app(true);
+        assert!(press(&mut app, KeyCode::Char('m')).is_none());
+        assert_eq!(app.overlay, Overlay::None);
+        for strategy in [EnforcementStrategy::Fast, EnforcementStrategy::Strict] {
+            app.overlay = Overlay::EnforcementPicker { selected: strategy };
+            assert!(press(&mut app, KeyCode::Enter).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+        }
+        app.overlay = Overlay::ConfirmFast;
+        assert!(press(&mut app, KeyCode::Char('y')).is_none());
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn old_daemon_cannot_claim_fast_but_can_select_strict() {
+        let mut app = enforcement_test_app(false);
+        app.set_enforcement_strategy(7, None);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('3'));
+        assert!(press(&mut app, KeyCode::Char('1')).is_none());
+        assert!(matches!(app.overlay, Overlay::EnforcementPicker { .. }));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(app.i18n.tr("enforcement.unavailable"))
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('2')),
+            Some(ControlRequest::SetMode {
+                expected_revision: 7,
+                mode: Mode::Enforcing,
+            })
+        );
+    }
+
+    #[test]
+    fn confirmed_strategy_ack_is_distinct_and_does_not_name_an_unknown_rule() {
+        let i18n = I18n::test_english();
+        let message = ack_message(
+            &Ack::new(8, None),
+            ControlAction::SetEnforcement(EnforcementStrategy::Fast),
+            &i18n,
+        );
+        assert!(message.contains(i18n.tr("mode.enforcing")));
+        assert!(message.contains(i18n.tr("enforcement.fast")));
+        assert!(!message.contains(i18n.tr("common.unknown")));
     }
 
     #[test]

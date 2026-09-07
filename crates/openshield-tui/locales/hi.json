@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "तेज़",
+  "enforcement.strict": "सख्त",
+  "enforcement.title": " नियम लागू करने की रणनीति ",
+  "enforcement.unavailable": "तेज़ उपलब्ध नहीं: डेमन रणनीति चयन का समर्थन नहीं करता या स्थिति लंबित है।",
+  "enforcement.fast_confirm": " तेज़ चालू करें? ",
+  "enforcement.fast_warning": "तेज़ प्रक्रिया संकेतों का उपयोग करता है। साझा या हस्तांतरित सॉकेट के अन्य स्वामी अनदेखे रह सकते हैं। सॉकेट, प्रक्रिया की पहचान और नियम फिर भी जाँचे जाते हैं। सभी स्वामियों की खोज के लिए सख्त चुनें।\n\nY: जोखिम स्वीकार कर चालू करें  N/Enter/Esc: रद्द करें",
+  "enforcement.hint": "1/2, ↑/↓: चुनें  Enter: आगे  Esc: वापस",
   "learning.limits": "सीखने की सीमाएँ: UID {uid}; अनुप्रयोग {application}; स्वचालित {automatic}; कुल {total}",
   "learning.counts": "स्वचालित नियम: {rules}; सीमा पर पहुँचे UID/अनुप्रयोग: {uids}/{applications}",
   "learning.skipped": "डेमन शुरू होने के बाद कोटा के कारण छोड़े गए अवलोकन: {skipped}",

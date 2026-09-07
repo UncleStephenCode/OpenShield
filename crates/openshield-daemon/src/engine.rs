@@ -12,10 +12,10 @@ use chrono::Utc;
 #[cfg(test)]
 use openshield_core::LearnedEndpoint;
 use openshield_core::{
-    ApplicationLearningAdmission, ApplicationLearningAdmissionIndex, CoreError, Event, EventKind,
-    FirewallCounters, LearnedApplicationEndpoint, LearningLimits, MAX_AUTOMATIC_LEARNED_RULES,
-    MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule, RuleAction, RuleOrigin, Snapshot, State,
-    StateStore, TransportProtocol,
+    ApplicationLearningAdmission, ApplicationLearningAdmissionIndex, CoreError,
+    EnforcementStrategy, Event, EventKind, FirewallCounters, LearnedApplicationEndpoint,
+    LearningLimits, MAX_AUTOMATIC_LEARNED_RULES, MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule,
+    RuleAction, RuleOrigin, Snapshot, State, StateStore, TransportProtocol,
 };
 #[cfg(test)]
 use openshield_protocol::FirewallBackendKind;
@@ -577,6 +577,11 @@ fn build_application_decision_policy(state: &State) -> ApplicationDecisionPolicy
         mode: state.mode(),
         rules,
     })
+    .with_enforcement_strategy(if state.mode() == Mode::Enforcing {
+        state.enforcement_strategy()
+    } else {
+        EnforcementStrategy::Strict
+    })
 }
 
 fn build_application_learning_admission(
@@ -592,6 +597,7 @@ fn validate_application_learning_transition(
     events: &[Event],
 ) -> bool {
     if candidate.mode() != Mode::Learning
+        || candidate.enforcement_strategy() != previous.enforcement_strategy()
         || candidate.flow_generation() != previous.flow_generation()
         || candidate.rules().len() != previous.rules().len().saturating_add(events.len())
         || previous
@@ -755,6 +761,13 @@ impl Engine {
             };
         }
         self.startup_policy = StartupPolicy::Active;
+        if self.state.mode() == Mode::Enforcing
+            && self.state.enforcement_strategy() == EnforcementStrategy::Fast
+        {
+            warn!(
+                "restoring Fast enforcement: process hint caching does not guarantee discovery of additional socket owners"
+            );
+        }
         Ok(())
     }
 
@@ -953,6 +966,22 @@ impl Engine {
         }
     }
 
+    pub fn status_v4_response(&self) -> Response {
+        if self.fatal {
+            return Response::Error(fatal_protocol_error());
+        }
+        Response::StatusV4 {
+            revision: self.state.revision(),
+            mode: self.state.mode(),
+            rule_count: u32::try_from(self.state.rules().len()).unwrap_or(u32::MAX),
+            backend: self.backend.kind(),
+            nfqueue: self.nfqueue_counters.snapshot(),
+            runtime_compatibility: self.runtime_compatibility(),
+            learning: self.learning_status(),
+            enforcement_strategy: self.state.enforcement_strategy(),
+        }
+    }
+
     fn record_learning_quota_skipped(&self, count: usize) {
         if count == 0 {
             return;
@@ -1052,8 +1081,15 @@ impl Engine {
                 ControlRequest::SetMode {
                     mode: Mode::Enforcing,
                     ..
-                }
+                } | ControlRequest::SetEnforcement { .. }
             );
+        let selecting_fast = matches!(
+            &request,
+            ControlRequest::SetEnforcement {
+                strategy: EnforcementStrategy::Fast,
+                ..
+            }
+        );
         let mut candidate = self.state.clone();
         let (events, affected_rule) = apply_control_to_candidate(&mut candidate, request)?;
 
@@ -1062,6 +1098,11 @@ impl Engine {
             .map_err(|error| core_protocol_error(&error))?;
         let revision = candidate.revision();
         self.commit(candidate, &events)?;
+        if selecting_fast {
+            warn!(
+                "Fast enforcement selected: process hints are revalidated, but additional socket owners outside the hint cache may not be detected"
+            );
+        }
         if entering_enforcing {
             let status = self.learning_status();
             if status.saturated_uids > 0
@@ -1699,6 +1740,12 @@ fn apply_control_to_candidate(
     request: ControlRequest,
 ) -> Result<(Vec<Event>, Option<Rule>), ProtocolError> {
     match request {
+        ControlRequest::SetEnforcement { strategy, .. } => {
+            let event = candidate
+                .enforce(strategy)
+                .map_err(|error| core_protocol_error(&error))?;
+            Ok((vec![event], None))
+        }
         ControlRequest::SetMode { mode, .. } => {
             let event = candidate
                 .set_mode(mode)
@@ -3263,6 +3310,141 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_strategy_is_persisted_and_rotates_packet_epoch() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let (mut engine, _, store, _) = engine_with_state(state)?;
+        let before = engine
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        engine
+            .handle_control(ControlRequest::SetEnforcement {
+                expected_revision: engine.revision(),
+                strategy: EnforcementStrategy::Fast,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let fast = engine
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(fast.mode, Mode::Enforcing);
+        assert_eq!(fast.enforcement_strategy(), EnforcementStrategy::Fast);
+        assert_ne!(fast.flow_generation, before.flow_generation);
+        assert!(matches!(
+            engine.status_v4_response(),
+            Response::StatusV4 {
+                mode: Mode::Enforcing,
+                enforcement_strategy: EnforcementStrategy::Fast,
+                ..
+            }
+        ));
+        assert!(matches!(
+            engine.status_response(),
+            Response::Status {
+                mode: Mode::Enforcing,
+                ..
+            }
+        ));
+        assert_eq!(
+            store
+                .persisted_state()?
+                .map(|state| state.enforcement_strategy()),
+            Some(EnforcementStrategy::Fast)
+        );
+        engine
+            .handle_control(ControlRequest::SetEnforcement {
+                expected_revision: engine.revision(),
+                strategy: EnforcementStrategy::Strict,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let strict = engine
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(strict.enforcement_strategy(), EnforcementStrategy::Strict);
+        assert_ne!(strict.flow_generation, fast.flow_generation);
+        // An in-flight decision from Fast carries the old epoch and cannot be
+        // accepted by the existing final-verdict generation check.
+        assert_ne!(
+            engine
+                .application_decision_identity()
+                .map_err(|error| anyhow!(error.message))?
+                .1,
+            fast.flow_generation
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fast_strategy_does_not_change_learning_attribution_or_survive_legacy_enforce()
+    -> AnyResult<()> {
+        let mut state = State::new();
+        state.enforce(EnforcementStrategy::Fast)?;
+        state.set_mode(Mode::Learning)?;
+        let (mut engine, _, _, _) = engine_with_state(state)?;
+        assert_eq!(
+            engine.state.enforcement_strategy(),
+            EnforcementStrategy::Fast
+        );
+        assert_eq!(
+            engine
+                .application_decision_snapshot()
+                .map_err(|error| anyhow!(error.message))?
+                .enforcement_strategy(),
+            EnforcementStrategy::Strict
+        );
+        engine
+            .handle_control(ControlRequest::SetMode {
+                expected_revision: engine.revision(),
+                mode: Mode::Enforcing,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(
+            engine.state.enforcement_strategy(),
+            EnforcementStrategy::Strict
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_fast_strategy_change_preserves_strict_state_and_stale_cas_is_rejected()
+    -> AnyResult<()> {
+        let (mut engine, backend, store, events) = engine_with_probes()?;
+        let before = engine.state.clone();
+        let subscription = events
+            .subscribe()
+            .map_err(|_| anyhow!("subscribe failed"))?;
+        let request = ControlRequest::SetEnforcement {
+            expected_revision: engine.revision(),
+            strategy: EnforcementStrategy::Fast,
+        };
+        backend.fail_next.store(true, Ordering::SeqCst);
+        assert!(engine.handle_control(request).is_err());
+        assert_eq!(engine.state, before);
+        assert_eq!(
+            store
+                .persisted_state()?
+                .map(|state| state.enforcement_strategy()),
+            Some(EnforcementStrategy::Strict)
+        );
+        assert!(matches!(
+            subscription.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        let stale = engine.handle_control(ControlRequest::SetEnforcement {
+            expected_revision: engine.revision() + 1,
+            strategy: EnforcementStrategy::Fast,
+        });
+        assert!(matches!(
+            stale,
+            Err(ProtocolError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        assert_eq!(engine.state, before);
         Ok(())
     }
 

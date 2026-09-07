@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Schnell",
+  "enforcement.strict": "Strikt",
+  "enforcement.title": " Regeldurchsetzung ",
+  "enforcement.unavailable": "Schnell ist nicht verfügbar: Der Daemon unterstützt keine Strategiewahl oder der Status fehlt.",
+  "enforcement.fast_confirm": " Schnell aktivieren? ",
+  "enforcement.fast_warning": "Schnell nutzt Prozesshinweise. Andere Besitzer gemeinsam genutzter oder übertragener Sockets können unentdeckt bleiben. Socket, Prozessidentität und Regeln werden weiterhin geprüft. Strikt sucht vollständig nach Besitzern.\n\nY: Risiko akzeptieren und aktivieren  N/Enter/Esc: abbrechen",
+  "enforcement.hint": "1/2, ↑/↓: auswählen  Enter: weiter  Esc: zurück",
   "learning.limits": "Lernlimits: UID {uid}; Anwendung {application}; automatisch {automatic}; gesamt {total}",
   "learning.counts": "Automatische Regeln: {rules}; UIDs/Anwendungen am Limit: {uids}/{applications}",
   "learning.skipped": "Seit Daemon-Start wegen Quoten übersprungene Beobachtungen: {skipped}",

@@ -1,4 +1,11 @@
 {
+  "enforcement.fast": "Fast",
+  "enforcement.strict": "Strict",
+  "enforcement.title": " Enforcing strategy ",
+  "enforcement.unavailable": "Fast is unavailable: the daemon lacks strategy selection or status is pending.",
+  "enforcement.fast_confirm": " Enable Fast? ",
+  "enforcement.fast_warning": "Fast uses process hints. Other owners of shared or transferred sockets may remain undetected. Socket, process identity and rules are still checked. Select Strict for a full owner search.\n\nY: accept risk and enable  N/Enter/Esc: cancel",
+  "enforcement.hint": "1/2, ↑/↓: select  Enter: continue  Esc: back",
   "learning.limits": "Learning limits: UID {uid}; application {application}; automatic {automatic}; total {total}",
   "learning.counts": "Automatic rules: {rules}; saturated UIDs/applications: {uids}/{applications}",
   "learning.skipped": "Quota-skipped observations since daemon start: {skipped}",
