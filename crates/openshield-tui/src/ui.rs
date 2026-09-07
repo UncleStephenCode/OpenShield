@@ -2,9 +2,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use openshield_core::{
-    CounterValue, Direction, Event, EventKind, Mode, Rule, RuleOrigin, TransportProtocol,
+    CounterValue, Direction, Event, EventKind, Mode, Rule, RuleAction, RuleOrigin,
+    TransportProtocol,
 };
-use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
+use openshield_protocol::{CompatibilityLevel, CompatibilityReason, OutboundGroupAction};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -17,8 +18,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, CommandMode, ConnectionState, FormField, OutboundGroupKey, Overlay, RuleForm, View,
-    peer_label,
+    App, CommandMode, ConnectionState, FormField, GROUP_ACTIONS, GroupTarget, OutboundGroupKey,
+    Overlay, RuleForm, View, peer_label,
 };
 use crate::i18n::I18n;
 
@@ -116,6 +117,10 @@ fn draw_status(
         .snapshot
         .as_ref()
         .map_or_else(Style::default, |snapshot| mode_style(snapshot.mode));
+    let learning = app
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.mode == Mode::Learning);
     let revision = revision.to_string();
     let rule_count = rule_count.to_string();
     let inbound_count = inbound_count.to_string();
@@ -154,6 +159,12 @@ fn draw_status(
             ),
         ]),
     ];
+    if learning {
+        lines.push(Line::from(Span::styled(
+            i18n.tr("status.learning_policy"),
+            Style::default().fg(Color::Green),
+        )));
+    }
     // The compact 80x24 layout keeps the attested backend, mode, level and
     // reason ahead of all optional detail. The explanatory scope is omitted
     // there because it can wrap to several rows in translated interfaces.
@@ -189,21 +200,24 @@ fn draw_status(
                 i18n.format("status.age", &[("duration", duration.as_str())])
             },
         );
-        lines.extend([
-            Line::from(Span::styled(
-                i18n.format("status.counters_title", &[("age", age.as_str())]),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            counter_line(i18n.tr("status.counter_accepted_in"), counters.accepted_in),
-            counter_line(
-                i18n.tr("status.counter_accepted_out"),
-                counters.accepted_out,
-            ),
-            counter_line(i18n.tr("status.counter_dropped_in"), counters.dropped_in),
-            counter_line(i18n.tr("status.counter_dropped_out"), counters.dropped_out),
-            counter_line(i18n.tr("status.counter_learned_out"), counters.learned_out),
-            Line::from(""),
-        ]);
+        lines.push(Line::from(Span::styled(
+            i18n.format("status.counters_title", &[("age", age.as_str())]),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(counter_lines(
+            &[
+                (i18n.tr("status.counter_accepted_in"), counters.accepted_in),
+                (
+                    i18n.tr("status.counter_accepted_out"),
+                    counters.accepted_out,
+                ),
+                (i18n.tr("status.counter_dropped_in"), counters.dropped_in),
+                (i18n.tr("status.counter_dropped_out"), counters.dropped_out),
+                (i18n.tr("status.counter_learned_out"), counters.learned_out),
+            ],
+            usize::from(area.width.saturating_sub(2)),
+        ));
+        lines.push(Line::from(""));
     } else {
         lines.push(Line::from(i18n.tr("status.counters_waiting")));
         lines.push(Line::from(""));
@@ -324,39 +338,53 @@ fn draw_outbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(area);
-    let groups = app.outbound_groups();
-    let group_rows = groups
+    let nodes = app.outbound_nodes();
+    let selected_node = app.selected_outbound_node_index(&nodes);
+    let group_rows = nodes
         .iter()
-        .map(|group| {
-            let active = group.rules.iter().filter(|rule| rule.spec.enabled).count();
-            let state = if active == group.rules.len() {
+        .map(|node| {
+            let active = node.rules.iter().filter(|rule| rule.spec.enabled).count();
+            let state = if active == node.rules.len() {
                 "●"
             } else if active == 0 {
                 "○"
             } else {
                 "◐"
             };
+            let label = node.executable.map_or_else(
+                || {
+                    format!(
+                        "{} {}",
+                        group_kind_label(&node.key, i18n),
+                        group_value_label(&node.key, i18n)
+                    )
+                },
+                |path| {
+                    format!(
+                        "  {} {}",
+                        if node.last_child { "└" } else { "├" },
+                        one_line(path)
+                    )
+                },
+            );
             Row::new([
                 Cell::from(state),
-                Cell::from(group_kind_label(&group.key, i18n)),
-                Cell::from(group_value_label(&group.key, i18n)),
-                Cell::from(group.rules.len().to_string()),
+                Cell::from(label),
+                Cell::from(node.rules.len().to_string()),
             ])
         })
         .collect::<Vec<_>>();
     let group_header = styled_header([
         i18n.tr("rules.column_enabled"),
         i18n.tr("rules.column_group"),
-        "",
         i18n.tr("rules.column_count"),
     ]);
     let group_table = Table::new(
         group_rows,
         [
-            Constraint::Length(4),
-            Constraint::Length(11),
+            Constraint::Length(3),
             Constraint::Min(12),
-            Constraint::Length(6),
+            Constraint::Length(5),
         ],
     )
     .header(group_header)
@@ -367,24 +395,22 @@ fn draw_outbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
     )
     .row_highlight_style(selected_style())
     .highlight_symbol("▶ ");
-    let mut group_state = TableState::default()
-        .with_selected((!groups.is_empty()).then_some(app.selected_outbound_group_index()));
+    let mut group_state = TableState::default().with_selected(selected_node);
     frame.render_stateful_widget(group_table, areas[0], &mut group_state);
 
     let right = Layout::default()
         .direction(LayoutDirection::Vertical)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(areas[1]);
-    let selected_group = groups.get(app.selected_outbound_group_index());
-    let members = selected_group.map_or(&[][..], |group| group.rules.as_slice());
+    let members = selected_node.map_or(&[][..], |index| nodes[index].rules.as_slice());
     draw_rule_table(
         frame,
         members,
         (!members.is_empty()).then_some(app.selected_outbound_member_index()),
         i18n.tr("rules.outbound_members_title"),
-        i18n.tr("editor.field_destination"),
         right[0],
         i18n,
+        true,
     );
     let selected = members.get(app.selected_outbound_member_index()).copied();
     draw_rule_details(
@@ -408,9 +434,9 @@ fn draw_inbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
         &rules,
         (!rules.is_empty()).then_some(app.selected_inbound_rule_index()),
         i18n.tr("rules.inbound_title"),
-        i18n.tr("editor.field_source"),
         areas[0],
         i18n,
+        false,
     );
     draw_rule_details(
         frame,
@@ -426,49 +452,64 @@ fn draw_rule_table(
     rules: &[&Rule],
     selected: Option<usize>,
     title: &str,
-    peer_header: &str,
     area: Rect,
     i18n: &I18n,
+    show_action: bool,
 ) {
     let rows = rules
         .iter()
-        .map(|rule| rule_row(rule, i18n))
+        .map(|rule| rule_row(rule, i18n, show_action))
         .collect::<Vec<_>>();
-    let header = styled_header([
-        i18n.tr("rules.column_enabled"),
+    let mut header = vec![i18n.tr("rules.column_enabled")];
+    let mut widths = vec![Constraint::Length(4)];
+    if show_action {
+        header.push(i18n.tr("rule_action.label"));
+        widths.push(Constraint::Length(9));
+    }
+    let peer_header = i18n.tr(if show_action {
+        "editor.field_destination"
+    } else {
+        "editor.field_source"
+    });
+    header.extend([
         i18n.tr("rules.column_protocol"),
         peer_header,
         i18n.tr("rules.column_port"),
         i18n.tr("rules.column_interface"),
         i18n.tr("rules.column_name"),
     ]);
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(7),
-            Constraint::Min(15),
-            Constraint::Length(11),
-            Constraint::Length(12),
-            Constraint::Min(14),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title(title))
-    .row_highlight_style(selected_style())
-    .highlight_symbol("▶ ");
+    widths.extend([
+        Constraint::Length(7),
+        Constraint::Min(15),
+        Constraint::Length(11),
+        Constraint::Length(12),
+        Constraint::Min(14),
+    ]);
+    let header = Row::new(header).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(selected_style())
+        .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn rule_row(rule: &Rule, i18n: &I18n) -> Row<'static> {
+fn rule_row(rule: &Rule, i18n: &I18n, show_action: bool) -> Row<'static> {
     let style = if rule.spec.enabled {
         Style::default()
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Row::new([
-        Cell::from(if rule.spec.enabled { "●" } else { "○" }),
+    let mut cells = vec![Cell::from(if rule.spec.enabled { "●" } else { "○" })];
+    if show_action {
+        cells.push(Cell::from(action_label(rule.spec.action, i18n).to_owned()));
+    }
+    cells.extend([
         Cell::from(protocol_label(rule.spec.protocol, i18n).to_owned()),
         Cell::from(peer_label(rule, i18n)),
         Cell::from(port_label(rule)),
@@ -479,8 +520,8 @@ fn rule_row(rule: &Rule, i18n: &I18n) -> Row<'static> {
                 .map_or_else(|| "—".to_owned(), ToString::to_string),
         ),
         Cell::from(rule.spec.name.to_string()),
-    ])
-    .style(style)
+    ]);
+    Row::new(cells).style(style)
 }
 
 fn draw_rule_details(
@@ -524,6 +565,7 @@ fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
     let origin = match rule.spec.origin {
         RuleOrigin::Manual => i18n.tr("common.manual"),
         RuleOrigin::Learned => i18n.tr("common.learned"),
+        RuleOrigin::Template => i18n.tr("common.template"),
     };
     let mut lines = vec![
         detail_line(i18n.tr("rules.details_uuid"), rule.id.to_string()),
@@ -536,6 +578,10 @@ fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
                 } else {
                     "common.no"
                 }),
+            ),
+            (
+                i18n.tr("rule_action.label"),
+                action_label(rule.spec.action, i18n),
             ),
             (i18n.tr("rules.details_origin"), origin),
             (
@@ -633,14 +679,9 @@ fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
                 openshield_core::CommandLineMatch::Exact => i18n.tr("editor.command_exact"),
                 openshield_core::CommandLineMatch::Prefix => i18n.tr("editor.command_prefix"),
             };
-            let values = command
-                .arguments
-                .iter()
-                .map(openshield_core::CommandArgument::as_str)
-                .collect::<Vec<_>>();
             (
                 mode.to_owned(),
-                serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_owned()),
+                crate::app::command_arguments_json(&command.arguments),
             )
         },
     );
@@ -884,6 +925,24 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
             &i18n.format("overlay.delete_body", &[("name", one_line(name).as_str())]),
             Color::Yellow,
         ),
+        Overlay::GroupMenu { target, selected } => draw_group_menu(frame, target, *selected, i18n),
+        Overlay::ConfirmGroup { target, action } => {
+            let body = i18n.format(
+                "group.confirm_body",
+                &[
+                    ("action", group_action_label(*action, i18n)),
+                    ("group", group_dialog_label(target, frame.area()).as_str()),
+                    ("count", target.count.to_string().as_str()),
+                ],
+            );
+            let body = format!("{body}\n\n{}", i18n.tr("group.semantics"));
+            draw_group_dialog(
+                frame,
+                i18n.tr("group.confirm_title"),
+                Text::from(body),
+                Color::Yellow,
+            );
+        }
         Overlay::Editor(form) => draw_editor(frame, form, i18n),
         Overlay::Message { title, body } => {
             let area = centered_rect(70, 9, frame.area());
@@ -898,16 +957,98 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
+pub fn group_action_label(action: OutboundGroupAction, i18n: &I18n) -> &str {
+    i18n.tr(match action {
+        OutboundGroupAction::Delete => "group.delete",
+        OutboundGroupAction::Accept => "rule_action.accept",
+        OutboundGroupAction::Reject => "rule_action.reject",
+        OutboundGroupAction::Drop => "rule_action.drop",
+        OutboundGroupAction::Disable => "group.disable",
+        OutboundGroupAction::Enable => "group.enable",
+    })
+}
+
+fn draw_group_menu(
+    frame: &mut Frame<'_>,
+    target: &GroupTarget,
+    selected: OutboundGroupAction,
+    i18n: &I18n,
+) {
+    let scope = i18n.format(
+        "group.scope",
+        &[
+            ("group", group_dialog_label(target, frame.area()).as_str()),
+            ("count", target.count.to_string().as_str()),
+        ],
+    );
+    let mut text = Text::from(scope);
+    text.push_line("");
+    for (index, action) in GROUP_ACTIONS.into_iter().enumerate() {
+        let marker = if action == selected { "▶" } else { " " };
+        let style = if action == selected {
+            selected_style()
+        } else {
+            Style::default()
+        };
+        text.push_line(Line::styled(
+            format!(
+                "{marker} {}. {}",
+                index + 1,
+                group_action_label(action, i18n)
+            ),
+            style,
+        ));
+    }
+    text.push_line("");
+    text.push_line(i18n.tr("group.hint").to_owned());
+    text.push_line("");
+    text.lines
+        .extend(Text::from(i18n.tr("group.semantics").to_owned()).lines);
+    draw_group_dialog(frame, i18n.tr("group.title"), text, Color::Cyan);
+}
+
+fn group_dialog_label(target: &GroupTarget, terminal: Rect) -> String {
+    let area = centered_rect(90, 23, terminal);
+    // A very long cgroup/path must not push actions and the broad-template
+    // warning out of the dialog. Only the displayed label is abbreviated.
+    clipped_counter_label(
+        &one_line(&target.label),
+        usize::from(area.width.saturating_sub(2)) * 2,
+    )
+}
+
+fn draw_group_dialog(frame: &mut Frame<'_>, title: &str, text: Text<'static>, color: Color) {
+    let area = centered_rect(90, 23, frame.area());
+    let lines = hard_wrap_lines(text.lines, area.width.saturating_sub(2).max(1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(title),
+        ),
+        area,
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
     let area = centered_rect(86, 29, frame.area());
     frame.render_widget(Clear, area);
-    let mut fields = vec![
-        (
-            FormField::Name,
-            i18n.tr("editor.field_name"),
-            form.name.clone(),
-        ),
+    let mut fields = vec![(
+        FormField::Name,
+        i18n.tr("editor.field_name"),
+        form.name.clone(),
+    )];
+    if form.direction() == Direction::Outbound {
+        fields.push((
+            FormField::Action,
+            i18n.tr("rule_action.label"),
+            action_label(form.action, i18n).to_owned(),
+        ));
+    }
+    fields.extend([
         (
             FormField::Protocol,
             i18n.tr("editor.field_protocol"),
@@ -932,7 +1073,7 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             i18n.tr("editor.field_interface"),
             form.interface.clone(),
         ),
-    ];
+    ]);
     if form.direction() == Direction::Outbound {
         fields.extend([
             (
@@ -989,6 +1130,7 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             match form.origin {
                 RuleOrigin::Manual => i18n.tr("common.manual"),
                 RuleOrigin::Learned => i18n.tr("common.learned_immutable"),
+                RuleOrigin::Template => i18n.tr("common.template"),
             },
             Style::default().fg(Color::DarkGray),
         ),
@@ -1293,6 +1435,14 @@ pub fn protocol_label(protocol: TransportProtocol, i18n: &I18n) -> &str {
     }
 }
 
+fn action_label(action: RuleAction, i18n: &I18n) -> &str {
+    match action {
+        RuleAction::Accept => i18n.tr("rule_action.accept"),
+        RuleAction::Drop => i18n.tr("rule_action.drop"),
+        RuleAction::Reject => i18n.tr("rule_action.reject"),
+    }
+}
+
 fn command_mode_label(mode: CommandMode, i18n: &I18n) -> &str {
     match mode {
         CommandMode::Any => i18n.tr("editor.command_any"),
@@ -1359,11 +1509,83 @@ fn safe_multiline(value: &str) -> String {
         .collect()
 }
 
-fn counter_line(label: &str, value: CounterValue) -> Line<'static> {
-    Line::from(format!(
-        "  {label:<16} {:>12} / {:>16}",
-        value.packets, value.bytes
-    ))
+fn counter_lines(rows: &[(&str, CounterValue)], width: usize) -> Vec<Line<'static>> {
+    let rows = rows
+        .iter()
+        .map(|(label, value)| (*label, value.packets.to_string(), value.bytes.to_string()))
+        .collect::<Vec<_>>();
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| label.width())
+        .max()
+        .unwrap_or(0);
+    let packet_width = rows
+        .iter()
+        .map(|(_, packets, _)| packets.len())
+        .max()
+        .unwrap_or(0);
+    let byte_width = rows
+        .iter()
+        .map(|(_, _, bytes)| bytes.len())
+        .max()
+        .unwrap_or(0);
+
+    // Reserve the indentation, column gap and separator. Prefer complete
+    // numbers, while retaining enough of a clipped label to identify its row.
+    let available = width.saturating_sub(6);
+    let numeric_space = available.saturating_sub(label_width.min(8));
+    let packet_space = packet_width.min(numeric_space / 2);
+    let byte_space = byte_width.min(numeric_space - packet_space);
+    let packet_space = packet_width.min(numeric_space - byte_space);
+    let label_space = label_width.min(available - packet_space - byte_space);
+    let spare = available - label_space - packet_space - byte_space;
+    let packet_padding = 12_usize.saturating_sub(packet_space).min(spare);
+    let packet_space = packet_space + packet_padding;
+    let byte_space = byte_space
+        + 16_usize
+            .saturating_sub(byte_space)
+            .min(spare - packet_padding);
+
+    rows.into_iter()
+        .map(|(label, packets, bytes)| {
+            let label = clipped_counter_label(label, label_space);
+            let padding = " ".repeat(label_space.saturating_sub(label.width()));
+            // Never present a partial integer as though it were the full count.
+            let packets = if packets.len() <= packet_space {
+                packets.as_str()
+            } else if packet_space == 0 {
+                ""
+            } else {
+                "…"
+            };
+            let bytes = if bytes.len() <= byte_space {
+                bytes.as_str()
+            } else if byte_space == 0 {
+                ""
+            } else {
+                "…"
+            };
+            let line =
+                format!("  {label}{padding} {packets:>packet_space$} / {bytes:>byte_space$}");
+            Line::from(clipped_counter_label(&line, width))
+        })
+        .collect()
+}
+
+fn clipped_counter_label(label: &str, width: usize) -> String {
+    if label.width() <= width {
+        return label.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let end = label
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|&index| label[..index].width() < width)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &label[..end])
 }
 
 #[cfg(test)]
@@ -1378,6 +1600,174 @@ mod tests {
 
     use super::*;
     use crate::i18n::Locale;
+
+    #[test]
+    fn counter_columns_align_in_every_locale() -> Result<(), Box<dyn std::error::Error>> {
+        for &locale in Locale::SUPPORTED {
+            let i18n = I18n::load(locale)?;
+            let rows = [
+                "status.counter_accepted_in",
+                "status.counter_accepted_out",
+                "status.counter_dropped_in",
+                "status.counter_dropped_out",
+                "status.counter_learned_out",
+            ]
+            .map(|key| {
+                (
+                    i18n.tr(key),
+                    CounterValue {
+                        packets: 123,
+                        bytes: 456,
+                    },
+                )
+            });
+            let lines = counter_lines(&rows, 118);
+            let mut terminal = Terminal::new(TestBackend::new(118, 5))?;
+            terminal.draw(|frame| {
+                frame.render_widget(Paragraph::new(lines.clone()), frame.area());
+            })?;
+            let buffer = terminal.backend().buffer();
+            let expected = (0..118)
+                .filter(|&x| matches!(buffer[(x, 0)].symbol(), "1" | "/" | "4"))
+                .collect::<Vec<_>>();
+            assert_eq!(expected.len(), 3, "locale {locale}");
+            for y in 1..5 {
+                let actual = (0..118)
+                    .filter(|&x| matches!(buffer[(x, y)].symbol(), "1" | "/" | "4"))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "locale {locale}, row {y}");
+            }
+            for ((label, _), line) in rows.iter().zip(&lines) {
+                assert!(line.to_string().contains(*label), "locale {locale}: {line}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn counter_columns_share_width_for_large_values_and_unicode_labels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = [
+            (
+                "in",
+                CounterValue {
+                    packets: 1,
+                    bytes: 2,
+                },
+            ),
+            (
+                "принято исходящих",
+                CounterValue {
+                    packets: u64::MAX,
+                    bytes: 3,
+                },
+            ),
+            (
+                "已丢弃入站",
+                CounterValue {
+                    packets: 4,
+                    bytes: u64::MAX,
+                },
+            ),
+            (
+                "e\u{301}",
+                CounterValue {
+                    packets: 5,
+                    bytes: 6,
+                },
+            ),
+        ];
+        let lines = counter_lines(&rows, 118);
+        let mut separator_columns = Vec::new();
+        let mut byte_ends = Vec::new();
+        for ((label, value), line) in rows.iter().zip(&lines) {
+            let text = line.to_string();
+            let (packets, bytes) = text.split_once(" / ").ok_or("missing counter separator")?;
+            assert!(text.contains(*label), "{text}");
+            assert!(packets.ends_with(&value.packets.to_string()), "{text}");
+            assert_eq!(bytes.trim(), value.bytes.to_string());
+            separator_columns.push(packets.width());
+            byte_ends.push(text.width());
+        }
+        assert!(separator_columns.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(byte_ends.windows(2).all(|pair| pair[0] == pair[1]));
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_counter_rows_fit_without_wrapping_or_partial_numbers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = [
+            (
+                "принято входящих",
+                CounterValue {
+                    packets: 7,
+                    bytes: 8,
+                },
+            ),
+            (
+                "принято исходящих",
+                CounterValue {
+                    packets: 9,
+                    bytes: u64::MAX,
+                },
+            ),
+            (
+                "заблокировано входящих",
+                CounterValue {
+                    packets: u64::MAX,
+                    bytes: 0,
+                },
+            ),
+            (
+                "已丢弃出站",
+                CounterValue {
+                    packets: 1,
+                    bytes: 2,
+                },
+            ),
+            (
+                "e\u{301} learned outbound",
+                CounterValue {
+                    packets: 3,
+                    bytes: 4,
+                },
+            ),
+        ];
+        assert!(counter_lines(&rows, 0).iter().all(|line| line.width() == 0));
+        for width in [1_u16, 5, 10, 20, 38, 60, 80] {
+            let mut lines = counter_lines(&rows, usize::from(width));
+            for line in &lines {
+                assert!(line.width() <= usize::from(width), "width {width}: {line}");
+                let text = line.to_string();
+                if let Some((label_and_packets, bytes)) = text.split_once(" / ") {
+                    let packet = label_and_packets
+                        .rsplit_once(' ')
+                        .map_or("", |(_, number)| number);
+                    for number in [packet, bytes.trim()] {
+                        assert!(
+                            number.len() <= 1 || number == "…" || number == u64::MAX.to_string(),
+                            "partial number at width {width}: {text}"
+                        );
+                    }
+                }
+            }
+            lines.push(Line::from("X"));
+            let mut terminal = Terminal::new(TestBackend::new(width, 6))?;
+            terminal.draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(lines.clone()).wrap(Wrap { trim: false }),
+                    frame.area(),
+                );
+            })?;
+            assert_eq!(
+                terminal.backend().buffer()[(0, 5)].symbol(),
+                "X",
+                "width {width}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn status_renders_verified_backend_instead_of_subscription_wording()
@@ -1421,9 +1811,68 @@ mod tests {
             screen.contains("network-only packets always stay in the kernel"),
             "{screen}"
         );
+        assert!(
+            screen.contains("Learning allows outbound traffic by default"),
+            "{screen}"
+        );
+        assert!(screen.contains("enabled Drop and Reject"), "{screen}");
         assert!(!screen.contains("Compatibility level:"), "{screen}");
         assert!(!screen.to_ascii_lowercase().contains("ebpf"), "{screen}");
         assert!(!screen.to_ascii_lowercase().contains("subscription"));
+        Ok(())
+    }
+
+    #[test]
+    fn group_dialogs_show_actions_scope_and_template_warning_in_every_locale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = GroupTarget {
+            selector: openshield_protocol::OutboundGroupSelector::Destination {
+                peer_network: None,
+            },
+            label: format!("/system.slice/{}.service", "long-name-".repeat(100)),
+            count: 321,
+        };
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace() && *ch != '│')
+                .collect::<String>()
+        };
+        for &locale in Locale::SUPPORTED {
+            let mut app = App::new(false, I18n::load(locale)?);
+            for (width, height) in [(80, 24), (120, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+                for confirmation in [false, true] {
+                    app.overlay = if confirmation {
+                        Overlay::ConfirmGroup {
+                            target: target.clone(),
+                            action: OutboundGroupAction::Enable,
+                        }
+                    } else {
+                        Overlay::GroupMenu {
+                            target: target.clone(),
+                            selected: OutboundGroupAction::Enable,
+                        }
+                    };
+                    terminal.draw(|frame| draw_overlay(frame, &app))?;
+                    let screen = buffer_text(terminal.backend());
+                    assert!(screen.contains("321"), "{locale}: {screen}");
+                    assert!(screen.contains('…'), "{locale}: {screen}");
+                    assert!(
+                        compact(&screen).contains(&compact(app.i18n.tr("group.semantics"))),
+                        "warning hidden in {locale} at {width}x{height}: {screen}"
+                    );
+                    if !confirmation {
+                        for action in GROUP_ACTIONS {
+                            assert!(
+                                compact(&screen)
+                                    .contains(&compact(group_action_label(action, &app.i18n))),
+                                "action hidden in {locale}: {screen}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1548,6 +1997,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut outbound_form = RuleForm::default();
         outbound_form.name = "package updater".to_owned();
+        outbound_form.action = RuleAction::Reject;
         outbound_form.protocol = TransportProtocol::Tcp;
         outbound_form.peer_network = "203.0.113.0/24".to_owned();
         outbound_form.port = "443".to_owned();
@@ -1606,6 +2056,7 @@ mod tests {
             "--channel=stable",
             "12345 B",
             "1000",
+            "Reject",
         ] {
             assert!(
                 outbound_screen.contains(expected),
@@ -1625,6 +2076,165 @@ mod tests {
             );
         }
         assert!(!inbound_screen.contains("/usr/bin/updater"));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercise root and both children in two locales.
+    fn outbound_tree_renders_branches_and_filters_both_right_panes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for locale in [Locale::En, Locale::Ru] {
+            let mut rules = Vec::new();
+            for (path, peer, name) in [
+                (
+                    "/usr/libexec/nm-daemon-helper",
+                    "203.0.113.11",
+                    "helper-one",
+                ),
+                (
+                    "/usr/libexec/nm-daemon-helper",
+                    "203.0.113.12",
+                    "helper-two",
+                ),
+                ("/usr/sbin/NetworkManager", "198.51.100.9", "manager-only"),
+            ] {
+                let mut form = RuleForm::default();
+                form.name = name.to_owned();
+                form.protocol = TransportProtocol::Tcp;
+                form.port = "443".to_owned();
+                form.peer_network = peer.to_owned();
+                form.bind_application = true;
+                form.executable = path.to_owned();
+                form.cgroup = "/system.slice/NetworkManager.service".to_owned();
+                rules.push(Rule::new(
+                    form.to_rule_spec(&I18n::test_english())
+                        .map_err(std::io::Error::other)?,
+                )?);
+            }
+            let mut app = App::new(false, I18n::load(locale)?);
+            app.view = View::Outbound;
+            app.set_snapshot(Snapshot {
+                revision: 1,
+                flow_generation: 1,
+                mode: Mode::Learning,
+                rules,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(220, 44))?;
+            for row in 0..3 {
+                terminal.draw(|frame| draw_outbound_rules(frame, &app, frame.area()))?;
+                let screen = buffer_text(terminal.backend());
+                assert!(
+                    screen.contains("/system.slice/NetworkManager.service"),
+                    "{screen}"
+                );
+                assert!(
+                    screen.contains("├ /usr/libexec/nm-daemon-helper"),
+                    "{screen}"
+                );
+                assert!(screen.contains("└ /usr/sbin/NetworkManager"), "{screen}");
+                // Inspect the actual right-hand cells: both paths deliberately
+                // remain visible in the left tree even when filtered out here.
+                let right = Layout::default()
+                    .direction(LayoutDirection::Horizontal)
+                    .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+                    .split(Rect::new(0, 0, 220, 44))[1];
+                let buffer = terminal.backend().buffer();
+                let right_text = (right.y..right.bottom())
+                    .map(|y| {
+                        (right.x..right.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(
+                    right_text.contains("203.0.113.11"),
+                    row != 2,
+                    "{right_text}"
+                );
+                assert_eq!(
+                    right_text.contains("203.0.113.12"),
+                    row != 2,
+                    "{right_text}"
+                );
+                assert_eq!(
+                    right_text.contains("198.51.100.9"),
+                    row != 1,
+                    "{right_text}"
+                );
+                if row == 1 {
+                    assert!(
+                        right_text.contains("/usr/libexec/nm-daemon-helper"),
+                        "{right_text}"
+                    );
+                    assert!(
+                        !right_text.contains("/usr/sbin/NetworkManager"),
+                        "{right_text}"
+                    );
+                } else if row == 2 {
+                    assert!(
+                        right_text.contains("/usr/sbin/NetworkManager"),
+                        "{right_text}"
+                    );
+                    assert!(
+                        !right_text.contains("/usr/libexec/nm-daemon-helper"),
+                        "{right_text}"
+                    );
+                }
+                app.select_next_rule();
+            }
+            app.select_previous_rule();
+            app.select_previous_rule();
+            terminal.draw(|frame| draw_outbound_rules(frame, &app, frame.area()))?;
+            let screen = buffer_text(terminal.backend());
+            for peer in ["203.0.113.11", "203.0.113.12", "198.51.100.9"] {
+                assert!(screen.contains(peer), "{screen}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_application_template_is_visible_in_its_application_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut form = RuleForm::default();
+        form.name = "application access template".to_owned();
+        form.origin = RuleOrigin::Template;
+        form.enabled = false;
+        form.bind_application = true;
+        form.executable = "/usr/bin/example-client".to_owned();
+        form.cgroup = "/system.slice/example.service".to_owned();
+        let template = Rule::new(
+            form.to_rule_spec(&I18n::test_english())
+                .map_err(std::io::Error::other)?,
+        )?;
+
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![template],
+        });
+        let groups = app.outbound_groups();
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].key, OutboundGroupKey::Cgroup(_)));
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 36))?;
+        terminal.draw(|frame| {
+            draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+        })?;
+        let screen = buffer_text(terminal.backend());
+        for expected in [
+            "application access template",
+            "application template",
+            "Accept",
+            "/usr/bin/example-client",
+            "/system.slice/example.service",
+        ] {
+            assert!(screen.contains(expected), "missing {expected}: {screen}");
+        }
         Ok(())
     }
 
@@ -1665,6 +2275,31 @@ mod tests {
         })?;
         let screen = buffer_text(terminal.backend());
         assert!(screen.contains("ARGTAIL"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn rule_details_escape_arguments_without_replacing_or_conflating_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut form = RuleForm::default();
+        form.name = "command control characters".to_owned();
+        form.protocol = TransportProtocol::Tcp;
+        form.bind_application = true;
+        form.executable = "/usr/bin/client".to_owned();
+        form.command_mode = CommandMode::Exact;
+        form.arguments =
+            r#"["client","line\nnext","line\\nnext","\u001b[31m\u202eSECRET"]"#.to_owned();
+        let i18n = I18n::test_english();
+        let rule = Rule::new(form.to_rule_spec(&i18n).map_err(std::io::Error::other)?)?;
+        let lines = rule_detail_lines(&rule, &i18n);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!text.chars().any(crate::i18n::is_unsafe_dynamic_character));
+        assert!(text.contains(r#""line\nnext","line\\nnext""#));
+        assert!(text.contains(r#""\u001b[31m\u202eSECRET""#));
         Ok(())
     }
 
@@ -1712,11 +2347,19 @@ mod tests {
     }
 
     fn buffer_text(backend: &TestBackend) -> String {
-        backend
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect()
+        let buffer = backend.buffer();
+        let mut text = String::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let mut x = buffer.area.x;
+            while x < buffer.area.right() {
+                let symbol = buffer[(x, y)].symbol();
+                text.push_str(symbol);
+                // TestBackend can retain old symbols under the trailing cell
+                // of a wide glyph. A real terminal does not display those cells.
+                x = x.saturating_add(u16::try_from(symbol.width()).unwrap_or(u16::MAX).max(1));
+            }
+            text.push('\n');
+        }
+        text
     }
 }

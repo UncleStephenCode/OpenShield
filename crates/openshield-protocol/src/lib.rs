@@ -4,7 +4,10 @@
 
 use std::io::{self, Read, Write};
 
-use openshield_core::{ApplicationInterception, Event, Mode, Rule, RuleSpec};
+use ipnet::IpNet;
+use openshield_core::{
+    ApplicationInterception, ApplicationPath, CgroupPath, Direction, Event, Mode, Rule, RuleSpec,
+};
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -330,6 +333,80 @@ pub enum ControlRequest {
         id: Uuid,
         enabled: bool,
     },
+    /// Applies one atomic policy transaction to the current members of an
+    /// outbound group. The acknowledgement carries the final revision and
+    /// no single affected rule; individual changes retain ordered events.
+    ManageOutboundGroup {
+        expected_revision: u64,
+        group: OutboundGroupSelector,
+        action: OutboundGroupAction,
+    },
+}
+
+/// Stable group identity, using the same cgroup/executable/destination
+/// priority as the outbound rule tree. Paths are validated during decoding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "snake_case",
+    tag = "type",
+    content = "data"
+)]
+pub enum OutboundGroupSelector {
+    /// An exact cgroup root, optionally restricted to one executable child.
+    Cgroup {
+        cgroup: CgroupPath,
+        executable: Option<ApplicationPath>,
+    },
+    /// Executable fallback group, excluding members of any cgroup group.
+    Executable { executable: ApplicationPath },
+    /// Destination fallback group, excluding visible application groups.
+    Destination { peer_network: Option<IpNet> },
+}
+
+impl OutboundGroupSelector {
+    /// Tests membership without exposing redacted application metadata.
+    #[must_use]
+    pub fn matches(&self, rule: &Rule) -> bool {
+        if rule.spec.direction != Direction::Outbound {
+            return false;
+        }
+        let application = rule
+            .spec
+            .application
+            .as_ref()
+            .filter(|application| !application.metadata_redacted);
+        match self {
+            Self::Cgroup { cgroup, executable } => application.is_some_and(|application| {
+                application.cgroup.as_ref() == Some(cgroup)
+                    && executable.as_ref().is_none_or(|executable| {
+                        application.executable.as_ref() == Some(executable)
+                    })
+            }),
+            Self::Executable { executable } => application.is_some_and(|application| {
+                application.cgroup.is_none() && application.executable.as_ref() == Some(executable)
+            }),
+            Self::Destination { peer_network } => {
+                application.is_none_or(|application| {
+                    application.cgroup.is_none() && application.executable.is_none()
+                }) && rule.spec.peer_network.map(|network| network.trunc())
+                    == peer_network.map(|network| network.trunc())
+            }
+        }
+    }
+}
+
+/// Group actions change only the named policy property. In particular,
+/// changing the verdict does not enable disabled rules or templates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum OutboundGroupAction {
+    Delete,
+    Accept,
+    Reject,
+    Drop,
+    Enable,
+    Disable,
 }
 
 impl ControlRequest {
@@ -350,6 +427,9 @@ impl ControlRequest {
                 expected_revision, ..
             }
             | Self::SetRuleEnabled {
+                expected_revision, ..
+            }
+            | Self::ManageOutboundGroup {
                 expected_revision, ..
             } => *expected_revision,
         }
@@ -769,6 +849,143 @@ mod tests {
     }
 
     #[test]
+    fn outbound_group_requests_round_trip_all_scopes_and_actions() -> Result<(), Box<dyn Error>> {
+        let executable = ApplicationPath::new("/usr/bin/client")?;
+        let cgroup = CgroupPath::new("/system.slice/client.service")?;
+        for group in [
+            OutboundGroupSelector::Cgroup {
+                cgroup: cgroup.clone(),
+                executable: None,
+            },
+            OutboundGroupSelector::Cgroup {
+                cgroup,
+                executable: Some(executable.clone()),
+            },
+            OutboundGroupSelector::Executable { executable },
+            OutboundGroupSelector::Destination {
+                peer_network: Some("203.0.113.27/24".parse()?),
+            },
+            OutboundGroupSelector::Destination { peer_network: None },
+        ] {
+            for action in [
+                OutboundGroupAction::Delete,
+                OutboundGroupAction::Accept,
+                OutboundGroupAction::Reject,
+                OutboundGroupAction::Drop,
+                OutboundGroupAction::Enable,
+                OutboundGroupAction::Disable,
+            ] {
+                let control = ControlRequest::ManageOutboundGroup {
+                    expected_revision: 41,
+                    group: group.clone(),
+                    action,
+                };
+                assert_eq!(control.expected_revision(), 41);
+                let request = Request::Control(control);
+                let mut bytes = Vec::new();
+                write_request(&mut bytes, &request)?;
+                assert_eq!(read_request(&mut Cursor::new(bytes))?, request);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_group_selectors_reject_invalid_or_ambiguous_wire_values() {
+        for payload in [
+            r#"{"type":"executable","data":{"executable":"relative"}}"#,
+            r#"{"type":"executable","data":{"executable":"/usr/../bin/client"}}"#,
+            r#"{"type":"cgroup","data":{"cgroup":"/../service","executable":null}}"#,
+            r#"{"type":"cgroup","data":{"cgroup":"/service","executable":"relative"}}"#,
+            r#"{"type":"destination","data":{"peer_network":"invalid"}}"#,
+            r#"{"type":"destination","data":{"peer_network":null,"executable":"/secret"}}"#,
+            r#"{"type":"executable","data":{"executable":"/client","metadata_redacted":true}}"#,
+            r#"{"type":"executable","data":{"executable":"/first","executable":"/second"}}"#,
+        ] {
+            assert!(serde_json::from_str::<OutboundGroupSelector>(payload).is_err());
+        }
+        assert!(serde_json::from_str::<OutboundGroupAction>(r#""allow""#).is_err());
+    }
+
+    #[test]
+    fn outbound_group_membership_respects_priority_and_redaction() -> Result<(), Box<dyn Error>> {
+        let mut rule = largest_rule()?;
+        rule.spec.peer_network = Some("203.0.113.27/24".parse()?);
+        let executable = ApplicationPath::new("/usr/bin/client")?;
+        let cgroup = CgroupPath::new("/system.slice/client.service")?;
+        let application = rule
+            .spec
+            .application
+            .as_mut()
+            .ok_or("missing application")?;
+        application.executable = Some(executable.clone());
+        application.cgroup = Some(cgroup.clone());
+        let root = OutboundGroupSelector::Cgroup {
+            cgroup: cgroup.clone(),
+            executable: None,
+        };
+        let child = OutboundGroupSelector::Cgroup {
+            cgroup,
+            executable: Some(executable.clone()),
+        };
+        let fallback = OutboundGroupSelector::Executable { executable };
+        let destination = OutboundGroupSelector::Destination {
+            peer_network: Some("203.0.113.0/24".parse()?),
+        };
+        let any_destination = OutboundGroupSelector::Destination { peer_network: None };
+        assert!(root.matches(&rule));
+        assert!(child.matches(&rule));
+        assert!(!fallback.matches(&rule));
+        assert!(!destination.matches(&rule));
+
+        let mut sibling = rule.clone();
+        sibling
+            .spec
+            .application
+            .as_mut()
+            .ok_or("missing application")?
+            .executable = Some(ApplicationPath::new("/usr/bin/other")?);
+        assert!(root.matches(&sibling));
+        assert!(!child.matches(&sibling));
+
+        let mut fallback_rule = rule.clone();
+        fallback_rule
+            .spec
+            .application
+            .as_mut()
+            .ok_or("missing application")?
+            .cgroup = None;
+        assert!(!root.matches(&fallback_rule));
+        assert!(!child.matches(&fallback_rule));
+        assert!(fallback.matches(&fallback_rule));
+        assert!(!destination.matches(&fallback_rule));
+
+        let redacted = rule.redacted_for_observer();
+        assert!(!root.matches(&redacted));
+        assert!(!child.matches(&redacted));
+        assert!(!fallback.matches(&redacted));
+        assert!(destination.matches(&redacted));
+        assert!(
+            !OutboundGroupSelector::Executable {
+                executable: ApplicationPath::new("/redacted")?,
+            }
+            .matches(&redacted)
+        );
+
+        rule.spec.application = None;
+        assert!(destination.matches(&rule));
+        assert!(!any_destination.matches(&rule));
+        rule.spec.peer_network = None;
+        assert!(!destination.matches(&rule));
+        assert!(any_destination.matches(&rule));
+        rule.spec.direction = Direction::Inbound;
+        for selector in [&root, &child, &fallback, &destination, &any_destination] {
+            assert!(!selector.matches(&rule));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn status_round_trip_preserves_backend_and_nfqueue_counters() -> Result<(), Box<dyn Error>> {
         let nfqueue = NfqueueCounters {
             queue_overflow: 1,
@@ -1051,6 +1268,42 @@ mod tests {
         let mut bytes = Vec::new();
         write_response(&mut bytes, &response)?;
         assert!(bytes.len() <= MAX_FRAME_SIZE + 4);
+        Ok(())
+    }
+
+    #[test]
+    fn maximum_control_argument_expansion_fits_request_and_response_frames()
+    -> Result<(), Box<dyn Error>> {
+        let mut rule = largest_rule()?;
+        rule.spec
+            .application
+            .as_mut()
+            .ok_or("application selector missing")?
+            .command_line = Some(CommandLineSelector::new(
+            CommandLineMatch::Exact,
+            vec![CommandArgument::new(
+                "\u{01}".repeat(MAX_COMMAND_LINE_BYTES - 1),
+            )?],
+        )?);
+        rule.spec.validate()?;
+        let request = Request::Control(ControlRequest::CreateRule {
+            expected_revision: u64::MAX,
+            rule: rule.spec.clone(),
+        });
+        let response = Response::RulesPage {
+            revision: u64::MAX,
+            rules: vec![rule],
+            next_after: Some(Uuid::new_v4()),
+        };
+        let mut request_bytes = Vec::new();
+        write_request(&mut request_bytes, &request)?;
+        assert!(request_bytes.len() > MAX_COMMAND_LINE_BYTES * 6);
+        assert!(request_bytes.len() <= MAX_FRAME_SIZE + 4);
+        assert_eq!(read_request(&mut Cursor::new(request_bytes))?, request);
+        let mut response_bytes = Vec::new();
+        write_response(&mut response_bytes, &response)?;
+        assert!(response_bytes.len() <= MAX_FRAME_SIZE + 4);
+        assert_eq!(read_response(&mut Cursor::new(response_bytes))?, response);
         Ok(())
     }
 

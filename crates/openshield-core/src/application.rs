@@ -8,8 +8,9 @@ use crate::LearnedEndpoint;
 pub const MAX_APPLICATION_PATH_BYTES: usize = 4_096;
 pub const MAX_CGROUP_PATH_BYTES: usize = 1_024;
 pub const MAX_COMMAND_ARGUMENTS: usize = 64;
-pub const MAX_COMMAND_ARGUMENT_BYTES: usize = 1_024;
 pub const MAX_COMMAND_LINE_BYTES: usize = 8 * 1_024;
+/// An argument may use the command-line budget, less its terminating NUL.
+pub const MAX_COMMAND_ARGUMENT_BYTES: usize = MAX_COMMAND_LINE_BYTES - 1;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -117,20 +118,25 @@ impl<'de> Deserialize<'de> for CgroupPath {
 pub struct CommandArgument(String);
 
 impl CommandArgument {
-    /// Constructs one bounded command-line argument without flattening argv.
+    /// Constructs one bounded UTF-8 argument without flattening or rewriting argv.
+    ///
+    /// Control and formatting characters are valid argument bytes, not an
+    /// identity-validation error. Matching and serialization preserve them;
+    /// [`fmt::Display`] produces an escaped JSON string for safe presentation.
     ///
     /// # Errors
     ///
     /// Returns [`ApplicationValidationError::InvalidCommandArgument`] for an
-    /// oversized or terminal-unsafe argument.
+    /// oversized argument or an embedded NUL, which cannot occur inside argv.
     pub fn new(value: impl Into<String>) -> Result<Self, ApplicationValidationError> {
         let value = value.into();
-        if value.len() > MAX_COMMAND_ARGUMENT_BYTES || value.chars().any(is_unsafe_text_character) {
+        if value.len() > MAX_COMMAND_ARGUMENT_BYTES || value.contains('\0') {
             return Err(ApplicationValidationError::InvalidCommandArgument);
         }
         Ok(Self(value))
     }
 
+    /// Returns the unmodified argument for matching, not terminal output.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -139,7 +145,29 @@ impl CommandArgument {
 
 impl fmt::Display for CommandArgument {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        // JSON escaping is reversible: a literal backslash followed by `n`
+        // must never be displayed like an actual newline argument. Escape
+        // formatting characters as well, which ordinary JSON permits verbatim.
+        formatter.write_str("\"")?;
+        for character in self.0.chars() {
+            match character {
+                '\\' => formatter.write_str("\\\\")?,
+                '"' => formatter.write_str("\\\"")?,
+                '\n' => formatter.write_str("\\n")?,
+                '\r' => formatter.write_str("\\r")?,
+                '\t' => formatter.write_str("\\t")?,
+                '\u{08}' => formatter.write_str("\\b")?,
+                '\u{0c}' => formatter.write_str("\\f")?,
+                character
+                    if is_unsafe_text_character(character)
+                        || matches!(character, '\u{2028}' | '\u{2029}') =>
+                {
+                    write!(formatter, "\\u{:04x}", u32::from(character))?;
+                }
+                character => write!(formatter, "{character}")?,
+            }
+        }
+        formatter.write_str("\"")
     }
 }
 
@@ -496,7 +524,7 @@ pub enum ApplicationValidationError {
     InvalidExecutablePath,
     #[error("cgroup path must be a bounded absolute path without traversal or controls")]
     InvalidCgroupPath,
-    #[error("command argument is oversized or contains unsafe control characters")]
+    #[error("command argument exceeds its byte bound or contains an embedded NUL")]
     InvalidCommandArgument,
     #[error("command-line selector is empty or exceeds its fixed bounds")]
     InvalidCommandLine,
@@ -532,6 +560,107 @@ fn is_unsafe_text_character(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argument_controls_are_preserved_but_displayed_as_reversible_safe_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw = "line\n\t\r\u{08}\u{0c}\u{1b}[31m\u{7f}\u{85}\u{202e}rtl\u{2066}\u{feff}\u{2028}\u{2029}\"\\Русский🙂";
+        let argument = CommandArgument::new(raw)?;
+        assert_eq!(argument.as_str().as_bytes(), raw.as_bytes());
+        let displayed = argument.to_string();
+        assert!(!displayed.chars().any(is_unsafe_text_character));
+        assert!(!displayed.contains(['\u{2028}', '\u{2029}']));
+        assert!(displayed.contains("\\n\\t\\r\\b\\f\\u001b[31m"));
+        assert!(displayed.contains("\\u202ertl\\u2066\\ufeff"));
+        assert_eq!(
+            serde_json::from_str::<CommandArgument>(&displayed)?,
+            argument
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandArgument>(&serde_json::to_string(&argument)?)?,
+            argument
+        );
+        assert!(
+            !format!("{argument:?}")
+                .chars()
+                .any(is_unsafe_text_character)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn argument_escapes_do_not_conflate_exact_or_prefix_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (raw, literal) in [
+            ("\n", "\\n"),
+            ("\u{1b}[31m", "\\u001b[31m"),
+            ("\u{202e}name", "\\u202ename"),
+            ("\t", " "),
+            ("", "\"\""),
+        ] {
+            let raw = CommandArgument::new(raw)?;
+            let literal = CommandArgument::new(literal)?;
+            assert_ne!(raw, literal);
+            assert_ne!(raw.to_string(), literal.to_string());
+            for kind in [CommandLineMatch::Exact, CommandLineMatch::Prefix] {
+                let selector = CommandLineSelector::new(kind, vec![raw.clone()])?;
+                assert!(selector.matches(std::slice::from_ref(&raw)));
+                assert!(!selector.matches(std::slice::from_ref(&literal)));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn long_arguments_keep_the_total_nul_terminated_command_line_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let maximum = CommandArgument::new("x".repeat(MAX_COMMAND_LINE_BYTES - 1))?;
+        let selector = CommandLineSelector::new(CommandLineMatch::Exact, vec![maximum.clone()])?;
+        assert_eq!(
+            selector.arguments[0].as_str().len(),
+            MAX_COMMAND_LINE_BYTES - 1
+        );
+        assert!(CommandArgument::new("x".repeat(MAX_COMMAND_LINE_BYTES)).is_err());
+        assert!(CommandArgument::new("я".repeat(MAX_COMMAND_LINE_BYTES / 2)).is_err());
+        assert!(
+            CommandLineSelector::new(
+                CommandLineMatch::Exact,
+                vec![maximum, CommandArgument::new("")?],
+            )
+            .is_err()
+        );
+        assert!(
+            CommandLineSelector::new(
+                CommandLineMatch::Exact,
+                vec![CommandArgument::new("")?; MAX_COMMAND_ARGUMENTS + 1],
+            )
+            .is_err()
+        );
+        assert!(CommandLineSelector::new(CommandLineMatch::Exact, vec![]).is_err());
+        assert!(
+            CommandLineSelector::new(CommandLineMatch::Exact, vec![CommandArgument::new("")?],)
+                .is_ok()
+        );
+        assert!(CommandArgument::new("embedded\0nul").is_err());
+        assert!(serde_json::from_str::<CommandArgument>(r#""embedded\u0000nul""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selector_preserves_long_multiline_arguments_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut actual = identity()?;
+        let raw = format!("{}\n\u{1b}[31m\\n", "x".repeat(2_048));
+        actual.command_line.push(CommandArgument::new(raw.clone())?);
+        let learned = actual.learned_selector()?;
+        assert!(learned.matches(&actual));
+        actual.command_line.pop();
+        actual
+            .command_line
+            .push(CommandArgument::new(raw.replace('\n', "\\n"))?);
+        assert!(!learned.matches(&actual));
+        Ok(())
+    }
 
     fn identity() -> Result<ApplicationIdentity, ApplicationValidationError> {
         Ok(ApplicationIdentity {
@@ -672,6 +801,131 @@ mod tests {
         assert!(selector.executable_file.is_some());
         assert_eq!(selector.cgroup, identity.cgroups.first().cloned());
         assert!(selector.matches(&identity));
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_learned_selector_accepts_restart_with_unchanged_constraints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        let learned = original.learned_selector()?;
+        let persisted: ApplicationSelector =
+            serde_json::from_str(&serde_json::to_string(&learned)?)?;
+        for pid in [original.pid, original.pid + 1] {
+            let restarted = ApplicationIdentity {
+                pid,
+                process_start_time_ticks: original.process_start_time_ticks + 100,
+                ..original.clone()
+            };
+            restarted.validate()?;
+            assert!(persisted.matches(&restarted));
+            assert_eq!(restarted.learned_selector()?, learned);
+        }
+        // A persisted rule identifies the allowed application, not one PID
+        // lifetime. Live attribution must independently race-check each new
+        // process and its socket before evaluating this selector.
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selector_rejects_each_changed_restart_constraint_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        let learned = original.learned_selector()?;
+        let mut changed_arguments = original.command_line.clone();
+        changed_arguments.push(CommandArgument::new("--new-session-token=2")?);
+        let changed_identities = [
+            (
+                "command_line",
+                ApplicationIdentity {
+                    command_line: changed_arguments,
+                    ..original.clone()
+                },
+            ),
+            (
+                "cgroup",
+                ApplicationIdentity {
+                    cgroups: vec![CgroupPath::new("/user.slice/new-session.scope")?],
+                    ..original.clone()
+                },
+            ),
+            (
+                "uid",
+                ApplicationIdentity {
+                    uid: original.uid + 1,
+                    ..original.clone()
+                },
+            ),
+            (
+                "executable_path",
+                ApplicationIdentity {
+                    executable: ApplicationPath::new("/usr/bin/another-curl")?,
+                    ..original.clone()
+                },
+            ),
+            (
+                "executable_version_inode",
+                ApplicationIdentity {
+                    executable_file: ExecutableFileId {
+                        inode: original.executable_file.inode + 1,
+                        ..original.executable_file
+                    },
+                    ..original.clone()
+                },
+            ),
+            (
+                "executable_version_ctime",
+                ApplicationIdentity {
+                    executable_file: ExecutableFileId {
+                        ctime_seconds: original.executable_file.ctime_seconds + 1,
+                        ..original.executable_file
+                    },
+                    ..original.clone()
+                },
+            ),
+        ];
+        for (field, mut changed) in changed_identities {
+            changed.pid += 1;
+            changed.process_start_time_ticks += 100;
+            changed.validate()?;
+            assert!(!learned.matches(&changed), "changed {field} was accepted");
+            assert_ne!(changed.learned_selector()?, learned);
+        }
+        assert!(learned.matches(&original));
+        Ok(())
+    }
+
+    #[test]
+    fn manually_pinned_executable_selector_does_not_inherit_learned_constraints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        // This independent manual selector intentionally omits argv, UID and
+        // cgroup. Keep the executable pin required by enabled persisted rules;
+        // creating a learned selector must never remove its own constraints.
+        let manual = ApplicationSelector::new(
+            Some(original.executable.clone()),
+            Some(original.executable_file),
+            None,
+            None,
+            None,
+        )?;
+        let learned = original.learned_selector()?;
+        let mut restarted = ApplicationIdentity {
+            pid: original.pid + 1,
+            process_start_time_ticks: original.process_start_time_ticks + 100,
+            command_line: vec![CommandArgument::new("curl")?],
+            uid: original.uid + 1,
+            cgroups: vec![CgroupPath::new("/user.slice/new-session.scope")?],
+            ..original.clone()
+        };
+        restarted.validate()?;
+        assert!(manual.matches(&restarted));
+        assert!(!learned.matches(&restarted));
+        restarted.executable_file.inode += 1;
+        assert!(!manual.matches(&restarted));
+        restarted.executable_file = original.executable_file;
+        restarted.executable = ApplicationPath::new("/usr/bin/another-curl")?;
+        assert!(!manual.matches(&restarted));
         Ok(())
     }
 

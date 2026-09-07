@@ -17,9 +17,9 @@ use crossterm::event::{
 };
 use nix::unistd::geteuid;
 use openshield_core::Mode;
-use openshield_protocol::{Ack, ControlRequest, ErrorCode};
+use openshield_protocol::{Ack, ControlRequest, ErrorCode, OutboundGroupAction};
 
-use crate::app::{App, FormField, Overlay, View};
+use crate::app::{App, FormField, GROUP_ACTIONS, Overlay, View};
 use crate::i18n::{I18n, Locale};
 use crate::terminal::TerminalSession;
 use crate::transport::{Observer, ObserverUpdate, SocketPaths};
@@ -250,6 +250,7 @@ enum ControlAction {
     UpdateRule,
     DeleteRule,
     SetRuleEnabled(bool),
+    ManageOutboundGroup(OutboundGroupAction),
 }
 
 impl ControlAction {
@@ -260,6 +261,9 @@ impl ControlAction {
             ControlRequest::UpdateRule { .. } => Self::UpdateRule,
             ControlRequest::DeleteRule { .. } => Self::DeleteRule,
             ControlRequest::SetRuleEnabled { enabled, .. } => Self::SetRuleEnabled(*enabled),
+            ControlRequest::ManageOutboundGroup { action, .. } => {
+                Self::ManageOutboundGroup(*action)
+            }
         }
     }
 }
@@ -277,6 +281,15 @@ fn ack_message(ack: &Ack, action: ControlAction, i18n: &I18n) -> String {
             &[("mode", mode), ("revision", revision.as_str())],
         );
     }
+    if let ControlAction::ManageOutboundGroup(action) = action {
+        return i18n.format(
+            "control.group_updated",
+            &[
+                ("action", ui::group_action_label(action, i18n)),
+                ("revision", revision.as_str()),
+            ],
+        );
+    }
     let name = ack.affected_rule.as_ref().map_or_else(
         || i18n.tr("common.unknown").to_owned(),
         |rule| rule.spec.name.to_string(),
@@ -287,7 +300,9 @@ fn ack_message(ack: &Ack, action: ControlAction, i18n: &I18n) -> String {
         ControlAction::DeleteRule => "control.rule_deleted",
         ControlAction::SetRuleEnabled(true) => "control.rule_enabled",
         ControlAction::SetRuleEnabled(false) => "control.rule_disabled",
-        ControlAction::SetMode(_) => unreachable!("mode action returned above"),
+        ControlAction::SetMode(_) | ControlAction::ManageOutboundGroup(_) => {
+            unreachable!("non-rule action returned above")
+        }
     };
     i18n.format(
         key,
@@ -307,6 +322,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
         Overlay::ModePicker { .. } => handle_mode_picker_key(app, key),
         Overlay::ConfirmBlockAll => handle_block_confirmation_key(app, key),
         Overlay::ConfirmDelete { .. } => handle_delete_confirmation_key(app, key),
+        Overlay::GroupMenu { .. } => handle_group_menu_key(app, key),
+        Overlay::ConfirmGroup { .. } => handle_group_confirmation_key(app, key),
         Overlay::Editor(_) => handle_editor_key(app, key),
         Overlay::Message { .. } => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
@@ -341,6 +358,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
             app.scroll_rule_details(false);
         }
         KeyCode::Char('m' | 'M') => app.open_mode_picker(),
+        KeyCode::Char('g' | 'G') if app.view == View::Outbound => app.open_group_menu(),
         KeyCode::Char('n' | 'N') if matches!(app.view, View::Outbound | View::Inbound) => {
             app.open_create_rule();
         }
@@ -415,6 +433,34 @@ fn handle_delete_confirmation_key(app: &mut App, key: KeyEvent) -> Option<Contro
     }
 }
 
+fn handle_group_menu_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    let Overlay::GroupMenu { selected, .. } = &app.overlay else {
+        return None;
+    };
+    let selected = *selected;
+    match key.code {
+        KeyCode::Esc => app.close_overlay(),
+        KeyCode::Up => app.move_group_action(true),
+        KeyCode::Down => app.move_group_action(false),
+        KeyCode::Enter => app.request_group_action(selected),
+        KeyCode::Char(character @ '1'..='6') => {
+            app.request_group_action(GROUP_ACTIONS[character as usize - '1' as usize]);
+        }
+        _ => {}
+    }
+    None
+}
+
+fn handle_group_confirmation_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    match key.code {
+        KeyCode::Char('y' | 'Y' | 'д' | 'Д') => app.confirm_group_action(true),
+        KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Esc | KeyCode::Enter => {
+            app.confirm_group_action(false)
+        }
+        _ => None,
+    }
+}
+
 fn handle_editor_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
     match key.code {
         KeyCode::Esc => {
@@ -435,7 +481,8 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
         KeyCode::Right | KeyCode::Char(' ')
             if matches!(
                 form.active_field,
-                FormField::Protocol
+                FormField::Action
+                    | FormField::Protocol
                     | FormField::Application
                     | FormField::CommandMode
                     | FormField::Enabled
@@ -493,6 +540,76 @@ mod tests {
         );
         assert!(request.is_none());
         assert_eq!(app.overlay, Overlay::ConfirmBlockAll);
+    }
+
+    #[test]
+    fn group_keyboard_actions_require_confirmation_and_are_outbound_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rule = Rule::new(RuleSpec::new(
+            RuleName::new("outbound")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("192.0.2.1/32".parse()?),
+            None,
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?)?;
+        let press = |app: &mut App, code| handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+        for (index, action) in GROUP_ACTIONS.into_iter().enumerate() {
+            let mut app = App::new(false, I18n::test_english());
+            app.set_snapshot(openshield_core::Snapshot {
+                revision: 4,
+                flow_generation: 1,
+                mode: Mode::Enforcing,
+                rules: vec![rule.clone()],
+            });
+            assert!(press(&mut app, KeyCode::Char('g')).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+            app.view = View::Outbound;
+            assert!(press(&mut app, KeyCode::Char('g')).is_none());
+            assert!(matches!(app.overlay, Overlay::GroupMenu { .. }));
+            for _ in 0..index {
+                assert!(press(&mut app, KeyCode::Down).is_none());
+            }
+            assert!(press(&mut app, KeyCode::Enter).is_none());
+            assert!(
+                matches!(app.overlay, Overlay::ConfirmGroup { action: selected, .. } if selected == action)
+            );
+            assert!(press(&mut app, KeyCode::Enter).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(press(&mut app, KeyCode::Char('G')).is_none());
+            let number = char::from(b'1' + u8::try_from(index)?);
+            assert!(press(&mut app, KeyCode::Char(number)).is_none());
+            assert!(
+                matches!(press(&mut app, KeyCode::Char('д')), Some(ControlRequest::ManageOutboundGroup { expected_revision: 4, action: selected, .. }) if selected == action)
+            );
+            assert_eq!(app.overlay, Overlay::None);
+            app.read_only = true;
+            assert!(press(&mut app, KeyCode::Char('g')).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_ack_uses_group_action_without_unknown_rule_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let i18n = I18n::load(Locale::Ru)?;
+        for action in GROUP_ACTIONS {
+            let message = ack_message(
+                &Ack::new(25, None),
+                ControlAction::ManageOutboundGroup(action),
+                &i18n,
+            );
+            assert!(
+                message.contains(ui::group_action_label(action, &i18n)),
+                "{message}"
+            );
+            assert!(message.contains("25"), "{message}");
+            assert!(!message.contains(i18n.tr("common.unknown")), "{message}");
+        }
+        Ok(())
     }
 
     #[test]

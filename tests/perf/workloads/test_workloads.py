@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -939,7 +940,344 @@ class ProtocolUnitTests(unittest.TestCase):
             )
 
 
+class TcpConnectionCloseTests(unittest.TestCase):
+    """Exercise close ordering and budgets without creating real sockets."""
+
+    class ScriptedClock:
+        def __init__(self, costs=None):
+            self.now = 100.0
+            self.costs = costs or {}
+            self.timeouts = []
+            self.active_timeout = None
+
+        def monotonic(self):
+            return self.now
+
+        async def wait_for(self, awaitable, timeout):
+            self.timeouts.append(timeout)
+            self.active_timeout = timeout
+            try:
+                return await awaitable
+            finally:
+                self.active_timeout = None
+
+        def consume(self, stage):
+            cost = self.costs.get(stage, 0.0)
+            if self.active_timeout is not None and cost >= self.active_timeout:
+                self.now += max(0.0, self.active_timeout)
+                raise asyncio.TimeoutError
+            self.now += cost
+
+    class Reader:
+        def __init__(self, events, *, result=b"", error=None, clock=None):
+            self.events = events
+            self.result = result
+            self.error = error
+            self.clock = clock
+
+        async def read(self, size):
+            self.events.append(("read", size))
+            if self.clock is not None:
+                self.clock.consume("read")
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    class Writer:
+        def __init__(self, events, *, errors=None, clock=None):
+            self.events = events
+            self.errors = errors or {}
+            self.clock = clock
+            self.transport = SimpleNamespace(abort=self.abort)
+
+        def _stage(self, stage):
+            self.events.append(stage)
+            if self.clock is not None:
+                self.clock.consume(stage)
+            if stage in self.errors:
+                raise self.errors[stage]
+
+        def write_eof(self):
+            self._stage("write_eof")
+
+        def write(self, data):
+            self.events.append(("write", len(data)))
+
+        async def drain(self):
+            self._stage("drain")
+
+        def close(self):
+            self._stage("close")
+
+        async def wait_closed(self):
+            self._stage("wait_closed")
+
+        def abort(self):
+            self._stage("abort")
+
+    def _client(self, *, io_timeout=1.0, mode="keepalive"):
+        client = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(
+                host="127.0.0.1",
+                port=18080,
+                duration=2.0,
+                operations=1,
+                seed=315,
+                pps=0.0,
+                cps=0.0,
+                mbps=0.0,
+                io_timeout=io_timeout,
+                latency_samples=16,
+                concurrency=1,
+                mode=mode,
+                keepalive_ratio=0.0 if mode == "short" else 1.0,
+                request_bytes=8,
+                response_mix=common.WeightedMix.fixed(8),
+            )
+        )
+        client.stats.active_change(1)
+        return client
+
+    def _run_with_clock(self, client, channel, clock, *, abort=False):
+        async def exercise():
+            # Replace only tcp's clock reference: the event loop and the
+            # thread-safe statistics continue to use the real monotonic clock.
+            with mock.patch.object(
+                tcp, "time", SimpleNamespace(monotonic=clock.monotonic)
+            ), mock.patch.object(tcp.asyncio, "wait_for", clock.wait_for):
+                if abort:
+                    await client._abort_connection(channel)
+                else:
+                    await client._close_connection(channel)
+
+        asyncio.run(exercise())
+
+    def _assert_closed(self, client, *, errors):
+        summary = client.stats.summary()
+        self.assertEqual(summary["errors"], errors)
+        self.assertEqual(summary["active_flows_current"], 0)
+
+    def test_normal_close_observes_peer_eof_before_local_close(self):
+        events = []
+        client = self._client()
+        clock = self.ScriptedClock(
+            {"drain": 0.25, "read": 0.35, "wait_closed": 0.15}
+        )
+        self._run_with_clock(
+            client,
+            (self.Reader(events, clock=clock), self.Writer(events, clock=clock)),
+            clock,
+        )
+        self.assertEqual(
+            events, ["write_eof", "drain", ("read", 1), "close", "wait_closed"]
+        )
+        self.assertEqual(len(clock.timeouts), 3)
+        for actual, expected in zip(clock.timeouts, (1.0, 0.75, 0.40)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(clock.now, 100.75)
+        self._assert_closed(client, errors=0)
+
+    def test_delayed_peer_eof_keeps_close_task_and_flow_live(self):
+        async def exercise():
+            events = []
+            waiting = asyncio.Event()
+            release = asyncio.Event()
+
+            class DelayedReader:
+                async def read(self, size):
+                    events.append(("read", size))
+                    waiting.set()
+                    await release.wait()
+                    return b""
+
+            client = self._client(io_timeout=2.0)
+            writer = self.Writer(events)
+            task = asyncio.create_task(
+                client._close_connection((DelayedReader(), writer))
+            )
+            try:
+                await asyncio.wait_for(waiting.wait(), timeout=1.0)
+                self.assertFalse(task.done())
+                self.assertNotIn("close", events)
+                self.assertEqual(client.stats.summary()["active_flows_current"], 1)
+                release.set()
+                await asyncio.wait_for(task, timeout=1.0)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(
+                events,
+                ["write_eof", "drain", ("read", 1), "close", "wait_closed"],
+            )
+            self._assert_closed(client, errors=0)
+
+        asyncio.run(exercise())
+
+    def test_all_close_stages_share_one_timeout_budget(self):
+        cases = (
+            {"drain": 1.25},
+            {"drain": 0.25, "read": 0.80},
+            {"drain": 0.25, "read": 0.50, "wait_closed": 0.50},
+        )
+        for costs in cases:
+            with self.subTest(costs=costs):
+                events = []
+                client = self._client()
+                clock = self.ScriptedClock(costs)
+                self._run_with_clock(
+                    client,
+                    (
+                        self.Reader(events, clock=clock),
+                        self.Writer(events, clock=clock),
+                    ),
+                    clock,
+                )
+                self.assertAlmostEqual(clock.now, 101.0)
+                self.assertTrue(all(0.0 < value <= 1.0 for value in clock.timeouts))
+                self.assertEqual(events.count("close"), 1)
+                self.assertEqual(events.count("abort"), 1)
+                self._assert_closed(client, errors=1)
+
+    def test_reset_or_unexpected_trailing_data_fails_close_once(self):
+        cases = (
+            (b"", ConnectionResetError("peer reset")),
+            (b"x", None),
+        )
+        for result, error in cases:
+            with self.subTest(result=result, error=type(error).__name__):
+                events = []
+                client = self._client()
+                clock = self.ScriptedClock()
+                self._run_with_clock(
+                    client,
+                    (
+                        self.Reader(events, result=result, error=error, clock=clock),
+                        self.Writer(events, clock=clock),
+                    ),
+                    clock,
+                )
+                self.assertEqual(events.count(("read", 1)), 1)
+                self.assertEqual(events.count("close"), 1)
+                self.assertEqual(events.count("wait_closed"), 1)
+                self._assert_closed(client, errors=1)
+
+    def test_local_close_failure_counts_once_even_when_peer_eof_also_failed(self):
+        for trailing in (b"", b"x"):
+            with self.subTest(trailing=trailing):
+                events = []
+                client = self._client()
+                clock = self.ScriptedClock()
+                self._run_with_clock(
+                    client,
+                    (
+                        self.Reader(events, result=trailing, clock=clock),
+                        self.Writer(
+                            events,
+                            errors={"wait_closed": ConnectionResetError("close reset")},
+                            clock=clock,
+                        ),
+                    ),
+                    clock,
+                )
+                self.assertEqual(events.count("close"), 1)
+                self.assertEqual(events.count("wait_closed"), 1)
+                self.assertEqual(events.count("abort"), 1)
+                self._assert_closed(client, errors=1)
+
+    def test_write_eof_or_drain_failure_still_releases_flow_once(self):
+        for stage in ("write_eof", "drain"):
+            with self.subTest(stage=stage):
+                events = []
+                client = self._client()
+                clock = self.ScriptedClock()
+                self._run_with_clock(
+                    client,
+                    (
+                        self.Reader(events, clock=clock),
+                        self.Writer(
+                            events,
+                            errors={stage: BrokenPipeError("peer closed")},
+                            clock=clock,
+                        ),
+                    ),
+                    clock,
+                )
+                self.assertNotIn(("read", 1), events)
+                self.assertEqual(events.count("close"), 1)
+                self.assertEqual(events.count("wait_closed"), 1)
+                self._assert_closed(client, errors=1)
+
+    def test_abort_skips_eof_and_preserves_original_exchange_error(self):
+        for close_cost in (0.0, 2.0):
+            with self.subTest(close_cost=close_cost):
+                events = []
+                client = self._client()
+                client.stats.add(errors=1)
+                clock = self.ScriptedClock({"wait_closed": close_cost})
+                self._run_with_clock(
+                    client,
+                    (self.Reader(events, clock=clock), self.Writer(events, clock=clock)),
+                    clock,
+                    abort=True,
+                )
+                self.assertNotIn("write_eof", events)
+                self.assertNotIn("drain", events)
+                self.assertNotIn(("read", 1), events)
+                self.assertNotIn("close", events)
+                self.assertEqual(events[0], "abort")
+                self.assertEqual(events.count("wait_closed"), 1)
+                self.assertEqual(events.count("abort"), 1 if close_cost == 0.0 else 2)
+                self.assertLessEqual(clock.now, 101.0)
+                self._assert_closed(client, errors=1)
+
+    def test_failed_worker_exchange_aborts_short_and_persistent_channels_once(self):
+        for mode in ("short", "keepalive"):
+            with self.subTest(mode=mode):
+                events = []
+                client = self._client(mode=mode)
+                channel = self.Reader(events), self.Writer(events)
+                connect = mock.AsyncMock(return_value=channel)
+                response = mock.AsyncMock(side_effect=ConnectionResetError("response reset"))
+
+                async def exercise():
+                    with mock.patch.object(
+                        client, "_new_connection", connect
+                    ), mock.patch.object(
+                        client, "_read_http_response", response
+                    ), mock.patch.object(tcp.asyncio, "sleep", mock.AsyncMock()):
+                        await client._worker(0)
+
+                asyncio.run(exercise())
+                connect.assert_awaited_once()
+                response.assert_awaited_once()
+                self.assertEqual(events.count("abort"), 1)
+                self.assertEqual(events.count("wait_closed"), 1)
+                self.assertEqual(events.count("drain"), 1)
+                self.assertNotIn("write_eof", events)
+                self.assertNotIn(("read", 1), events)
+                self.assertNotIn("close", events)
+                self._assert_closed(client, errors=1)
+
+
 class SocketIntegrationTests(unittest.TestCase):
+    def _assert_tcp_naturally_drained(self, running):
+        # A client's observed FIN may precede the server thread's bookkeeping.
+        # Permit that bounded scheduling race, but never force stop to satisfy
+        # a successful client's claim that all connections are finished.
+        deadline = time.monotonic() + 1.0
+        while True:
+            snapshot = running.server.stats.summary()
+            drained = snapshot["active_flows_current"] == 0 and snapshot.get(
+                "connections_closed", 0
+            ) == snapshot.get("connections", 0)
+            if drained or time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        self.assertFalse(running.server.stop.is_set())
+        self.assertTrue(drained, f"TCP peer did not finish naturally: {snapshot}")
+
     def test_tcp_http1_and_framed_keepalive_short_and_mixed(self) -> None:
         require_network(self)
         mixture = common.parse_weighted_mix("0:1,128:3,4096:1", 4096)
@@ -978,6 +1316,7 @@ class SocketIntegrationTests(unittest.TestCase):
                             )
                         )
                         summary = client.run()
+                        self._assert_tcp_naturally_drained(running)
                         completed += summary["operations"]
                         self.assertEqual(summary.get("errors", 0), 0)
                         self.assertEqual(summary["operations"], 8)
@@ -1047,6 +1386,7 @@ class SocketIntegrationTests(unittest.TestCase):
                 )
             )
             summary = client.run()
+            self._assert_tcp_naturally_drained(running)
         finally:
             server_summary = running.close()
         self.assertEqual(summary.get("errors", 0), 0)
@@ -1101,6 +1441,7 @@ class SocketIntegrationTests(unittest.TestCase):
                 )
             )
             summary = client.run()
+            self._assert_tcp_naturally_drained(running)
         finally:
             server_summary = running.close()
         self.assertEqual(summary["operations"], 512)

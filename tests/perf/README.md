@@ -56,13 +56,28 @@ admission run under the engine mutex, while atomic save and file/directory
 `fsync` run after releasing it. Storage latency is therefore part of the
 workload without intentionally stalling packet verdicts on that mutex; exact
 observations covered by the in-flight candidate are deduplicated. The harness
-does not relax fail-closed, NFQUEUE-error, drop, or latency gates during a write.
+does not relax NFQUEUE-error, drop, validity, or latency gates during a write.
+In OpenShield 0.2.4, the ordinary Learning path intentionally allows unmatched
+outbound traffic: observational attribution or persistence pressure may lose
+evidence but may not deny that packet. Enabled explicit denies are outside these
+capacity scenarios and remain enforceable. The performance gate still reports and rejects such lost evidence;
+the controlled fail-closed overload proof remains scoped to `Enforcing`.
 
 TCP clients use ordinary nonblocking sockets and complete HTTP/1.1 or bounded
 framed request/response exchanges. UDP clients use persistent ordinary UDP
 sockets. The harness does not inject handcrafted TCP packets. Consequently the
 kernel exercises TCP state, conntrack, NFQUEUE, socket ownership, and `/proc`
 process attribution in the same shape as the production daemon.
+
+Normal TCP connection closure, including short connections, keep-alive turnover,
+and final phase cleanup, half-closes the write side, drains it, requires peer
+EOF, and then closes the local transport. All steps share one `io_timeout` and
+finish before the client summary and `finished` event, while collectors remain
+active. A timeout, reset, unexpected trailing data, or local close failure
+counts as a workload error. Already-failed exchanges abort without counting a
+second error. Peer EOF confirms receipt of the peer's FIN; it does not prove
+that all kernel TCP state has expired. Retransmission and error thresholds remain
+unchanged.
 
 UDP completion does not rely on an ordering guarantee that UDP does not
 provide. Every flow carries an explicit sequence. The server tracks a bounded
@@ -79,28 +94,31 @@ the pristine baseline DUT. The cases are:
 | Case | Expected OpenShield path |
 | --- | --- |
 | `baseline` | Independent pristine DUT with the same image and veth topology; the daemon is never started |
-| `network_only` | Exact network allow is evaluated in the kernel before NFQUEUE; queue sequence delta must be zero (or the explicitly configured tiny noise bound) |
-| `application_tcp` | The first packet of every new TCP connection is attributed through NFQUEUE; established traffic must use the current conntrack generation fast-path |
-| `application_udp` | Every otherwise-unmatched outbound datagram clears the reusable conntrack generation and is attributed again |
+| `network_only` | In Enforcing, exact network allows remain in the kernel and queue delta is zero within the configured noise bound; Learning additionally observes eligible outbound flows |
+| `application_tcp` | Enforcing attributes each new TCP connection through NFQUEUE and uses the current conntrack generation for established traffic; Learning observes SYN plus bounded established samples |
+| `application_udp` | Enforcing reattributes every otherwise-unmatched outbound datagram after clearing the reusable conntrack generation; Learning observes datagrams with bounded userspace duplicate suppression |
 
-For OpenShield 0.1.31, `StatusV2` classifies the worst-case active policy path.
+Since OpenShield 0.1.31, `StatusV2` classifies the worst-case active policy path.
 An `Enforcing` `network_only` case is L3 `KernelNative`; an `Enforcing`
 `application_tcp` case is L2 `ConntrackHybrid`; every `Learning` case and an
-`application_udp` case is L1 `Nfqueue`. Network-only packets remain in the
-kernel even when the policy-wide level is L1. `Unknown` invalidates a claim
+`application_udp` case is L1 `Nfqueue`. Network-only Enforcing packets remain in
+the kernel even when the policy-wide level is L1; Learning also exercises its
+observational queue. `Unknown` invalidates a claim
 about which OpenShield path was measured. The backend name is recorded
 separately because the nftables-to-iptables startup fallback does not change
 these levels.
 
-These names do not describe an eBPF data plane. Version 0.1.31 exercises the
+These names do not describe an eBPF data plane. Version 0.2.4 exercises the
 existing nftables/iptables, conntrack, NFQUEUE, and procfs paths and introduces
 no `CAP_BPF`, kernel module, boot-parameter, or MOK requirement. The controlled
 NFQUEUE overload case is therefore still the relevant fail-closed saturation
 proof for application attribution.
 
 `network_only` runs in both `Enforcing` and `Learning`. Application cases run
-with a privileged manual executable rule in `Enforcing` and as real learned
-rules in `Learning`. The `known_endpoint` learning variant keeps the client's
+with a privileged manual executable rule in `Enforcing`; in `Learning`, offered
+traffic without an explicit deny is admitted while successful observations create
+real enabled `accept` endpoint rules plus disabled path/cgroup templates. The
+`known_endpoint` learning variant keeps the client's
 argv stable while changing only the owner-controlled JSON configuration file.
 The optional `discovery_churn` variant deliberately changes that argv path at
 every phase and load point to measure repeated first-seen learning.
@@ -226,6 +244,21 @@ The wrapper has an 1800-second hard process-group timeout and validates the
 report schema, file types, permissions, and size bounds. It runs on the single
 openSUSE Tumbleweed `linux/amd64` release stand after all functional firewall
 E2E jobs.
+
+Progress lines are flushed immediately by `bounded_output.py`; the log remains
+limited to 16 MiB, including a single truncation marker. The filter keeps draining
+the runner after truncation so the log limit cannot block a running test. Its
+source is included in the independently verified harness manifest.
+The workflow also shows the bounded Markdown report on a failed smoke step;
+missing or unsafe reports produce a short diagnostic instead. This does not
+change the failed gate's outcome or permit publication.
+
+The benchmark control client retries a mutation only after an explicit
+`Conflict` rejection, using a fresh policy revision. The whole operation is
+bounded by five seconds and each mutation by twenty attempts; timeouts, missing
+ACKs and other errors are not retried. Rule cleanup keeps its original snapshot
+and refuses to delete a rule changed concurrently. This handles asynchronous
+Learning saves without relaxing the daemon's revision checks.
 
 The host orchestrator re-executes as `python3 -I -B -S` before importing any
 workspace-resolvable module. `environment.py` is opened without following
@@ -364,8 +397,11 @@ Every phase records:
   the configured relative threshold accounting invalidates the evidence.
   Daemon children and firewall/kernel work remain included;
 - host-wide NET_RX/NET_TX softirq deltas;
-- NFQUEUE 1337 depth, wrap-safe packet-sequence delta, and exact kernel/user
-  drop deltas from `/proc/net/netfilter/nfnetlink_queue`;
+- mode-selected NFQUEUE depth, wrap-safe packet-sequence delta, and exact
+  kernel/user drop deltas from `/proc/net/netfilter/nfnetlink_queue`: queue
+  1337 for baseline and `Enforcing`, queue 1338 for observational `Learning`.
+  The selected number is retained in every DUT metric document and is checked
+  independently against the scenario mode;
 - process-lifetime monotonic deltas from the typed
   `status.data.nfqueue` counters: `queue_overflow`, `attribution_timeout`,
   `terminal_queue_error`, and `denied`; these status deltas are authoritative
@@ -409,9 +445,16 @@ A valid steady window passes capacity only when it attains the configured
 fraction of offered application operations and remains within the configured
 error, sampled UDP reply-loss, TCP retransmit, p99 latency, daemon CPU/RSS,
 interface drop/error, and NFQUEUE drop/error bounds. Path safety independently
-requires NFQUEUE sequence deltas of zero for network-only, approximately one
+requires, in Enforcing, NFQUEUE sequence deltas of zero for network-only, approximately one
 per new application TCP connection with a low keep-alive per-operation ratio,
-and approximately one per application UDP datagram. Every required steady
+and approximately one per application UDP datagram. Learning instead requires
+outbound TCP queue hits to track new connections plus bounded established samples,
+and UDP hits to track outgoing datagrams, including network-only cases. Its first
+eligible observation may wait up to 250 ms for asynchronous capture; repeat
+observations are admitted immediately. Do not interpret that bounded capture wait
+as an Enforcing fast-path latency or a guarantee of complete one-way UDP learning.
+The [short-lived application fixture](../compat/README.md#short-lived-application-regression)
+covers that separate lifetime boundary. Every required steady
 window must pass. Every burst must remain valid and fail-closed; when
 `require_burst_capacity` is true, it must pass the capacity bounds as well.
 Explicit wrong-executable fail-open behavior is tested separately by the
@@ -444,9 +487,10 @@ relative CPU/latency crossings follow the explicit advisory setting (observe in
 CI smoke, fail in production-like). Burst validity, configured capacity
 ceilings, and fail-closed safety also remain mandatory and blocking. Safety is
 never deferred to statistical confirmation:
-application loss/errors, TCP retransmits, NIC drops/errors, NFQUEUE errors or
-drops, a failed identity probe, or any fail-open behavior fails the affected
-ordinary window immediately. The only intentional exception is
+application loss/errors, TCP retransmits, NIC drops/errors, or NFQUEUE errors or
+drops fail the affected ordinary window immediately. Any unexpected allow in
+`Enforcing` is fail-open and fails immediately; Learning's declared outbound
+allow is not classified as fail-open. The only intentional exception is
 the separately reported controlled-overload proof: there NFQUEUE drops prove
 that saturation actually occurred, an exactly accounted DUT UDP send-buffer
 error may record local fail-closed backpressure before the pressure process is
@@ -465,7 +509,9 @@ capacity point.
 The separate `overload` configuration is a destructive stress test of the
 disposable namespace, not a capacity point. For each backend it installs an
 exact outbound application rule in `Enforcing`, flushes conntrack, and runs both
-real short-connection TCP and real UDP workloads. The pressure client first
+real short-connection TCP and real UDP workloads. This proof deliberately
+remains on the fail-closed enforcing queue 1337; it never targets observational
+Learning queue 1338. The pressure client first
 validates its configuration and allocates bounded resources, emits an explicit ready event, and
 waits at a start barrier. Only then does the harness stop the authenticated
 daemon process with `SIGSTOP`, send the client its `start` command, and poll direct NFQUEUE
@@ -530,7 +576,8 @@ Each JSON controlled-overload record uses `openshield.perf.overload.v2`; this
 version adds the mandatory, gap-free split between the controlled
 pressure/resume-transition and clean post-resume DUT metric windows. Metric
 documents use `openshield.perf.metrics.v3`; this version makes raw, bracketed
-collector, and adjusted cgroup CPU explicit. Synchronized collectors acknowledge the exact
+collector, and adjusted cgroup CPU explicit. Its `nfqueue.queue_number` field
+records the queue selected before the collector starts. Synchronized collectors acknowledge the exact
 initial boundary before workload or overload activity can begin.
 
 `report.json.baseline_pairing` uses

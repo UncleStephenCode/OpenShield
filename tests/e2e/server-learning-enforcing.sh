@@ -151,30 +151,8 @@ begin_stage() {
 refresh_zypper_repository() {
     container=$1
     repository=$2
-    attempt=1
-    maximum_attempts=3
-    while :; do
-        if docker exec "$container" zypper --non-interactive refresh "$repository"; then
-            return 0
-        else
-            refresh_status=$?
-        fi
-        if [ "$refresh_status" -ne 4 ]; then
-            printf 'zypper refresh for %s failed with non-retryable status %s\n' \
-                "$repository" "$refresh_status" >&2
-            return "$refresh_status"
-        fi
-        if [ "$attempt" -ge "$maximum_attempts" ]; then
-            printf 'zypper refresh for %s failed after %s attempts (status %s)\n' \
-                "$repository" "$attempt" "$refresh_status" >&2
-            return "$refresh_status"
-        fi
-        retry_delay=$((attempt * 5))
-        printf 'zypper refresh for %s failed (status %s); retrying in %s seconds\n' \
-            "$repository" "$refresh_status" "$retry_delay" >&2
-        sleep "$retry_delay"
-        attempt=$((attempt + 1))
-    done
+    docker exec -i "$container" sh -s -- "$repository" \
+        < "$script_directory/zypper-refresh.sh"
 }
 
 wait_for_marker() {
@@ -195,6 +173,48 @@ wait_for_marker() {
     fi
     printf '%s did not become ready within 10 seconds\n' "$description" >&2
     return 1
+}
+
+start_observable_learning_hold() {
+    learning_hold_tcp_port=$1
+    learning_hold_udp_port=$2
+    learning_hold_ready="/tmp/openshield-learning-hold-${learning_hold_tcp_port}-${learning_hold_udp_port}.ready"
+    learning_hold_release="/tmp/openshield-learning-hold-${learning_hold_tcp_port}-${learning_hold_udp_port}.release"
+    learning_hold_status="/tmp/openshield-learning-hold-${learning_hold_tcp_port}-${learning_hold_udp_port}.status"
+    learning_hold_log="/tmp/openshield-learning-hold-${learning_hold_tcp_port}-${learning_hold_udp_port}.log"
+    docker exec "$client" rm -f "$learning_hold_ready" "$learning_hold_release" \
+        "$learning_hold_status" "${learning_hold_status}.tmp" "$learning_hold_log"
+    docker exec --detach "$client" /bin/sh -c '
+        address=$1
+        tcp_port=$2
+        udp_port=$3
+        log_file=$4
+        status_file=$5
+        if python3 /opt/learning-sockets.py hold \
+            "$address" "$tcp_port" "$udp_port" >"$log_file" 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        printf "%s\n" "$status" >"${status_file}.tmp"
+        mv -f "${status_file}.tmp" "$status_file"
+    ' openshield-learning-hold "$server_ip" "$learning_hold_tcp_port" \
+        "$learning_hold_udp_port" "$learning_hold_log" "$learning_hold_status"
+    wait_for_marker "$client" "$learning_hold_ready" \
+        "observable Learning TCP/UDP flow on ports ${learning_hold_tcp_port}/${learning_hold_udp_port}"
+}
+
+finish_observable_learning_hold() {
+    docker exec "$client" touch "$learning_hold_release"
+    wait_for_marker "$client" "$learning_hold_status" \
+        "observable Learning TCP/UDP flow exit"
+    learning_hold_exit_status=$(docker exec "$client" cat "$learning_hold_status")
+    [ "$learning_hold_exit_status" = 0 ] || {
+        docker exec "$client" cat "$learning_hold_log" >&2 || true
+        printf 'observable Learning TCP/UDP flow exited with status %s\n' \
+            "$learning_hold_exit_status" >&2
+        exit 1
+    }
 }
 
 dump_daemon_log() {
@@ -361,7 +381,19 @@ cleanup() {
                  uname -a 2>/dev/null || true
                  cat /tmp/openshield.exit-status /var/lib/openshield/state.json 2>/dev/null || true
                  printf "%s\n" "--- daemon logs ---"
-                 cat /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
+                 cat /tmp/openshield-preflight.log /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
+                 printf "%s\n" "--- TCP session ---"
+                 cat /tmp/openshield-l2-client.log /tmp/openshield-l2-client.status 2>/dev/null || true
+                 printf "%s\n" "--- application queue status ---"
+                 cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null || true
+                 python3 /opt/ipc_client.py status 2>&1 || true
+                 printf "%s\n" "--- nftables OpenShield table ---"
+                 nft --version 2>&1 || true
+                 nft -nn list table inet openshield 2>&1 || true
+                 for registry in /proc/net/ip_tables_names /proc/net/ip6_tables_names; do
+                     printf "%s\n" "--- $registry ---"
+                     cat "$registry" 2>/dev/null || true
+                 done
                  for save in \
                      /usr/sbin/iptables-legacy-save /usr/sbin/ip6tables-legacy-save \
                      /usr/sbin/iptables-nft-save /usr/sbin/ip6tables-nft-save; do
@@ -394,6 +426,7 @@ server_id=$(docker create --name "$server_name" --label "$resource_label" --netw
     --read-only --cap-drop ALL --security-opt no-new-privileges \
     --security-opt label=disable \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
+    --mount "type=bind,src=$script_directory/learning-sockets.py,dst=/opt/learning-sockets.py,readonly" \
     "$server_image" python3 -m http.server 18081 --bind 0.0.0.0)
 docker start "$server_id" >/dev/null
 
@@ -405,7 +438,10 @@ if [ -n "$native_client_source" ]; then
         --env PYTHONDONTWRITEBYTECODE=1 \
         --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$script_directory/downstream-counters.py,dst=/opt/downstream-counters.py,readonly" \
+        --mount "type=bind,src=$script_directory/learning-sockets.py,dst=/opt/learning-sockets.py,readonly" \
         --mount "type=bind,src=$script_directory/tcp-session.py,dst=/opt/tcp-session.py,readonly" \
+        --mount "type=bind,src=$script_directory/udp-client.py,dst=/opt/udp-client.py,readonly" \
         --mount "type=bind,src=$native_client_source,dst=/opt/openshield-e2e-client,readonly" \
         "$client_image" sleep infinity)
 else
@@ -416,7 +452,10 @@ else
         --env PYTHONDONTWRITEBYTECODE=1 \
         --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$script_directory/downstream-counters.py,dst=/opt/downstream-counters.py,readonly" \
+        --mount "type=bind,src=$script_directory/learning-sockets.py,dst=/opt/learning-sockets.py,readonly" \
         --mount "type=bind,src=$script_directory/tcp-session.py,dst=/opt/tcp-session.py,readonly" \
+        --mount "type=bind,src=$script_directory/udp-client.py,dst=/opt/udp-client.py,readonly" \
         "$client_image" sleep infinity)
 fi
 docker start "$client_id" >/dev/null
@@ -555,6 +594,27 @@ else
     }
 fi
 
+# Install a pre-existing mangle decision before OpenShield establishes its
+# dispatchers. The iptables Learning observation queue must run after this rule;
+# otherwise NF_ACCEPT/queue-bypass would skip host mark/QoS/policy-routing work.
+if [ "$backend" = iptables ]; then
+    docker exec "$client" /bin/sh -c '
+        installed=0
+        for command in /usr/sbin/iptables /usr/sbin/iptables-legacy /usr/sbin/iptables-nft; do
+            [ -x "$command" ] || continue
+            if "$command" --wait 5 -t mangle -A OUTPUT -p tcp --dport 18081 \
+                -m comment --comment e2e-preexisting-mark \
+                -j MARK --set-xmark 0x100/0x100 2>/dev/null; then
+                "$command" --wait 5 -t filter -A OUTPUT -p tcp --dport 18081 \
+                    -m mark --mark 0x100/0x100 \
+                    -m comment --comment e2e-preexisting-drop -j DROP
+                installed=$((installed + 1))
+            fi
+        done
+        [ "$installed" -gt 0 ]
+    '
+fi
+
 begin_stage 'install systemd-equivalent fail-closed preflight'
 install_fail_closed_preflight
 
@@ -615,7 +675,98 @@ case "$server_ip:$client_ip" in
     *[!0-9.:]*) printf '%s\n' 'unsafe container address' >&2; exit 1 ;;
 esac
 
-begin_stage 'verify application-bound TCP conntrack-hybrid path'
+if [ "$backend" = iptables ]; then
+    begin_stage 'verify Learning preserves pre-existing mangle policy'
+    if docker exec "$client" curl --fail --silent --show-error --max-time 2 \
+        "http://$server_ip:18081/" >/dev/null 2>&1; then
+        printf '%s\n' 'Learning NFQUEUE bypassed a pre-existing mangle decision' >&2
+        exit 1
+    fi
+    docker exec "$client" /bin/sh -c '
+        for command in /usr/sbin/iptables /usr/sbin/iptables-legacy /usr/sbin/iptables-nft; do
+            [ -x "$command" ] || continue
+            "$command" --wait 5 -t filter -D OUTPUT -p tcp --dport 18081 \
+                -m mark --mark 0x100/0x100 \
+                -m comment --comment e2e-preexisting-drop -j DROP 2>/dev/null || true
+            "$command" --wait 5 -t mangle -D OUTPUT -p tcp --dport 18081 \
+                -m comment --comment e2e-preexisting-mark \
+                -j MARK --set-xmark 0x100/0x100 2>/dev/null || true
+        done
+    '
+fi
+
+begin_stage 'verify Learning admits traffic when attribution is unavailable'
+learning_python_executable=$(docker exec "$client" /bin/sh -c '
+    executable=$(command -v python3) || exit 1
+    readlink -f "$executable"
+')
+case "$learning_python_executable" in
+    /*) ;;
+    *) printf '%s\n' 'cannot resolve the Learning test executable' >&2; exit 1 ;;
+esac
+case "$learning_python_executable" in
+    *[!A-Za-z0-9._/-]*)
+        printf '%s\n' 'unsafe Learning test executable path' >&2
+        exit 1
+        ;;
+esac
+# The child uses a real TCP socket but deliberately has more than the bounded
+# 64 argv entries. Attribution must reject that observation, while Learning
+# still admits the connection and must not persist an incomplete rule.
+docker exec "$client" /bin/sh -c '
+    server_address=$1
+    server_port=$2
+    set --
+    argument=0
+    while [ "$argument" -lt 70 ]; do
+        set -- "$@" "bounded-attribution-$argument"
+        argument=$((argument + 1))
+    done
+    exec python3 -c '\''
+import socket
+import sys
+import time
+
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5) as stream:
+    stream.sendall(b"GET /learning-attribution-failure HTTP/1.0\r\nHost: e2e\r\n\r\n")
+    response = stream.recv(64)
+    if not response.startswith(b"HTTP/"):
+        raise RuntimeError("Learning did not admit the real TCP exchange")
+    # Keep the owning process and socket visible long enough for the async
+    # worker to reject the deliberately oversized argv, rather than merely
+    # observing a process that exited before attribution.
+    time.sleep(1)
+'\'' "$server_address" "$server_port" "$@"
+' openshield-learning-attribution "$server_ip" 18081
+# A packet verdict intentionally precedes the asynchronous durable learning
+# commit. Leave a bounded interval in which an erroneous partial observation
+# would become visible before asserting its absence.
+docker exec "$client" sleep 1
+docker exec "$client" python3 /opt/ipc_client.py assert-no-learned \
+    "$learning_python_executable" "$server_ip" 18081 tcp
+
+begin_stage 'verify Learning packet telemetry'
+if [ "$backend" = iptables ]; then
+    if docker exec "$client" /usr/sbin/iptables-legacy-save -t mangle 2>/dev/null \
+        | grep -Fq -- '-A OPENSHIELD_OBSERVE'; then
+        learning_counter_save=/usr/sbin/iptables-legacy-save
+    else
+        learning_counter_save=/usr/sbin/iptables-save
+    fi
+    docker exec "$client" "$learning_counter_save" -c -t mangle \
+        | grep -Eq -- '^\[[1-9][0-9]*:[0-9]+\] -A OPENSHIELD_OBSERVE .*--comment "?openshield:learned_out"? .*--queue-num 1338' || {
+        printf '%s\n' 'iptables Learning observation counter did not advance' >&2
+        exit 1
+    }
+else
+    docker exec "$client" nft list counter inet openshield learned_out \
+        | grep -Eq -- 'packets [1-9][0-9]* bytes [0-9]+' || {
+        printf '%s\n' 'nftables Learning observation counter did not advance' >&2
+        exit 1
+    }
+fi
+
+begin_stage 'learn observable application-bound TCP session'
 docker exec --detach "$server" python3 -c '
 import socket
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -632,10 +783,7 @@ with connection:
         connection.sendall(data)
 '
 wait_for_marker "$server" /tmp/openshield-l2-server-ready 'TCP echo server'
-l2_tcp_executable=$(docker exec "$client" /bin/sh -c '
-    executable=$(command -v python3) || exit 1
-    readlink -f "$executable"
-')
+l2_tcp_executable=$learning_python_executable
 case "$l2_tcp_executable" in
     /*) ;;
     *) printf '%s\n' 'cannot resolve the TCP session executable' >&2; exit 1 ;;
@@ -675,7 +823,18 @@ if [ "$attempt" -ge 50 ]; then
     docker exec "$client" cat /tmp/openshield-l2-client.log >&2 || true
     exit 1
 fi
+docker exec "$client" python3 /opt/ipc_client.py assert-template \
+    "$l2_tcp_executable" disabled
 
+# Learning observation is asynchronous and debounced per flow. Keep real TCP
+# exchanges active until a complete learned rule is visible, then drain the
+# last echo and stop the Learning heartbeat before rotating the generation.
+# Merely increasing the polling timeout cannot help a silent one-burst client.
+docker exec "$client" touch /tmp/openshield-l2-learning-idle
+wait_for_marker "$client" /tmp/openshield-l2-learning-idle-ready \
+    'quiescent application-bound TCP session before Enforcing'
+
+begin_stage 'verify application-bound TCP conntrack-hybrid path'
 docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
 docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
     enforcing "$expected_backend_protocol" conntrack_hybrid application_tcp >/dev/null
@@ -720,6 +879,144 @@ docker exec "$client" python3 /opt/ipc_client.py set-mode learning >/dev/null
 docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
     learning "$expected_backend_protocol" nfqueue learning >/dev/null
 
+begin_stage 'verify transparent Learning with concurrent real sockets'
+docker exec --detach "$server" python3 /opt/learning-sockets.py serve 18084 18085
+wait_for_marker "$server" /tmp/openshield-learning-sockets-18084-18085.ready \
+    'transparent Learning TCP/UDP server'
+start_observable_learning_hold 18084 18085
+# Keep one TCP connection and one connected UDP flow alive while polling. This
+# makes asynchronous /proc attribution deterministic instead of relying on a
+# short-lived client process remaining visible after its packet was admitted.
+for learned_port in 18084 18085; do
+    case "$learned_port" in
+        18084) learned_protocol=tcp ;;
+        18085) learned_protocol=udp ;;
+    esac
+    attempt=0
+    while [ "$attempt" -lt 50 ]; do
+        if docker exec "$client" python3 /opt/ipc_client.py assert-learned \
+            "$learning_python_executable" "$server_ip" "$learned_port" \
+            "$learned_protocol" >/dev/null 2>&1; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    [ "$attempt" -lt 50 ] || {
+        printf 'transparent Learning did not persist the %s endpoint\n' \
+            "$learned_protocol" >&2
+        exit 1
+    }
+done
+docker exec "$client" python3 /opt/learning-sockets.py client \
+    "$server_ip" 18084 18085 >/dev/null
+# The second workload adds sequential NEW TCP connections, concurrent
+# persistent TCP sockets with repeated exchanges, and persistent plus parallel
+# DNS-like UDP request/reply flows.
+finish_observable_learning_hold
+
+begin_stage 'verify Learning has no synchronous attribution head-of-line blocking'
+docker exec --detach "$server" python3 /opt/learning-sockets.py serve 18086 18087
+wait_for_marker "$server" /tmp/openshield-learning-sockets-18086-18087.ready \
+    'Learning burst TCP/UDP server'
+# A same-UID process with many shared descriptors and threads makes bounded
+# procfs attribution deliberately expensive without touching the host. The
+# first packet of each unseen flow may wait up to 250 ms for identity capture.
+# Check serial NEW flows separately; 24 legitimate serial holds alone can use
+# the old six-second total budget. Keep the strict six-second limit for the
+# concurrent NEW load and repeated exchanges on already-seen TCP/UDP probes,
+# which must not wait behind other flows' asynchronous attribution work.
+docker exec --detach "$client" /bin/sh -c '
+    status_file=/tmp/openshield-procfs-pressure.status
+    python3 /opt/learning-sockets.py procfs-pressure \
+        128 640 /tmp/openshield-procfs-pressure.ready \
+        >/tmp/openshield-procfs-pressure.log 2>&1 &
+    child=$!
+    printf "%s\n" "$child" >/tmp/openshield-procfs-pressure.pid
+    if wait "$child"; then status=0; else status=$?; fi
+    printf "%s\n" "$status" >"${status_file}.tmp"
+    mv -f "${status_file}.tmp" "$status_file"
+'
+wait_for_marker "$client" /tmp/openshield-procfs-pressure.ready \
+    'bounded procfs-pressure fixture'
+procfs_pressure_pid=$(docker exec "$client" cat /tmp/openshield-procfs-pressure.pid)
+case "$procfs_pressure_pid" in
+    ''|*[!0-9]*) printf '%s\n' 'invalid procfs-pressure pid' >&2; exit 1 ;;
+esac
+learning_burst_terminal_errors=$(docker exec "$client" python3 /opt/ipc_client.py \
+    learning-queue-health)
+burst_passed=true
+if ! docker exec "$client" python3 /opt/learning-sockets.py burst \
+    "$server_ip" 18086 18087; then
+    burst_passed=false
+fi
+# Learning observation queue 1338 uses bypass on reader loss. Successful sockets alone
+# therefore cannot establish that the observation reader survived the burst.
+if ! docker exec "$client" python3 /opt/ipc_client.py learning-queue-health \
+    --expected-terminal-errors "$learning_burst_terminal_errors" >/dev/null; then
+    burst_passed=false
+fi
+docker exec "$client" /bin/sh -c 'kill -TERM "$1"' \
+    openshield-procfs-pressure-stop "$procfs_pressure_pid"
+wait_for_marker "$client" /tmp/openshield-procfs-pressure.status \
+    'bounded procfs-pressure fixture exit'
+[ "$burst_passed" = true ] || {
+    docker exec "$client" cat /tmp/openshield-procfs-pressure.log >&2 || true
+    printf '%s\n' 'Learning burst failed or its observation queue stopped' >&2
+    exit 1
+}
+# Invalidate any deliberately saturated observation backlog before testing a
+# particular durable-write failure. Stale-generation async work must be
+# discarded instead of mutating the next Learning generation.
+docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py set-mode learning >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    learning "$expected_backend_protocol" nfqueue learning >/dev/null
+
+begin_stage 'verify transparent Learning while persistence is paused'
+docker exec --detach "$server" python3 /opt/learning-sockets.py serve 18088 18089
+wait_for_marker "$server" /tmp/openshield-learning-sockets-18088-18089.ready \
+    'persistence-pause TCP/UDP server'
+state_directory_mode=$(docker exec "$client" stat -c '%a' /var/lib/openshield)
+case "$state_directory_mode" in
+    [0-7][0-7][0-7]) ;;
+    *) printf '%s\n' 'unsafe state-directory mode from container' >&2; exit 1 ;;
+esac
+# The daemon runs with the packaged capability set and lacks DAC_OVERRIDE.
+# Removing owner-write permission therefore makes one otherwise safe atomic
+# learning save fail without touching the host filesystem or firewall.
+docker exec "$client" chmod 0500 /var/lib/openshield
+start_observable_learning_hold 18088 18089
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+    if docker exec "$client" grep -Fq \
+        'automatic learning paused after a recoverable persistence failure' \
+        /tmp/openshield.log; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+docker exec "$client" chmod "$state_directory_mode" /var/lib/openshield
+[ "$attempt" -lt 50 ] || {
+    printf '%s\n' 'failed learning save did not enter the documented persistence pause' >&2
+    exit 1
+}
+docker exec "$client" sleep 1
+docker exec "$client" python3 /opt/ipc_client.py assert-no-learned \
+    "$learning_python_executable" "$server_ip" 18088 tcp
+docker exec "$client" python3 /opt/ipc_client.py assert-no-learned \
+    "$learning_python_executable" "$server_ip" 18089 udp
+# The hold repeatedly completed framed TCP keep-alives and DNS-like UDP
+# request/reply exchanges before and after persistence entered its paused state.
+finish_observable_learning_hold
+# A successful privileged transition explicitly resumes automatic learning for
+# the following scenarios.
+docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py set-mode learning >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    learning "$expected_backend_protocol" nfqueue learning >/dev/null
+
 begin_stage 'learn mixed outbound TCP and UDP applications'
 docker exec --detach "$server" python3 -c '
 import socket
@@ -735,9 +1032,8 @@ if [ -n "$native_client_source" ]; then
     tcp_executable=/opt/openshield-e2e-client
     udp_executable=/opt/openshield-e2e-client
 else
-    tcp_command=$(docker exec "$client" /bin/sh -c 'command -v curl')
     udp_command=$(docker exec "$client" /bin/sh -c 'command -v nc')
-    tcp_executable=$(docker exec "$client" readlink -f "$tcp_command")
+    tcp_executable=$learning_python_executable
     udp_executable=$(docker exec "$client" readlink -f "$udp_command")
 fi
 for executable in "$tcp_executable" "$udp_executable"; do
@@ -760,9 +1056,8 @@ run_tcp_client() {
         docker exec "$client" "$tcp_executable" tcp \
             "$server_ip" 18081 "$((timeout_seconds * 1000))"
     else
-        docker exec "$client" "$tcp_executable" \
-            --fail --silent --show-error --max-time "$timeout_seconds" \
-            "http://$server_ip:18081/" >/dev/null
+        docker exec "$client" python3 /opt/learning-sockets.py http \
+            "$server_ip" 18081 / "$((timeout_seconds * 1000))" 1000
     fi
 }
 
@@ -771,19 +1066,24 @@ run_udp_client() {
         docker exec "$client" "$udp_executable" udp \
             "$server_ip" 18082 19000 2000 "$udp_payload"
     else
-        docker exec "$client" /bin/sh -c '
-            payload=$1
-            executable=$2
-            source_port=$3
-            server_address=$4
-            server_port=$5
-            # Keep stdin open briefly after the datagram is written.  Nmap
-            # Ncat otherwise exits on EOF before the daemon can attribute the
-            # short-lived UDP socket and before the echo reply is received.
-            { printf "%s" "$payload"; sleep 1; } \
-                | "$executable" -u -w 2 -p "$source_port" "$server_address" "$server_port"
-        ' openshield-udp-client \
-            "$udp_payload" "$udp_executable" 19000 "$server_ip" 18082
+        # Keep the real nc socket owner alive through exact echo validation
+        # and the separate attribution hold; startup must not race stdin EOF.
+        docker exec "$client" python3 /opt/udp-client.py \
+            --executable "$udp_executable" --peer "$server_ip" \
+            --source-port 19000 --payload "$udp_payload" \
+            --timeout-ms 2000 --hold-ms 1000
+    fi
+}
+
+run_tcp_client_variant() {
+    timeout_seconds=$1
+    if [ -n "$native_client_source" ]; then
+        docker exec "$client" "$tcp_executable" tcp \
+            "$server_ip" 18081 "$((timeout_seconds * 1000))"
+    else
+        docker exec "$client" python3 /opt/learning-sockets.py http \
+            "$server_ip" 18081 '/?openshield-template=variant' \
+            "$((timeout_seconds * 1000))" 1000
     fi
 }
 
@@ -817,6 +1117,10 @@ while [ "$attempt" -lt 50 ]; do
     sleep 0.1
 done
 [ "$attempt" -lt 50 ] || exit 1
+docker exec "$client" python3 /opt/ipc_client.py assert-template \
+    "$tcp_executable" disabled
+docker exec "$client" python3 /opt/ipc_client.py assert-template \
+    "$udp_executable" disabled
 
 begin_stage 'enforce learned outbound rules'
 docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
@@ -832,9 +1136,153 @@ fi
     exit 1
 }
 
+begin_stage 'verify disabled and enabled application-group template'
+if run_tcp_client_variant 2 >/dev/null 2>&1; then
+    printf '%s\n' 'a disabled application template admitted unmatched arguments' >&2
+    exit 1
+fi
+docker exec "$client" python3 /opt/ipc_client.py enable-template \
+    "$tcp_executable" >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-template \
+    "$tcp_executable" enabled
+run_tcp_client_variant 5 || {
+    printf '%s\n' 'an enabled application template did not admit unmatched arguments' >&2
+    exit 1
+}
+docker exec "$client" python3 /opt/ipc_client.py disable-template \
+    "$tcp_executable" >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-template \
+    "$tcp_executable" disabled
+
+begin_stage 'verify outbound Drop, Reject, and independent enabled state'
+action_test_command=$(docker exec "$client" /bin/sh -c 'command -v curl')
+action_test_executable=$(docker exec "$client" readlink -f "$action_test_command")
+case "$action_test_executable" in
+    /*) ;;
+    *) printf '%s\n' 'cannot resolve the action test executable' >&2; exit 1 ;;
+esac
+assert_learning_action() {
+    action_description=$1
+    expected_status=$2
+    docker exec "$client" python3 /opt/ipc_client.py set-mode learning >/dev/null
+    docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+        learning "$expected_backend_protocol" nfqueue learning >/dev/null
+    set +e
+    docker exec "$client" "$action_test_executable" \
+        --fail --silent --show-error --max-time 2 \
+        "http://$server_ip:18081/" >/dev/null 2>&1
+    learning_action_status=$?
+    set -e
+    if [ "$learning_action_status" -ne "$expected_status" ]; then
+        printf 'Learning %s returned status %s instead of %s\n' \
+            "$action_description" "$learning_action_status" \
+            "$expected_status" >&2
+        exit 1
+    fi
+    docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+    docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+        enforcing "$expected_backend_protocol" nfqueue application_per_packet >/dev/null
+}
+# This broad kernel-only allow deliberately overlaps every application rule
+# below. Application Drop/Reject must still win after userspace attribution.
+docker exec "$client" python3 /opt/ipc_client.py create-network-tcp-rule \
+    openshield-e2e-network-accept "$server_ip" 18081 accept >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py create-app-tcp-rule \
+    openshield-e2e-app-accept "$action_test_executable" "$server_ip" 18081 accept >/dev/null
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 5 "http://$server_ip:18081/" >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py create-network-tcp-rule \
+    openshield-e2e-network-drop "$server_ip" 18081 drop >/dev/null
+# Explicit enabled Drop and Reject actions remain active in Learning. Ordinary
+# unmatched outbound traffic is the transparent allow-and-observe path tested
+# above; a network-only deny is enforced directly by the kernel backend.
+assert_learning_action 'network Drop' 28
+set +e
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 2 "http://$server_ip:18081/" >/dev/null 2>&1
+network_drop_status=$?
+set -e
+if [ "$network_drop_status" -ne 28 ]; then
+    printf 'network Drop overlapping application Accept returned status %s instead of a silent timeout\n' \
+        "$network_drop_status" >&2
+    exit 1
+fi
+docker exec "$client" python3 /opt/ipc_client.py set-named-rule-enabled \
+    openshield-e2e-network-drop disabled >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py create-network-tcp-rule \
+    openshield-e2e-network-reject "$server_ip" 18081 reject >/dev/null
+assert_learning_action 'network Reject' 7
+set +e
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 2 "http://$server_ip:18081/" >/dev/null 2>&1
+network_reject_status=$?
+set -e
+if [ "$network_reject_status" -ne 7 ]; then
+    printf 'network Reject overlapping application Accept returned status %s instead of prompt refusal\n' \
+        "$network_reject_status" >&2
+    exit 1
+fi
+docker exec "$client" python3 /opt/ipc_client.py set-named-rule-enabled \
+    openshield-e2e-network-reject disabled >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py create-app-tcp-rule \
+    openshield-e2e-app-drop "$action_test_executable" "$server_ip" 18081 drop >/dev/null
+# Application denies use the fail-closed enforcing queue even in Learning;
+# the observational queue remains immediate and cannot override the decision.
+assert_learning_action 'application Drop' 28
+set +e
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 2 "http://$server_ip:18081/" >/dev/null 2>&1
+drop_status=$?
+set -e
+if [ "$drop_status" -ne 28 ]; then
+    printf 'application Drop returned status %s instead of a silent timeout\n' \
+        "$drop_status" >&2
+    exit 1
+fi
+docker exec "$client" python3 /opt/ipc_client.py set-named-rule-enabled \
+    openshield-e2e-app-drop disabled >/dev/null
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 5 "http://$server_ip:18081/" >/dev/null || {
+    printf '%s\n' 'a disabled application Drop rule remained active' >&2
+    exit 1
+}
+docker exec "$client" python3 /opt/ipc_client.py create-app-tcp-rule \
+    openshield-e2e-app-reject "$action_test_executable" "$server_ip" 18081 reject >/dev/null
+assert_learning_action 'application Reject' 7
+set +e
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 2 "http://$server_ip:18081/" >/dev/null 2>&1
+reject_status=$?
+set -e
+if [ "$reject_status" -ne 7 ]; then
+    printf 'application Reject returned status %s instead of prompt refusal\n' \
+        "$reject_status" >&2
+    exit 1
+fi
+docker exec "$client" python3 /opt/ipc_client.py set-named-rule-enabled \
+    openshield-e2e-app-reject disabled >/dev/null
+docker exec "$client" "$action_test_executable" \
+    --fail --silent --show-error --max-time 5 "http://$server_ip:18081/" >/dev/null || {
+    printf '%s\n' 'a disabled application Reject rule remained active' >&2
+    exit 1
+}
+docker exec "$client" python3 /opt/ipc_client.py set-named-rule-enabled \
+    openshield-e2e-network-accept disabled >/dev/null
+
 # An OpenShield allow must not bypass a later DROP owned by another firewall.
 begin_stage 'verify downstream firewall DROP precedence'
+# Prove that these exact commands are allowed under the final policy before
+# introducing downstream rules. Their identities must not change for negatives.
+run_tcp_client 5 >/dev/null
+udp_reply=$(run_udp_client)
+[ "$udp_reply" = "$udp_payload" ] || {
+    printf '%s\n' 'UDP echo failed before downstream DROP installation' >&2
+    exit 1
+}
 if [ "$backend" = iptables ]; then
+    # Each policy mutation replaces the owned chains and resets their
+    # counters. Exercise both application paths under the final policy before
+    # asserting that NF_REPEAT reached the authorization chains.
     if docker exec "$client" /usr/sbin/iptables-legacy-save -t filter 2>/dev/null \
         | grep -Fq -- '-A OUTPUT -j OPENSHIELD_OUT'; then
         iptables_command=/usr/sbin/iptables-legacy
@@ -849,6 +1297,13 @@ if [ "$backend" = iptables ]; then
         printf '%s\n' 'OpenShield mangle sanitizer is not the first OUTPUT rule' >&2
         exit 1
     }
+    docker exec "$client" "$iptables_save" -c -t mangle \
+        | grep -E -- ' -A OUTPUT ' \
+        | tail -n1 \
+        | grep -Eq -- '^\[[0-9]+:[0-9]+\] -A OUTPUT -j OPENSHIELD_OBSERVE$' || {
+        printf '%s\n' 'OpenShield Learning observer is not the last mangle OUTPUT rule' >&2
+        exit 1
+    }
     docker exec "$client" "$iptables_save" -c -t filter \
         | grep -Eq -- '^\[[1-9][0-9]*:[0-9]+\] -A OPENSHIELD_APP_TCP -j CONNMARK ' || {
         printf '%s\n' 'NF_REPEAT did not reach the post-queue TCP authorization chain' >&2
@@ -859,20 +1314,37 @@ if [ "$backend" = iptables ]; then
         printf '%s\n' 'NF_REPEAT did not reach the post-queue UDP authorization chain' >&2
         exit 1
     }
-    docker exec "$client" "$iptables_command" --wait 5 -A OUTPUT -p tcp -d "$server_ip" \
-        --dport 18081 -m comment --comment openshield-e2e-downstream -j DROP
-    docker exec "$client" "$iptables_command" --wait 5 -A OUTPUT -p udp -d "$server_ip" \
-        --dport 18082 -m comment --comment openshield-e2e-downstream -j DROP
+    docker exec "$client" "$iptables_command" --wait 5 -N OPENSHIELD_E2E_DOWNSTREAM
+    docker exec "$client" "$iptables_command" --wait 5 -A OUTPUT -j OPENSHIELD_E2E_DOWNSTREAM
+    # Only the fresh SYN counter proves the new TCP probe reached downstream;
+    # a late FIN from the preceding successful connection must not count.
+    docker exec "$client" "$iptables_command" --wait 5 -A OPENSHIELD_E2E_DOWNSTREAM \
+        -s "$client_ip/32" -d "$server_ip/32" -p tcp --dport 18081 --syn \
+        -m comment --comment openshield-e2e-downstream-syn -j DROP
+    docker exec "$client" "$iptables_command" --wait 5 -A OPENSHIELD_E2E_DOWNSTREAM \
+        -s "$client_ip/32" -d "$server_ip/32" -p tcp --dport 18081 \
+        -m comment --comment openshield-e2e-downstream-tcp -j DROP
+    docker exec "$client" "$iptables_command" --wait 5 -A OPENSHIELD_E2E_DOWNSTREAM \
+        -s "$client_ip/32" -d "$server_ip/32" -p udp --dport 18082 \
+        -m comment --comment openshield-e2e-downstream-udp -j DROP
 else
     docker exec "$client" nft add table inet openshield_e2e_downstream
     docker exec "$client" nft add chain inet openshield_e2e_downstream output \
         '{ type filter hook output priority 10; policy accept; }'
     docker exec "$client" nft add rule inet openshield_e2e_downstream output \
-        ip daddr "$server_ip" tcp dport 18081 drop
+        ip saddr "$client_ip/32" ip daddr "$server_ip/32" tcp dport 18081 \
+        tcp flags '&' '(fin|syn|rst|ack)' '==' syn counter drop \
+        comment '"openshield-e2e-downstream-syn"'
     docker exec "$client" nft add rule inet openshield_e2e_downstream output \
-        ip daddr "$server_ip" udp dport 18082 drop
+        ip saddr "$client_ip/32" ip daddr "$server_ip/32" tcp dport 18081 counter drop \
+        comment '"openshield-e2e-downstream-tcp"'
+    docker exec "$client" nft add rule inet openshield_e2e_downstream output \
+        ip saddr "$client_ip/32" ip daddr "$server_ip/32" udp dport 18082 counter drop \
+        comment '"openshield-e2e-downstream-udp"'
 fi
-if run_tcp_client 2 >/dev/null 2>&1; then
+# Keep the learned 5000-ms argument byte-for-byte: a 2000-ms argument would be
+# rejected by OpenShield's exact application selector before reaching DROP.
+if run_tcp_client 5 >/dev/null 2>&1; then
     printf '%s\n' 'an OpenShield allow bypassed a downstream firewall DROP' >&2
     exit 1
 fi
@@ -882,11 +1354,16 @@ if [ "$udp_reply" = "$udp_payload" ]; then
     exit 1
 fi
 if [ "$backend" = iptables ]; then
-    docker exec "$client" "$iptables_command" --wait 5 -D OUTPUT -p tcp -d "$server_ip" \
-        --dport 18081 -m comment --comment openshield-e2e-downstream -j DROP
-    docker exec "$client" "$iptables_command" --wait 5 -D OUTPUT -p udp -d "$server_ip" \
-        --dport 18082 -m comment --comment openshield-e2e-downstream -j DROP
+    docker exec "$client" "$iptables_save" -c -t filter \
+        | docker exec -i "$client" python3 /opt/downstream-counters.py \
+            iptables "$client_ip" "$server_ip"
+    docker exec "$client" "$iptables_command" --wait 5 -D OUTPUT -j OPENSHIELD_E2E_DOWNSTREAM
+    docker exec "$client" "$iptables_command" --wait 5 -F OPENSHIELD_E2E_DOWNSTREAM
+    docker exec "$client" "$iptables_command" --wait 5 -X OPENSHIELD_E2E_DOWNSTREAM
 else
+    docker exec "$client" nft -j list chain inet openshield_e2e_downstream output \
+        | docker exec -i "$client" python3 /opt/downstream-counters.py \
+            nftables "$client_ip" "$server_ip"
     docker exec "$client" nft delete table inet openshield_e2e_downstream
 fi
 run_tcp_client 5
@@ -981,4 +1458,4 @@ if docker exec "$client" test -S /run/openshield/control.sock; then
     exit 1
 fi
 
-printf 'PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (%s)\n' "$backend"
+printf 'PASS server Learning allow -> templates -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (%s)\n' "$backend"

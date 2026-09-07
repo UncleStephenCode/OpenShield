@@ -9,8 +9,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ApplicationSelector, Direction, FirewallCounters, LearnedApplicationEndpoint, LearnedEndpoint,
-    Rule, RuleName, RuleOrigin, RuleSpec, ValidationError, model::REDACTED_APPLICATION_RULE_NAME,
+    ApplicationPath, ApplicationSelector, CgroupPath, Direction, FirewallCounters,
+    LearnedApplicationEndpoint, LearnedEndpoint, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec,
+    ValidationError, model::REDACTED_APPLICATION_RULE_NAME,
 };
 
 pub const MAX_RULES: usize = 10_000;
@@ -27,6 +28,7 @@ pub const MAX_LEARNED_RULES_PER_UID: usize = 512;
 pub const MAX_LEARNED_RULES_PER_APPLICATION: usize = 256;
 /// Maximum exact JSON size of persisted policy state.
 pub const MAX_STATE_BYTES: usize = 8 * 1024 * 1024;
+const APPLICATION_GROUP_TEMPLATE_NAME: &str = "application-wide template";
 /// Maximum policy generation representable inside the reserved nftables mark domains.
 ///
 /// Application conntrack marks use two domain bits plus this 30-bit generation.
@@ -438,10 +440,17 @@ impl State {
         }
         let rule = Rule::with_id_and_time(id, spec, now)?;
         let revision = self.next_revision()?;
+        let flow_generation = (rule.spec.enabled && rule.spec.action != RuleAction::Accept)
+            .then(|| self.next_flow_generation())
+            .transpose()?;
         self.rules.insert(id, rule.clone());
-        // Adding an allow rule cannot invalidate an already authorized flow.
-        // Keeping the generation avoids interrupting a Learning-mode handshake
-        // while its newly observed rule is persisted.
+        // Adding an enabled deny rule must invalidate application flow marks
+        // which were authorized by an older policy. Accept rules and inert
+        // rules can retain the generation, which also avoids interrupting a
+        // Learning-mode handshake while its observation is persisted.
+        if let Some(flow_generation) = flow_generation {
+            self.flow_generation = flow_generation;
+        }
         self.revision = revision;
         let event = Event {
             revision,
@@ -470,9 +479,10 @@ impl State {
     pub fn update_rule_at(
         &mut self,
         id: Uuid,
-        spec: RuleSpec,
+        mut spec: RuleSpec,
         now: DateTime<Utc>,
     ) -> Result<(Rule, Event), CoreError> {
+        clear_disabled_template_pin_if_skeleton(&mut spec);
         spec.validate()?;
         reject_redacted_spec(&spec)?;
         reject_unpinned_application_spec(&spec)?;
@@ -564,15 +574,19 @@ impl State {
         let Some(current) = self.rules.get(&id) else {
             return Err(CoreError::RuleNotFound(id));
         };
-        let flow_generation = if current.spec.enabled && !enabled {
+        let flow_generation = if current.spec.enabled && !enabled
+            || !current.spec.enabled && enabled && current.spec.action != RuleAction::Accept
+        {
             Some(self.next_flow_generation()?)
         } else {
             None
         };
         let mut rule = current.clone();
         rule.spec.enabled = enabled;
+        clear_disabled_template_pin_if_skeleton(&mut rule.spec);
         rule.updated_at = now.max(rule.updated_at);
         rule.validate()?;
+        reject_unpinned_application_spec(&rule.spec)?;
         self.rules.insert(id, rule.clone());
         if let Some(flow_generation) = flow_generation {
             self.flow_generation = flow_generation;
@@ -608,7 +622,7 @@ impl State {
         if self
             .rules
             .values()
-            .filter(|rule| rule.spec.origin == RuleOrigin::Learned)
+            .filter(|rule| is_automatic_rule(rule))
             .count()
             >= MAX_AUTOMATIC_LEARNED_RULES
         {
@@ -652,7 +666,7 @@ impl State {
         let learned_count = self
             .rules
             .values()
-            .filter(|rule| rule.spec.origin == RuleOrigin::Learned)
+            .filter(|rule| is_automatic_rule(rule))
             .count();
         let maximum_new = maximum_new
             .min(MAX_RULES - self.rules.len())
@@ -703,10 +717,15 @@ impl State {
             })
             .map(LearnedRuleKey::from_rule)
             .collect();
+        let mut known_templates: HashSet<ApplicationTemplateKey> = self
+            .rules
+            .values()
+            .filter_map(ApplicationTemplateKey::from_template)
+            .collect();
         let learned_count = self
             .rules
             .values()
-            .filter(|rule| rule.spec.origin == RuleOrigin::Learned)
+            .filter(|rule| is_automatic_rule(rule))
             .count();
         let mut learned_per_uid = HashMap::<u32, usize>::new();
         let mut learned_per_application = HashMap::<(u32, crate::ExecutableFileId), usize>::new();
@@ -732,7 +751,10 @@ impl State {
             if known.contains(&key) {
                 continue;
             }
-            if outcomes.len() >= maximum_new {
+            let template_key = ApplicationTemplateKey::from_selector(&learned.application)?;
+            let needs_template = !known_templates.contains(&template_key);
+            let required_slots = usize::from(needs_template) + 1;
+            if outcomes.len().saturating_add(required_slots) > maximum_new {
                 break;
             }
             let uid = learned
@@ -754,6 +776,11 @@ impl State {
             {
                 continue;
             }
+            if needs_template {
+                let outcome = self.insert_application_group_template(&template_key)?;
+                known_templates.insert(template_key);
+                outcomes.push(outcome);
+            }
             let outcome =
                 self.insert_learned_endpoint(learned.endpoint, Some(learned.application))?;
             known.insert(key);
@@ -762,6 +789,122 @@ impl State {
             outcomes.push(outcome);
         }
         Ok(outcomes)
+    }
+
+    /// Adds missing disabled application-wide templates for learned rules
+    /// loaded from an older state schema.
+    ///
+    /// Templates consume the same bounded automatic-rule reserve as endpoint
+    /// observations. Existing endpoint rules are never removed when there is
+    /// insufficient room for every historical group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] when a generated template cannot be validated or
+    /// revisioned.
+    pub fn ensure_application_group_templates(
+        &mut self,
+        maximum_new: usize,
+    ) -> Result<Vec<LearnOutcome>, CoreError> {
+        self.ensure_application_group_templates_with_size_limit(maximum_new, MAX_STATE_BYTES)
+    }
+
+    fn ensure_application_group_templates_with_size_limit(
+        &mut self,
+        maximum_new: usize,
+        maximum_state_bytes: usize,
+    ) -> Result<Vec<LearnOutcome>, CoreError> {
+        let mut known: HashSet<ApplicationTemplateKey> = self
+            .rules
+            .values()
+            .filter_map(ApplicationTemplateKey::from_template)
+            .collect();
+        let groups: Vec<ApplicationTemplateKey> = self
+            .rules
+            .values()
+            .filter(|rule| {
+                rule.spec.origin == RuleOrigin::Learned
+                    && rule.spec.direction == Direction::Outbound
+            })
+            .filter_map(|rule| rule.spec.application.as_ref())
+            .filter_map(|selector| ApplicationTemplateKey::from_selector(selector).ok())
+            .filter(|key| known.insert(key.clone()))
+            .collect();
+        let automatic_count = self
+            .rules
+            .values()
+            .filter(|rule| is_automatic_rule(rule))
+            .count();
+        let maximum_new = maximum_new
+            .min(MAX_RULES.saturating_sub(self.rules.len()))
+            .min(MAX_AUTOMATIC_LEARNED_RULES.saturating_sub(automatic_count));
+        let mut outcomes = Vec::with_capacity(maximum_new.min(groups.len()));
+        let mut serialized_size = bounded_serialized_state_size(self)?;
+        for group in groups.into_iter().take(maximum_new) {
+            let previous_revision = self.revision;
+            let previous_flow_generation = self.flow_generation;
+            let had_rules = !self.rules.is_empty();
+            let outcome = self.insert_application_group_template(&group)?;
+            let size_delta = match serialized_rule_map_entry_delta(
+                &outcome.rule,
+                previous_revision,
+                self.revision,
+                had_rules,
+            ) {
+                Ok(size_delta) => size_delta,
+                Err(error) => {
+                    self.rules.remove(&outcome.rule.id);
+                    self.revision = previous_revision;
+                    self.flow_generation = previous_flow_generation;
+                    return Err(error);
+                }
+            };
+            let candidate_size = serialized_size.saturating_add(size_delta);
+            if candidate_size > maximum_state_bytes {
+                // A legacy state close to the byte ceiling must remain
+                // bootable. Template migration is additive convenience, so
+                // roll back only the template which would cross the bound and
+                // leave the already valid policy unchanged.
+                self.rules.remove(&outcome.rule.id);
+                self.revision = previous_revision;
+                self.flow_generation = previous_flow_generation;
+                break;
+            }
+            serialized_size = candidate_size;
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
+    fn insert_application_group_template(
+        &mut self,
+        key: &ApplicationTemplateKey,
+    ) -> Result<LearnOutcome, CoreError> {
+        let application = ApplicationSelector::new(
+            Some(key.executable.clone()),
+            None,
+            None,
+            None,
+            key.cgroup.clone(),
+        )
+        .map_err(ValidationError::from)?;
+        let spec = RuleSpec {
+            name: RuleName::new(APPLICATION_GROUP_TEMPLATE_NAME)?,
+            direction: Direction::Outbound,
+            action: RuleAction::Accept,
+            protocol: crate::TransportProtocol::Any,
+            peer_network: None,
+            port: None,
+            interface: None,
+            application: Some(application),
+            origin: RuleOrigin::Template,
+            enabled: false,
+        };
+        let (rule, event) = self.create_rule(spec)?;
+        Ok(LearnOutcome {
+            rule,
+            event: Some(event),
+        })
     }
 
     fn insert_learned_endpoint(
@@ -791,6 +934,7 @@ impl State {
             RuleOrigin::Learned,
             true,
         )?;
+        spec.action = RuleAction::Accept;
         spec.application = application;
         spec.validate()?;
         let (rule, event) = self.create_rule(spec)?;
@@ -857,6 +1001,10 @@ fn classify_application_interception<'a>(
     }
 }
 
+fn is_automatic_rule(rule: &Rule) -> bool {
+    matches!(rule.spec.origin, RuleOrigin::Learned | RuleOrigin::Template)
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LearnedRuleKey {
     protocol: crate::TransportProtocol,
@@ -864,6 +1012,36 @@ struct LearnedRuleKey {
     port: Option<crate::PortRange>,
     interface: Option<crate::InterfaceName>,
     application: Option<ApplicationSelector>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ApplicationTemplateKey {
+    executable: ApplicationPath,
+    cgroup: Option<CgroupPath>,
+}
+
+impl ApplicationTemplateKey {
+    fn from_selector(selector: &ApplicationSelector) -> Result<Self, ValidationError> {
+        let executable = selector
+            .executable
+            .clone()
+            .ok_or(crate::ApplicationValidationError::ApplicationSelectorNeedsExecutable)?;
+        Ok(Self {
+            executable,
+            cgroup: selector.cgroup.clone(),
+        })
+    }
+
+    fn from_template(rule: &Rule) -> Option<Self> {
+        let selector = rule.spec.application.as_ref()?;
+        if rule.spec.origin != RuleOrigin::Template
+            || rule.spec.direction != Direction::Outbound
+            || selector.metadata_redacted
+        {
+            return None;
+        }
+        Self::from_selector(selector).ok()
+    }
 }
 
 impl LearnedRuleKey {
@@ -924,6 +1102,7 @@ pub struct ApplicationLearningAdmissionIndex {
     total_rule_count: usize,
     learned_rule_count: usize,
     known: HashSet<LearnedRuleKey>,
+    known_templates: HashSet<ApplicationTemplateKey>,
     learned_per_uid: HashMap<u32, usize>,
     learned_per_application: HashMap<(u32, crate::ExecutableFileId), usize>,
 }
@@ -931,16 +1110,21 @@ pub struct ApplicationLearningAdmissionIndex {
 impl ApplicationLearningAdmissionIndex {
     fn from_state(state: &State) -> Self {
         let mut known = HashSet::new();
+        let mut known_templates = HashSet::new();
         let mut learned_rule_count = 0_usize;
         let mut learned_per_uid = HashMap::<u32, usize>::new();
         let mut learned_per_application = HashMap::<(u32, crate::ExecutableFileId), usize>::new();
 
         for rule in state.rules.values() {
-            if rule.spec.origin != RuleOrigin::Learned {
+            if !is_automatic_rule(rule) {
                 continue;
             }
             learned_rule_count += 1;
-            if rule.spec.direction != Direction::Outbound {
+            if let Some(template) = ApplicationTemplateKey::from_template(rule) {
+                known_templates.insert(template);
+            }
+            if rule.spec.origin != RuleOrigin::Learned || rule.spec.direction != Direction::Outbound
+            {
                 continue;
             }
             known.insert(LearnedRuleKey::from_rule(rule));
@@ -961,6 +1145,7 @@ impl ApplicationLearningAdmissionIndex {
             total_rule_count: state.rules.len(),
             learned_rule_count,
             known,
+            known_templates,
             learned_per_uid,
             learned_per_application,
         }
@@ -997,8 +1182,16 @@ impl ApplicationLearningAdmissionIndex {
         if self.known.contains(&key) {
             return Ok(ApplicationLearningAdmission::AlreadyKnown);
         }
-        if self.total_rule_count >= MAX_RULES
-            || self.learned_rule_count >= MAX_AUTOMATIC_LEARNED_RULES
+        let template_key =
+            ApplicationTemplateKey {
+                executable: endpoint.application.executable.clone().ok_or(
+                    crate::ApplicationValidationError::IncompleteLearnedApplicationIdentity,
+                )?,
+                cgroup: endpoint.application.cgroup.clone(),
+            };
+        let required_slots = 1 + usize::from(!self.known_templates.contains(&template_key));
+        if self.total_rule_count.saturating_add(required_slots) > MAX_RULES
+            || self.learned_rule_count.saturating_add(required_slots) > MAX_AUTOMATIC_LEARNED_RULES
         {
             return Ok(ApplicationLearningAdmission::Saturated);
         }
@@ -1096,6 +1289,27 @@ fn bounded_serialized_state_size(state: &State) -> Result<usize, CoreError> {
     }
 }
 
+fn serialized_rule_map_entry_delta(
+    rule: &Rule,
+    previous_revision: u64,
+    current_revision: u64,
+    had_rules: bool,
+) -> Result<usize, CoreError> {
+    let rule_size = serde_json::to_vec(rule)
+        .map_err(|error| CoreError::StateSerialization(error.to_string()))?
+        .len();
+    let key_and_separator_size = rule.id.to_string().len().saturating_add(3);
+    let comma_size = usize::from(had_rules);
+    let previous_revision_size = previous_revision.to_string().len();
+    let current_revision_size = current_revision.to_string().len();
+    rule_size
+        .checked_add(key_and_separator_size)
+        .and_then(|size| size.checked_add(comma_size))
+        .and_then(|size| size.checked_add(current_revision_size))
+        .and_then(|size| size.checked_sub(previous_revision_size))
+        .ok_or_else(|| CoreError::StateSerialization("state size arithmetic overflowed".to_owned()))
+}
+
 fn reject_redacted_rule(rule: &Rule) -> Result<(), CoreError> {
     reject_redacted_spec(&rule.spec)
 }
@@ -1116,10 +1330,52 @@ fn reject_unpinned_application_spec(spec: &RuleSpec) -> Result<(), CoreError> {
         .application
         .as_ref()
         .is_some_and(|selector| selector.executable_file.is_none())
+        && !is_unpinned_application_template(spec)
     {
         return Err(CoreError::UnpinnedApplicationIdentity);
     }
     Ok(())
+}
+
+fn is_unpinned_application_template(spec: &RuleSpec) -> bool {
+    let Some(selector) = spec.application.as_ref() else {
+        return false;
+    };
+    spec.origin == RuleOrigin::Template
+        && !spec.enabled
+        && spec.action == RuleAction::Accept
+        && spec.direction == Direction::Outbound
+        && spec.protocol == crate::TransportProtocol::Any
+        && spec.peer_network.is_none()
+        && spec.port.is_none()
+        && spec.interface.is_none()
+        && selector.executable.is_some()
+        && selector.executable_file.is_none()
+        && selector.command_line.is_none()
+        && selector.uid.is_none()
+        && !selector.metadata_redacted
+}
+
+fn clear_disabled_template_pin_if_skeleton(spec: &mut RuleSpec) {
+    if spec.origin != RuleOrigin::Template
+        || spec.enabled
+        || spec.action != RuleAction::Accept
+        || spec.direction != Direction::Outbound
+        || spec.protocol != crate::TransportProtocol::Any
+        || spec.peer_network.is_some()
+        || spec.port.is_some()
+        || spec.interface.is_some()
+    {
+        return;
+    }
+    if let Some(selector) = spec.application.as_mut()
+        && selector.executable.is_some()
+        && selector.command_line.is_none()
+        && selector.uid.is_none()
+        && !selector.metadata_redacted
+    {
+        selector.executable_file = None;
+    }
 }
 
 #[cfg(test)]
@@ -1438,6 +1694,25 @@ mod tests {
     }
 
     #[test]
+    fn activating_or_creating_a_deny_invalidates_old_application_flows()
+    -> Result<(), Box<dyn Error>> {
+        let mut disabled_drop = test_spec("disabled drop")?;
+        disabled_drop.enabled = false;
+        disabled_drop.action = RuleAction::Drop;
+        let mut state = State::new();
+        let (rule, _) = state.create_rule(disabled_drop)?;
+        assert_eq!(state.flow_generation(), 1);
+        state.set_rule_enabled(rule.id, true)?;
+        assert_eq!(state.flow_generation(), 2);
+
+        let mut enabled_reject = test_spec("enabled reject")?;
+        enabled_reject.action = RuleAction::Reject;
+        state.create_rule(enabled_reject)?;
+        assert_eq!(state.flow_generation(), 3);
+        Ok(())
+    }
+
+    #[test]
     fn exhausted_generation_can_enter_but_never_leave_block_all() -> Result<(), Box<dyn Error>> {
         let mut state = State::new();
         state.mode = Mode::Enforcing;
@@ -1538,7 +1813,7 @@ mod tests {
             state
                 .learn_new_application_endpoints(first_application, MAX_RULES)?
                 .len(),
-            MAX_LEARNED_RULES_PER_APPLICATION
+            MAX_LEARNED_RULES_PER_APPLICATION + 1
         );
 
         let second_application = (300..600)
@@ -1548,17 +1823,26 @@ mod tests {
             state
                 .learn_new_application_endpoints(second_application, MAX_RULES)?
                 .len(),
-            MAX_LEARNED_RULES_PER_APPLICATION
+            MAX_LEARNED_RULES_PER_APPLICATION + 1
         );
-        assert_eq!(state.rules().len(), MAX_LEARNED_RULES_PER_UID);
+        assert_eq!(state.rules().len(), MAX_LEARNED_RULES_PER_UID + 2);
 
         let saturated_uid = learned_application_endpoint(700, 1_000, 3)?;
         let other_uid = learned_application_endpoint(701, 1_001, 3)?;
         let mixed =
             state.learn_new_application_endpoints([saturated_uid.clone(), other_uid], MAX_RULES)?;
-        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed.len(), 2);
         assert_eq!(
             mixed[0]
+                .rule
+                .spec
+                .application
+                .as_ref()
+                .and_then(|app| app.uid),
+            None
+        );
+        assert_eq!(
+            mixed[1]
                 .rule
                 .spec
                 .application
@@ -1581,6 +1865,233 @@ mod tests {
         );
         assert_eq!(
             admission.classify(&learned_application_endpoint(702, 1_002, 3)?)?,
+            ApplicationLearningAdmission::Candidate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn application_learning_creates_one_safe_disabled_template_per_path_and_cgroup()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let first = learned_application_endpoint(10, 1_000, 7)?;
+        let second = learned_application_endpoint(11, 1_000, 7)?;
+        let outcomes = state.learn_new_application_endpoints([first, second], MAX_RULES)?;
+        assert_eq!(outcomes.len(), 3);
+
+        let templates: Vec<_> = state
+            .rules()
+            .filter(|rule| rule.spec.origin == RuleOrigin::Template)
+            .collect();
+        assert_eq!(templates.len(), 1);
+        let template = templates[0];
+        let template_id = template.id;
+        assert!(!template.spec.enabled);
+        assert_eq!(template.spec.action, RuleAction::Accept);
+        assert_eq!(template.spec.direction, Direction::Outbound);
+        assert_eq!(template.spec.protocol, TransportProtocol::Any);
+        assert!(template.spec.peer_network.is_none());
+        assert!(template.spec.port.is_none());
+        assert!(template.spec.interface.is_none());
+        let selector = template
+            .spec
+            .application
+            .as_ref()
+            .ok_or("template has no application selector")?;
+        assert!(selector.executable.is_some());
+        assert!(selector.executable_file.is_none());
+        assert!(selector.command_line.is_none());
+        assert!(selector.uid.is_none());
+        drop(templates);
+        assert_eq!(
+            state.set_rule_enabled(template_id, true),
+            Err(CoreError::UnpinnedApplicationIdentity)
+        );
+        assert!(
+            !state
+                .rule(template_id)
+                .ok_or("template disappeared")?
+                .spec
+                .enabled
+        );
+        assert!(
+            state
+                .rules()
+                .filter(|rule| rule.spec.origin == RuleOrigin::Learned)
+                .all(|rule| rule.spec.enabled && rule.spec.action == RuleAction::Accept)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_application_identity_is_limited_to_the_exact_template_skeleton()
+    -> Result<(), Box<dyn Error>> {
+        let mut learned_state = State::new();
+        let endpoint = learned_application_endpoint(12, 1_000, 12)?;
+        learned_state.learn_new_application_endpoints([endpoint], MAX_RULES)?;
+        let skeleton = learned_state
+            .rules()
+            .find(|rule| rule.spec.origin == RuleOrigin::Template)
+            .ok_or("missing generated template")?
+            .spec
+            .clone();
+        State::new().create_rule(skeleton.clone())?;
+
+        let mut invalid = Vec::new();
+        let mut changed = skeleton.clone();
+        changed.origin = RuleOrigin::Manual;
+        invalid.push(changed);
+        let mut changed = skeleton.clone();
+        changed.enabled = true;
+        invalid.push(changed);
+        let mut changed = skeleton.clone();
+        changed.action = RuleAction::Drop;
+        invalid.push(changed);
+        let mut changed = skeleton.clone();
+        changed.protocol = TransportProtocol::Tcp;
+        invalid.push(changed);
+        let mut changed = skeleton.clone();
+        changed.peer_network = Some("203.0.113.0/24".parse()?);
+        invalid.push(changed);
+        let mut changed = skeleton.clone();
+        changed.protocol = TransportProtocol::Tcp;
+        changed.port = Some(PortRange::single(443)?);
+        invalid.push(changed);
+        let mut changed = skeleton.clone();
+        changed.interface = Some(crate::InterfaceName::new("eth0")?);
+        invalid.push(changed);
+        let mut changed = skeleton;
+        changed
+            .application
+            .as_mut()
+            .ok_or("template selector disappeared")?
+            .uid = Some(1_000);
+        invalid.push(changed);
+
+        for specification in invalid {
+            assert_eq!(
+                State::new().create_rule(specification),
+                Err(CoreError::UnpinnedApplicationIdentity)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_an_edited_template_preserves_its_custom_specification()
+    -> Result<(), Box<dyn Error>> {
+        let mut learned_state = State::new();
+        learned_state.learn_new_application_endpoints(
+            [learned_application_endpoint(51, 1_000, 51)?],
+            MAX_RULES,
+        )?;
+        let mut custom = learned_state
+            .rules()
+            .find(|rule| rule.spec.origin == RuleOrigin::Template)
+            .ok_or("missing generated template")?
+            .spec
+            .clone();
+        custom.enabled = true;
+        custom.action = RuleAction::Drop;
+        custom.protocol = TransportProtocol::Tcp;
+        custom.peer_network = Some("203.0.113.0/24".parse()?);
+        custom.port = Some(PortRange::single(443)?);
+        custom
+            .application
+            .as_mut()
+            .ok_or("template selector missing")?
+            .executable_file = Some(ExecutableFileId {
+            device: 8,
+            inode: 51,
+            size: 4_096,
+            ctime_seconds: 1_700_000_000,
+            ctime_nanoseconds: 0,
+        });
+
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let (created, _) = state.create_rule(custom.clone())?;
+        state.set_rule_enabled(created.id, false)?;
+        let disabled = &state.rule(created.id).ok_or("template disappeared")?.spec;
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.action, custom.action);
+        assert_eq!(disabled.protocol, custom.protocol);
+        assert_eq!(disabled.peer_network, custom.peer_network);
+        assert_eq!(disabled.port, custom.port);
+        assert_eq!(disabled.application, custom.application);
+        Ok(())
+    }
+
+    #[test]
+    fn historical_learned_groups_receive_missing_templates_without_duplicates()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        let learned = learned_application_endpoint(20, 1_000, 8)?;
+        let outcome = state.insert_learned_endpoint(learned.endpoint, Some(learned.application))?;
+        assert_eq!(outcome.rule.spec.action, RuleAction::Accept);
+        assert_eq!(
+            state.ensure_application_group_templates(MAX_RULES)?.len(),
+            1
+        );
+        assert!(
+            state
+                .ensure_application_group_templates(MAX_RULES)?
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .rules()
+                .filter(|rule| rule.spec.origin == RuleOrigin::Template)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn template_migration_stops_before_the_state_byte_limit_without_mutation()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        let learned = learned_application_endpoint(21, 1_000, 9)?;
+        state.insert_learned_endpoint(learned.endpoint, Some(learned.application))?;
+        let before = state.clone();
+        let existing_size = serde_json::to_vec(&state)?.len();
+
+        assert!(
+            state
+                .ensure_application_group_templates_with_size_limit(MAX_RULES, existing_size)?
+                .is_empty()
+        );
+        assert_eq!(state, before);
+        assert_eq!(
+            state.ensure_application_group_templates(MAX_RULES)?.len(),
+            1
+        );
+        state.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn admission_reserves_both_endpoint_and_missing_template_slots() -> Result<(), Box<dyn Error>> {
+        let endpoint = learned_application_endpoint(22, 1_000, 10)?;
+        let mut admission = State::new().application_learning_admission_index();
+        admission.total_rule_count = MAX_RULES - 1;
+        assert_eq!(
+            admission.classify(&endpoint)?,
+            ApplicationLearningAdmission::Saturated
+        );
+
+        admission.known_templates.insert(ApplicationTemplateKey {
+            executable: endpoint
+                .application
+                .executable
+                .clone()
+                .ok_or("learned selector has no path")?,
+            cgroup: endpoint.application.cgroup.clone(),
+        });
+        assert_eq!(
+            admission.classify(&endpoint)?,
             ApplicationLearningAdmission::Candidate
         );
         Ok(())

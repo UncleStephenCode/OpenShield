@@ -294,8 +294,9 @@ mislabeling environmental drift as a performance regression.
 - application errors/loss, TCP retransmits, NIC drops/errors, NFQUEUE
   drops/errors, or fail-open behavior block immediately and are never deferred
   to the repeated-sample relative decision;
-  explicit fail-open behavior is proven by the independent canary during the
-  separate controlled-overload test, outside the paired performance workload;
+  the independent canary in the separate controlled-overload test proves the
+  absence of fail-open behavior: application-bound Enforcing traffic remains
+  fail-closed while its queue consumer is unavailable;
 - the overload pressure client must publish readiness and wait at its explicit
   start barrier before the authenticated daemon process is stopped; the fixed
   saturation window must then show the configured NFQUEUE drop evidence, and a
@@ -308,8 +309,9 @@ mislabeling environmental drift as a performance regression.
 - ordinary measurement windows require zero application loss/errors, TCP
   retransmits, NIC drops/errors, and NFQUEUE drops/errors;
   NFQUEUE drops are expected only in the explicitly controlled overload proof,
-  where observed saturation and every canary probe must still remain
-  fail-closed;
+  where saturation must be observed, every application-bound wrong-executable
+  probe must remain fail-closed, and the separate network-only canary must stay
+  live;
 - UDP drain acknowledgements count only after the server proves the exact
   contiguous per-flow sequence prefix within its fixed reordering bound; the
   gate never assumes UDP delivery order;

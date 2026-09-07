@@ -14,13 +14,14 @@ use openshield_core::LearnedEndpoint;
 use openshield_core::{
     ApplicationLearningAdmission, ApplicationLearningAdmissionIndex, CoreError, Event, EventKind,
     FirewallCounters, LearnedApplicationEndpoint, MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule,
-    RuleOrigin, Snapshot, State, StateStore,
+    RuleAction, RuleOrigin, Snapshot, State, StateStore, TransportProtocol,
 };
 #[cfg(test)]
 use openshield_protocol::FirewallBackendKind;
 use openshield_protocol::{
     Ack, CompatibilityLevel, CompatibilityReason, ControlRequest, ErrorCode, NfqueueCounters,
-    ProtocolError, Response, RuntimeCompatibility, clamp_page_limit,
+    OutboundGroupAction, OutboundGroupSelector, ProtocolError, Response, RuntimeCompatibility,
+    clamp_page_limit,
 };
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -543,14 +544,28 @@ fn rotate_startup_flow_generation(state: &mut State) -> Result<()> {
 }
 
 fn build_application_decision_policy(state: &State) -> ApplicationDecisionPolicy {
-    let rules = if state.mode() == Mode::Enforcing {
-        state
+    let rules = match state.mode() {
+        Mode::Enforcing => state
             .rules()
-            .filter(|rule| rule.spec.enabled && rule.spec.application.is_some())
+            .filter(|rule| {
+                rule.spec.enabled
+                    && (rule.spec.application.is_some()
+                        || (rule.spec.direction == openshield_core::Direction::Outbound
+                            && rule.spec.action == RuleAction::Accept))
+            })
             .cloned()
-            .collect()
-    } else {
-        Vec::new()
+            .collect(),
+        Mode::Learning => state
+            .rules()
+            .filter(|rule| {
+                rule.spec.enabled
+                    && rule.spec.direction == openshield_core::Direction::Outbound
+                    && rule.spec.application.is_some()
+                    && matches!(rule.spec.action, RuleAction::Drop | RuleAction::Reject)
+            })
+            .cloned()
+            .collect(),
+        Mode::BlockAll => Vec::new(),
     };
     ApplicationDecisionPolicy::new(Snapshot {
         revision: state.revision(),
@@ -587,11 +602,28 @@ fn validate_application_learning_transition(
         let EventKind::RuleCreated { rule } = &event.kind else {
             return false;
         };
+        let valid_learned_rule = rule.spec.origin == RuleOrigin::Learned
+            && rule.spec.direction == openshield_core::Direction::Outbound
+            && rule.spec.action == RuleAction::Accept
+            && rule.spec.enabled
+            && rule.spec.application.is_some();
+        let valid_template = rule.spec.origin == RuleOrigin::Template
+            && rule.spec.direction == openshield_core::Direction::Outbound
+            && rule.spec.action == RuleAction::Accept
+            && rule.spec.protocol == TransportProtocol::Any
+            && rule.spec.peer_network.is_none()
+            && rule.spec.port.is_none()
+            && rule.spec.interface.is_none()
+            && !rule.spec.enabled
+            && rule.spec.application.as_ref().is_some_and(|selector| {
+                selector.executable.is_some()
+                    && selector.executable_file.is_none()
+                    && selector.command_line.is_none()
+                    && selector.uid.is_none()
+                    && !selector.metadata_redacted
+            });
         if event.revision != next_revision
-            || rule.spec.origin != RuleOrigin::Learned
-            || rule.spec.direction != openshield_core::Direction::Outbound
-            || !rule.spec.enabled
-            || rule.spec.application.is_none()
+            || !(valid_learned_rule || valid_template)
             || previous.rule(rule.id).is_some()
             || candidate.rule(rule.id) != Some(rule)
         {
@@ -619,6 +651,9 @@ impl Engine {
         let state = match persistence.load_exclusive() {
             Ok(Some(mut state)) => {
                 rotate_startup_flow_generation(&mut state)?;
+                state
+                    .ensure_application_group_templates(MAX_RULES)
+                    .context("cannot migrate application group templates")?;
                 if let Err(save_error) = persistence.save_exclusive(&state) {
                     let fail_closed = backend.fail_closed();
                     return match fail_closed {
@@ -928,68 +963,13 @@ impl Engine {
         }
 
         let mut candidate = self.state.clone();
-        let (event, affected_rule) = match request {
-            ControlRequest::SetMode { mode, .. } => {
-                let event = candidate
-                    .set_mode(mode)
-                    .map_err(|error| core_protocol_error(&error))?;
-                (event, None)
-            }
-            ControlRequest::CreateRule { mut rule, .. } => {
-                if rule.origin != RuleOrigin::Manual {
-                    return Err(ProtocolError::new(
-                        ErrorCode::InvalidRequest,
-                        "only the daemon may create rules marked as learned",
-                    ));
-                }
-                pin_rule_application(&mut rule).map_err(|error| {
-                    ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
-                })?;
-                let (created, event) = candidate
-                    .create_rule(rule)
-                    .map_err(|error| core_protocol_error(&error))?;
-                (event, Some(created))
-            }
-            ControlRequest::UpdateRule { id, mut rule, .. } => {
-                let Some(current) = candidate.rule(id) else {
-                    return Err(ProtocolError::new(
-                        ErrorCode::NotFound,
-                        format!("rule {id} does not exist"),
-                    ));
-                };
-                if current.spec.origin != rule.origin {
-                    return Err(ProtocolError::new(
-                        ErrorCode::InvalidRequest,
-                        "a rule's origin cannot be changed",
-                    ));
-                }
-                pin_rule_application(&mut rule).map_err(|error| {
-                    ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
-                })?;
-                let (updated, event) = candidate
-                    .update_rule(id, rule)
-                    .map_err(|error| core_protocol_error(&error))?;
-                (event, Some(updated))
-            }
-            ControlRequest::DeleteRule { id, .. } => {
-                let (deleted, event) = candidate
-                    .delete_rule(id)
-                    .map_err(|error| core_protocol_error(&error))?;
-                (event, Some(deleted))
-            }
-            ControlRequest::SetRuleEnabled { id, enabled, .. } => {
-                let (updated, event) = candidate
-                    .set_rule_enabled(id, enabled)
-                    .map_err(|error| core_protocol_error(&error))?;
-                (event, Some(updated))
-            }
-        };
+        let (events, affected_rule) = apply_control_to_candidate(&mut candidate, request)?;
 
         candidate
             .validate()
             .map_err(|error| core_protocol_error(&error))?;
         let revision = candidate.revision();
-        self.commit(candidate, std::slice::from_ref(&event))?;
+        self.commit(candidate, &events)?;
         Ok(Ack::new(revision, affected_rule))
     }
 
@@ -1581,6 +1561,169 @@ impl Engine {
     }
 }
 
+fn apply_control_to_candidate(
+    candidate: &mut State,
+    request: ControlRequest,
+) -> Result<(Vec<Event>, Option<Rule>), ProtocolError> {
+    match request {
+        ControlRequest::SetMode { mode, .. } => {
+            let event = candidate
+                .set_mode(mode)
+                .map_err(|error| core_protocol_error(&error))?;
+            Ok((vec![event], None))
+        }
+        ControlRequest::CreateRule { mut rule, .. } => {
+            if rule.origin != RuleOrigin::Manual {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "only the daemon may create rules marked as learned or template",
+                ));
+            }
+            pin_rule_application(&mut rule).map_err(|error| {
+                ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
+            })?;
+            let (created, event) = candidate
+                .create_rule(rule)
+                .map_err(|error| core_protocol_error(&error))?;
+            Ok((vec![event], Some(created)))
+        }
+        ControlRequest::UpdateRule { id, mut rule, .. } => {
+            let Some(current) = candidate.rule(id) else {
+                return Err(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("rule {id} does not exist"),
+                ));
+            };
+            if current.spec.origin != rule.origin {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "a rule's origin cannot be changed",
+                ));
+            }
+            // Pin every edited application selector before it reaches State.
+            // State deliberately removes the pin again only for the exact
+            // disabled broad-template skeleton.  A disabled template that is
+            // edited into a narrower/custom rule must remain pinned so it can
+            // later be enabled without storing an unauthenticated selector.
+            pin_rule_application(&mut rule).map_err(|error| {
+                ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
+            })?;
+            let (updated, event) = candidate
+                .update_rule(id, rule)
+                .map_err(|error| core_protocol_error(&error))?;
+            Ok((vec![event], Some(updated)))
+        }
+        ControlRequest::DeleteRule { id, .. } => {
+            let (deleted, event) = candidate
+                .delete_rule(id)
+                .map_err(|error| core_protocol_error(&error))?;
+            Ok((vec![event], Some(deleted)))
+        }
+        ControlRequest::SetRuleEnabled { id, enabled, .. } => {
+            let current = candidate.rule(id).cloned().ok_or_else(|| {
+                ProtocolError::new(ErrorCode::NotFound, format!("rule {id} does not exist"))
+            })?;
+            let (updated, event) = if enabled
+                && (current.spec.origin == RuleOrigin::Template
+                    || current
+                        .spec
+                        .application
+                        .as_ref()
+                        .is_some_and(|selector| selector.executable_file.is_none()))
+            {
+                let mut specification = current.spec;
+                pin_rule_application(&mut specification).map_err(|error| {
+                    ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
+                })?;
+                specification.enabled = true;
+                candidate
+                    .update_rule(id, specification)
+                    .map_err(|error| core_protocol_error(&error))?
+            } else {
+                candidate
+                    .set_rule_enabled(id, enabled)
+                    .map_err(|error| core_protocol_error(&error))?
+            };
+            Ok((vec![event], Some(updated)))
+        }
+        ControlRequest::ManageOutboundGroup { group, action, .. } => {
+            let events = apply_outbound_group_to_candidate(candidate, &group, action)?;
+            Ok((events, None))
+        }
+    }
+}
+
+fn apply_outbound_group_to_candidate(
+    candidate: &mut State,
+    group: &OutboundGroupSelector,
+    action: OutboundGroupAction,
+) -> Result<Vec<Event>, ProtocolError> {
+    // Resolve membership before editing the private candidate. State assigns
+    // each event its normal consecutive revision, while the caller commits
+    // the final policy to the firewall and storage exactly once.
+    let members: Vec<Rule> = candidate
+        .rules()
+        .filter(|rule| group.matches(rule))
+        .cloned()
+        .collect();
+    if members.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::NotFound,
+            "outbound group has no matching rules; reload before retrying",
+        ));
+    }
+
+    let mut events = Vec::with_capacity(members.len());
+    for member in members {
+        match action {
+            OutboundGroupAction::Delete => {
+                let (_, event) = candidate
+                    .delete_rule(member.id)
+                    .map_err(|error| core_protocol_error(&error))?;
+                events.push(event);
+            }
+            OutboundGroupAction::Accept
+            | OutboundGroupAction::Reject
+            | OutboundGroupAction::Drop => {
+                let mut specification = member.spec;
+                specification.action = match action {
+                    OutboundGroupAction::Reject => RuleAction::Reject,
+                    OutboundGroupAction::Drop => RuleAction::Drop,
+                    _ => RuleAction::Accept,
+                };
+                // Existing file pins are policy identity and must survive a
+                // verdict change even when the executable has disappeared.
+                // A disabled, broad Accept template may have no pin; changing
+                // it into a deny rule requires pinning under State invariants.
+                if specification.action != RuleAction::Accept
+                    && specification
+                        .application
+                        .as_ref()
+                        .is_some_and(|selector| selector.executable_file.is_none())
+                {
+                    pin_rule_application(&mut specification).map_err(|error| {
+                        ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
+                    })?;
+                }
+                let (_, event) = candidate
+                    .update_rule(member.id, specification)
+                    .map_err(|error| core_protocol_error(&error))?;
+                events.push(event);
+            }
+            OutboundGroupAction::Enable | OutboundGroupAction::Disable => {
+                let request = ControlRequest::SetRuleEnabled {
+                    expected_revision: candidate.revision(),
+                    id: member.id,
+                    enabled: action == OutboundGroupAction::Enable,
+                };
+                let (changed, _) = apply_control_to_candidate(candidate, request)?;
+                events.extend(changed);
+            }
+        }
+    }
+    Ok(events)
+}
+
 fn persisted_state_after_failed_save(
     store: &dyn StateStore,
     previous: &State,
@@ -1652,13 +1795,14 @@ fn core_protocol_error(error: &CoreError) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::fs;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
     use anyhow::{Result as AnyResult, bail};
     use openshield_core::{
-        ApplicationPath, ApplicationSelector, Direction, ExecutableFileId, InterfaceName,
-        PortRange, RuleName, RuleSpec, Snapshot, StorageError, TransportProtocol,
+        ApplicationPath, ApplicationSelector, CgroupPath, Direction, ExecutableFileId,
+        InterfaceName, PortRange, RuleName, RuleSpec, Snapshot, StorageError, TransportProtocol,
     };
     use openshield_protocol::{CompatibilityLevel, CompatibilityReason, RuntimeCompatibility};
 
@@ -1716,6 +1860,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct StoreProbe {
         state: Arc<Mutex<Option<State>>>,
+        save_count: Arc<AtomicUsize>,
         fail_next: Arc<AtomicBool>,
         failure_script: Arc<Mutex<VecDeque<bool>>>,
     }
@@ -1724,6 +1869,7 @@ mod tests {
         fn new(state: State) -> Self {
             Self {
                 state: Arc::new(Mutex::new(Some(state))),
+                save_count: Arc::new(AtomicUsize::new(0)),
                 fail_next: Arc::new(AtomicBool::new(false)),
                 failure_script: Arc::new(Mutex::new(VecDeque::new())),
             }
@@ -1732,9 +1878,17 @@ mod tests {
         fn empty() -> Self {
             Self {
                 state: Arc::new(Mutex::new(None)),
+                save_count: Arc::new(AtomicUsize::new(0)),
                 fail_next: Arc::new(AtomicBool::new(false)),
                 failure_script: Arc::new(Mutex::new(VecDeque::new())),
             }
+        }
+
+        fn persisted_state(&self) -> AnyResult<Option<State>> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| anyhow!("store probe poisoned"))
         }
     }
 
@@ -1747,6 +1901,7 @@ mod tests {
         }
 
         fn save(&self, state: &State) -> Result<(), StorageError> {
+            self.save_count.fetch_add(1, Ordering::SeqCst);
             let scripted_failure = self
                 .failure_script
                 .lock()
@@ -1978,7 +2133,704 @@ mod tests {
             .lock()
             .map_err(|_| anyhow!("backend probe poisoned"))?
             .clear();
+        store.save_count.store(0, Ordering::SeqCst);
         Ok((engine, backend, store, events))
+    }
+
+    fn outbound_group_state() -> AnyResult<(State, Vec<Rule>)> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let mut rules = Vec::new();
+        for (index, (executable, cgroup, network, inbound)) in [
+            (
+                Some("/group/alpha"),
+                Some("/group/a"),
+                Some("203.0.113.1/24"),
+                false,
+            ),
+            (Some("/group/alpha"), Some("/group/a"), None, false),
+            (Some("/group/beta"), Some("/group/a"), None, false),
+            (Some("/group/alpha"), None, Some("203.0.113.1/24"), false),
+            (Some("/group/alpha"), Some("/group/b"), None, false),
+            (None, None, Some("203.0.113.1/24"), false),
+            (None, None, Some("203.0.113.129/24"), false),
+            (None, None, None, false),
+            (None, None, Some("203.0.113.1/24"), true),
+            (None, None, None, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut spec = manual_rule(&format!("group rule {index}"))?;
+            spec.enabled = index % 2 == 0;
+            spec.origin = if index == 5 {
+                RuleOrigin::Learned
+            } else {
+                RuleOrigin::Manual
+            };
+            spec.peer_network = network.map(str::parse).transpose()?;
+            if inbound {
+                spec.direction = Direction::Inbound;
+            }
+            if let Some(executable) = executable {
+                let mut application = learned_application_endpoint(1, 1_000, 1)?.application;
+                application.executable = Some(ApplicationPath::new(executable)?);
+                application.cgroup = cgroup.map(CgroupPath::new).transpose()?;
+                spec.application = Some(application);
+            }
+            let (rule, _) = state.create_rule_at(
+                Uuid::from_u128(u128::try_from(index)? + 1),
+                spec,
+                Utc::now(),
+            )?;
+            rules.push(rule);
+        }
+        Ok((state, rules))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Explicit scope/action matrix and ordered-event assertions.
+    fn outbound_group_actions_commit_all_selected_members_once() -> AnyResult<()> {
+        let executable = ApplicationPath::new("/group/alpha")?;
+        let cgroup = CgroupPath::new("/group/a")?;
+        for (group, selected_indices) in [
+            (
+                OutboundGroupSelector::Cgroup {
+                    cgroup: cgroup.clone(),
+                    executable: None,
+                },
+                vec![0, 1, 2],
+            ),
+            (
+                OutboundGroupSelector::Cgroup {
+                    cgroup,
+                    executable: Some(executable.clone()),
+                },
+                vec![0, 1],
+            ),
+            (OutboundGroupSelector::Executable { executable }, vec![3]),
+            (
+                OutboundGroupSelector::Destination {
+                    peer_network: Some("203.0.113.90/24".parse()?),
+                },
+                vec![5, 6],
+            ),
+            (
+                OutboundGroupSelector::Destination { peer_network: None },
+                vec![7],
+            ),
+        ] {
+            for action in [
+                OutboundGroupAction::Delete,
+                OutboundGroupAction::Accept,
+                OutboundGroupAction::Reject,
+                OutboundGroupAction::Drop,
+                OutboundGroupAction::Enable,
+                OutboundGroupAction::Disable,
+            ] {
+                let (state, original) = outbound_group_state()?;
+                let (mut engine, backend, store, events) = engine_with_state(state)?;
+                let previous_revision = engine.revision();
+                let subscription = events
+                    .subscribe()
+                    .map_err(|_| anyhow!("subscribe failed"))?;
+                let ack = engine
+                    .handle_control(ControlRequest::ManageOutboundGroup {
+                        expected_revision: previous_revision,
+                        group: group.clone(),
+                        action,
+                    })
+                    .map_err(|error| anyhow!(error.message))?;
+                assert_eq!(ack.affected_rule, None);
+                assert_eq!(
+                    ack.revision,
+                    previous_revision + u64::try_from(selected_indices.len())?
+                );
+                assert_eq!(engine.revision(), ack.revision);
+                assert_eq!(store.save_count.load(Ordering::SeqCst), 1);
+                assert_eq!(store.persisted_state()?, Some(engine.state.clone()));
+                let applied = backend
+                    .applied
+                    .lock()
+                    .map_err(|_| anyhow!("backend probe poisoned"))?;
+                assert_eq!(applied.as_slice(), &[engine.state.snapshot()]);
+                drop(applied);
+
+                for (index, before) in original.iter().enumerate() {
+                    if !selected_indices.contains(&index) {
+                        assert_eq!(engine.state.rule(before.id), Some(before));
+                        continue;
+                    }
+                    if action == OutboundGroupAction::Delete {
+                        assert!(engine.state.rule(before.id).is_none());
+                        continue;
+                    }
+                    let after = engine
+                        .state
+                        .rule(before.id)
+                        .ok_or_else(|| anyhow!("member disappeared"))?;
+                    let mut expected_spec = before.spec.clone();
+                    match action {
+                        OutboundGroupAction::Accept => expected_spec.action = RuleAction::Accept,
+                        OutboundGroupAction::Reject => expected_spec.action = RuleAction::Reject,
+                        OutboundGroupAction::Drop => expected_spec.action = RuleAction::Drop,
+                        OutboundGroupAction::Enable => expected_spec.enabled = true,
+                        OutboundGroupAction::Disable => expected_spec.enabled = false,
+                        OutboundGroupAction::Delete => bail!("delete was already handled"),
+                    }
+                    assert_eq!(after.spec, expected_spec);
+                    assert_eq!(after.created_at, before.created_at);
+                    assert!(after.updated_at >= before.updated_at);
+                }
+                for (offset, index) in selected_indices.iter().enumerate() {
+                    let event = subscription.recv_timeout(Duration::from_millis(50))?;
+                    assert_eq!(
+                        event.revision,
+                        previous_revision + u64::try_from(offset)? + 1
+                    );
+                    match (action, event.kind) {
+                        (OutboundGroupAction::Delete, EventKind::RuleDeleted { rule }) => {
+                            assert_eq!(rule, original[*index]);
+                        }
+                        (
+                            OutboundGroupAction::Enable | OutboundGroupAction::Disable,
+                            EventKind::RuleEnabledChanged { rule },
+                        )
+                        | (
+                            OutboundGroupAction::Accept
+                            | OutboundGroupAction::Reject
+                            | OutboundGroupAction::Drop,
+                            EventKind::RuleUpdated { rule },
+                        ) => {
+                            assert_eq!(rule.id, original[*index].id);
+                            assert_eq!(engine.state.rule(rule.id), Some(&rule));
+                        }
+                        _ => bail!("unexpected group event"),
+                    }
+                }
+                assert!(matches!(
+                    subscription.recv_timeout(Duration::from_millis(1)),
+                    Err(RecvTimeoutError::Timeout)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_group_rejects_stale_revisions_and_empty_matches_without_side_effects()
+    -> AnyResult<()> {
+        let (state, _) = outbound_group_state()?;
+        let (mut engine, backend, store, events) = engine_with_state(state)?;
+        let original = engine.state.clone();
+        let subscription = events
+            .subscribe()
+            .map_err(|_| anyhow!("subscribe failed"))?;
+        for (expected_revision, group, expected_code) in [
+            (
+                engine.revision() - 1,
+                OutboundGroupSelector::Destination { peer_network: None },
+                ErrorCode::Conflict,
+            ),
+            (
+                engine.revision(),
+                OutboundGroupSelector::Executable {
+                    executable: ApplicationPath::new("/missing")?,
+                },
+                ErrorCode::NotFound,
+            ),
+        ] {
+            let error = engine
+                .handle_control(ControlRequest::ManageOutboundGroup {
+                    expected_revision,
+                    group,
+                    action: OutboundGroupAction::Delete,
+                })
+                .err()
+                .ok_or_else(|| anyhow!("group unexpectedly succeeded"))?;
+            assert_eq!(error.code, expected_code);
+            assert_eq!(engine.state, original);
+            assert_eq!(store.persisted_state()?, Some(original.clone()));
+            assert_eq!(store.save_count.load(Ordering::SeqCst), 0);
+            assert!(
+                backend
+                    .applied
+                    .lock()
+                    .map_err(|_| anyhow!("backend probe poisoned"))?
+                    .is_empty()
+            );
+        }
+        assert!(matches!(
+            subscription.recv_timeout(Duration::from_millis(1)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_group_rolls_back_backend_and_persistence_failures_without_events() -> AnyResult<()>
+    {
+        for failure in 0..3 {
+            let (state, _) = outbound_group_state()?;
+            let (mut engine, backend, store, events) = engine_with_state(state)?;
+            let original = engine.state.clone();
+            let subscription = events
+                .subscribe()
+                .map_err(|_| anyhow!("subscribe failed"))?;
+            match failure {
+                0 => backend.fail_next.store(true, Ordering::SeqCst),
+                1 => backend.error_after_apply.store(true, Ordering::SeqCst),
+                _ => store.fail_next.store(true, Ordering::SeqCst),
+            }
+            let error = engine
+                .handle_control(ControlRequest::ManageOutboundGroup {
+                    expected_revision: engine.revision(),
+                    group: OutboundGroupSelector::Cgroup {
+                        cgroup: CgroupPath::new("/group/a")?,
+                        executable: None,
+                    },
+                    action: OutboundGroupAction::Drop,
+                })
+                .err()
+                .ok_or_else(|| anyhow!("group unexpectedly succeeded"))?;
+            assert_eq!(
+                error.code,
+                if failure == 2 {
+                    ErrorCode::Internal
+                } else {
+                    ErrorCode::BackendUnavailable
+                }
+            );
+            assert_eq!(engine.state, original);
+            assert_eq!(store.persisted_state()?, Some(original.clone()));
+            let applied = backend
+                .applied
+                .lock()
+                .map_err(|_| anyhow!("backend probe poisoned"))?;
+            assert_eq!(applied.len(), if failure == 0 { 1 } else { 2 });
+            assert_eq!(applied.last(), Some(&original.snapshot()));
+            assert!(!engine.restart_required());
+            assert!(matches!(
+                subscription.recv_timeout(Duration::from_millis(1)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_group_revision_or_generation_exhaustion_discards_partial_candidate() -> AnyResult<()>
+    {
+        for exhausted_revision in [true, false] {
+            let (state, _) = outbound_group_state()?;
+            let mut snapshot = state.snapshot();
+            if exhausted_revision {
+                snapshot.revision = u64::MAX - 1;
+            }
+            let (mut engine, backend, store, events) =
+                engine_with_state(State::from_snapshot(snapshot)?)?;
+            if !exhausted_revision {
+                // Startup intentionally rotates the generation. Put the live
+                // policy at its final usable generation after that rotation.
+                engine
+                    .state
+                    .rotate_flow_generation(MAX_FLOW_GENERATION - 1)?;
+                *store
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("store probe poisoned"))? = Some(engine.state.clone());
+            }
+            let original = engine.state.clone();
+            let subscription = events
+                .subscribe()
+                .map_err(|_| anyhow!("subscribe failed"))?;
+            assert!(
+                engine
+                    .handle_control(ControlRequest::ManageOutboundGroup {
+                        expected_revision: engine.revision(),
+                        group: OutboundGroupSelector::Cgroup {
+                            cgroup: CgroupPath::new("/group/a")?,
+                            executable: None,
+                        },
+                        action: OutboundGroupAction::Delete,
+                    })
+                    .is_err()
+            );
+            assert_eq!(engine.state, original);
+            assert_eq!(store.save_count.load(Ordering::SeqCst), 0);
+            assert!(
+                backend
+                    .applied
+                    .lock()
+                    .map_err(|_| anyhow!("backend probe poisoned"))?
+                    .is_empty()
+            );
+            assert!(matches!(
+                subscription.recv_timeout(Duration::from_millis(1)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+        }
+        Ok(())
+    }
+
+    fn outbound_group_template(
+        executable: ApplicationPath,
+        cgroup: CgroupPath,
+    ) -> AnyResult<RuleSpec> {
+        Ok(RuleSpec {
+            name: RuleName::new("application-wide template")?,
+            direction: Direction::Outbound,
+            action: RuleAction::Accept,
+            protocol: TransportProtocol::Any,
+            peer_network: None,
+            port: None,
+            interface: None,
+            application: Some(ApplicationSelector::new(
+                Some(executable),
+                None,
+                None,
+                None,
+                Some(cgroup),
+            )?),
+            origin: RuleOrigin::Template,
+            enabled: false,
+        })
+    }
+
+    #[test]
+    fn outbound_group_preserves_templates_and_pins_only_when_required() -> AnyResult<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("application");
+        fs::write(&path, b"test executable")?;
+        let executable =
+            ApplicationPath::new(path.to_str().ok_or_else(|| anyhow!("non-UTF-8 path"))?)?;
+        let cgroup = CgroupPath::new("/group/templates")?;
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let (template, _) =
+            state.create_rule(outbound_group_template(executable.clone(), cgroup.clone())?)?;
+        let mut concrete = manual_rule("learned application")?;
+        concrete.origin = RuleOrigin::Learned;
+        concrete.application = Some(ApplicationSelector::new(
+            Some(executable.clone()),
+            None,
+            None,
+            Some(1_000),
+            Some(cgroup.clone()),
+        )?);
+        pin_rule_application(&mut concrete)?;
+        let (learned, _) = state.create_rule(concrete)?;
+        let (mut engine, backend, store, _events) = engine_with_state(state)?;
+        for (index, action) in [
+            OutboundGroupAction::Reject,
+            OutboundGroupAction::Drop,
+            OutboundGroupAction::Accept,
+            OutboundGroupAction::Enable,
+            OutboundGroupAction::Disable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = engine.state.clone();
+            engine
+                .handle_control(ControlRequest::ManageOutboundGroup {
+                    expected_revision: engine.revision(),
+                    group: OutboundGroupSelector::Cgroup {
+                        cgroup: cgroup.clone(),
+                        executable: Some(executable.clone()),
+                    },
+                    action,
+                })
+                .map_err(|error| anyhow!(error.message))?;
+            assert_eq!(engine.state.rules().len(), 2);
+            for original in [&template, &learned] {
+                let previous = before
+                    .rule(original.id)
+                    .ok_or_else(|| anyhow!("member missing"))?;
+                let current = engine
+                    .state
+                    .rule(original.id)
+                    .ok_or_else(|| anyhow!("member missing"))?;
+                assert_eq!(current.spec.origin, original.spec.origin);
+                assert_eq!(current.spec.name, original.spec.name);
+                assert_eq!(current.created_at, original.created_at);
+                assert_eq!(current.spec.protocol, original.spec.protocol);
+                let expected_enabled = match action {
+                    OutboundGroupAction::Enable => true,
+                    OutboundGroupAction::Disable => false,
+                    _ => previous.spec.enabled,
+                };
+                assert_eq!(current.spec.enabled, expected_enabled);
+                let selector = current
+                    .spec
+                    .application
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("selector missing"))?;
+                assert_eq!(selector.executable.as_ref(), Some(&executable));
+                assert_eq!(selector.cgroup.as_ref(), Some(&cgroup));
+                assert_eq!(
+                    selector.uid,
+                    original
+                        .spec
+                        .application
+                        .as_ref()
+                        .and_then(|selector| selector.uid)
+                );
+                if original.spec.origin == RuleOrigin::Template {
+                    assert_eq!(
+                        selector.executable_file.is_none(),
+                        !current.spec.enabled && current.spec.action == RuleAction::Accept
+                    );
+                } else {
+                    assert_eq!(current.spec.application, original.spec.application);
+                }
+            }
+            assert_eq!(store.save_count.load(Ordering::SeqCst), index + 1);
+            assert_eq!(
+                backend
+                    .applied
+                    .lock()
+                    .map_err(|_| anyhow!("backend probe poisoned"))?
+                    .len(),
+                index + 1
+            );
+            assert_eq!(store.persisted_state()?, Some(engine.state.clone()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_group_pin_failure_discards_every_prepared_member() -> AnyResult<()> {
+        let directory = tempfile::tempdir()?;
+        let existing = directory.path().join("existing");
+        let missing = directory.path().join("missing");
+        fs::write(&existing, b"test executable")?;
+        let cgroup = CgroupPath::new("/group/templates")?;
+        let mut state = State::new();
+        for (index, path) in [existing, missing].into_iter().enumerate() {
+            state.create_rule_at(
+                Uuid::from_u128(u128::try_from(index)? + 1),
+                outbound_group_template(
+                    ApplicationPath::new(path.to_str().ok_or_else(|| anyhow!("non-UTF-8 path"))?)?,
+                    cgroup.clone(),
+                )?,
+                Utc::now(),
+            )?;
+        }
+        for action in [OutboundGroupAction::Enable, OutboundGroupAction::Drop] {
+            let (mut engine, backend, store, events) = engine_with_state(state.clone())?;
+            let original = engine.state.clone();
+            let subscription = events
+                .subscribe()
+                .map_err(|_| anyhow!("subscribe failed"))?;
+            let error = engine
+                .handle_control(ControlRequest::ManageOutboundGroup {
+                    expected_revision: engine.revision(),
+                    group: OutboundGroupSelector::Cgroup {
+                        cgroup: cgroup.clone(),
+                        executable: None,
+                    },
+                    action,
+                })
+                .err()
+                .ok_or_else(|| anyhow!("group unexpectedly succeeded"))?;
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert_eq!(engine.state, original);
+            assert_eq!(store.persisted_state()?, Some(original));
+            assert_eq!(store.save_count.load(Ordering::SeqCst), 0);
+            assert!(
+                backend
+                    .applied
+                    .lock()
+                    .map_err(|_| anyhow!("backend probe poisoned"))?
+                    .is_empty()
+            );
+            assert!(matches!(
+                subscription.recv_timeout(Duration::from_millis(1)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_an_unpinned_group_template_pins_it_before_kernel_apply() -> AnyResult<()> {
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("application");
+        fs::write(&executable_path, b"test executable")?;
+        let executable = ApplicationPath::new(
+            executable_path
+                .to_str()
+                .ok_or_else(|| anyhow!("temporary executable path is not UTF-8"))?,
+        )?;
+        let application = ApplicationSelector::new(Some(executable), None, None, None, None)?;
+        let specification = RuleSpec {
+            name: RuleName::new("application-wide template")?,
+            direction: Direction::Outbound,
+            action: RuleAction::Accept,
+            protocol: TransportProtocol::Any,
+            peer_network: None,
+            port: None,
+            interface: None,
+            application: Some(application),
+            origin: RuleOrigin::Template,
+            enabled: false,
+        };
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let (template, _) = state.create_rule(specification)?;
+        let (mut engine, backend, store, _events) = engine_with_state(state)?;
+
+        let ack = engine
+            .handle_control(ControlRequest::SetRuleEnabled {
+                expected_revision: engine.revision(),
+                id: template.id,
+                enabled: true,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let enabled = engine
+            .state
+            .rule(template.id)
+            .ok_or_else(|| anyhow!("enabled template disappeared"))?;
+        assert!(enabled.spec.enabled);
+        assert!(
+            enabled
+                .spec
+                .application
+                .as_ref()
+                .is_some_and(|selector| selector.executable_file.is_some())
+        );
+        let first_pin = enabled
+            .spec
+            .application
+            .as_ref()
+            .and_then(|selector| selector.executable_file)
+            .ok_or_else(|| anyhow!("enabled template has no pin"))?;
+
+        engine
+            .handle_control(ControlRequest::SetRuleEnabled {
+                expected_revision: engine.revision(),
+                id: template.id,
+                enabled: false,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let disabled = engine
+            .state
+            .rule(template.id)
+            .ok_or_else(|| anyhow!("disabled template disappeared"))?;
+        let disabled_application = disabled
+            .spec
+            .application
+            .as_ref()
+            .ok_or_else(|| anyhow!("disabled template lost its selector"))?;
+        assert!(!disabled.spec.enabled);
+        assert_eq!(disabled.spec.action, RuleAction::Accept);
+        assert_eq!(disabled.spec.direction, Direction::Outbound);
+        assert_eq!(disabled.spec.protocol, TransportProtocol::Any);
+        assert!(disabled.spec.peer_network.is_none());
+        assert!(disabled.spec.port.is_none());
+        assert!(disabled.spec.interface.is_none());
+        assert!(disabled_application.executable_file.is_none());
+        assert!(disabled_application.command_line.is_none());
+        assert!(disabled_application.uid.is_none());
+
+        fs::write(&executable_path, b"replacement executable version")?;
+        engine
+            .handle_control(ControlRequest::SetRuleEnabled {
+                expected_revision: engine.revision(),
+                id: template.id,
+                enabled: true,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let replacement_pin = engine
+            .state
+            .rule(template.id)
+            .and_then(|rule| rule.spec.application.as_ref())
+            .and_then(|selector| selector.executable_file)
+            .ok_or_else(|| anyhow!("re-enabled template has no replacement pin"))?;
+        assert_ne!(replacement_pin, first_pin);
+        assert!(ack.revision < engine.revision());
+        assert_eq!(store.persisted_state()?, Some(engine.state.clone()));
+        let applied = backend
+            .applied
+            .lock()
+            .map_err(|_| anyhow!("backend probe poisoned"))?;
+        assert_eq!(applied.last(), Some(&engine.state.snapshot()));
+        Ok(())
+    }
+
+    #[test]
+    fn editing_a_disabled_template_pins_and_preserves_the_custom_rule() -> AnyResult<()> {
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("application");
+        fs::write(&executable_path, b"test executable")?;
+        let executable = ApplicationPath::new(
+            executable_path
+                .to_str()
+                .ok_or_else(|| anyhow!("temporary executable path is not UTF-8"))?,
+        )?;
+        let application = ApplicationSelector::new(Some(executable), None, None, None, None)?;
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let (template, _) = state.create_rule(RuleSpec {
+            name: RuleName::new("application-wide template")?,
+            direction: Direction::Outbound,
+            action: RuleAction::Accept,
+            protocol: TransportProtocol::Any,
+            peer_network: None,
+            port: None,
+            interface: None,
+            application: Some(application),
+            origin: RuleOrigin::Template,
+            enabled: false,
+        })?;
+        let (mut engine, _backend, store, _events) = engine_with_state(state)?;
+        let mut custom = template.spec;
+        custom.protocol = TransportProtocol::Tcp;
+        let expected_port = PortRange::single(443)?;
+        custom.port = Some(expected_port);
+
+        engine
+            .handle_control(ControlRequest::UpdateRule {
+                expected_revision: engine.revision(),
+                id: template.id,
+                rule: custom,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let edited = engine
+            .state
+            .rule(template.id)
+            .ok_or_else(|| anyhow!("edited template disappeared"))?;
+        assert!(!edited.spec.enabled);
+        assert_eq!(edited.spec.protocol, TransportProtocol::Tcp);
+        assert_eq!(edited.spec.port, Some(expected_port));
+        assert!(
+            edited
+                .spec
+                .application
+                .as_ref()
+                .is_some_and(|selector| selector.executable_file.is_some())
+        );
+
+        engine
+            .handle_control(ControlRequest::SetRuleEnabled {
+                expected_revision: engine.revision(),
+                id: template.id,
+                enabled: true,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        assert!(engine.state.rule(template.id).is_some_and(|rule| {
+            rule.spec.enabled
+                && rule.spec.protocol == TransportProtocol::Tcp
+                && rule.spec.port == Some(expected_port)
+                && rule
+                    .spec
+                    .application
+                    .as_ref()
+                    .is_some_and(|selector| selector.executable_file.is_some())
+        }));
+        assert_eq!(store.persisted_state()?, Some(engine.state.clone()));
+        Ok(())
     }
 
     fn spawn_application_learning(
@@ -2169,7 +3021,8 @@ mod tests {
     }
 
     #[test]
-    fn packet_decision_omits_rules_that_cannot_require_userspace_attribution() -> AnyResult<()> {
+    fn packet_decision_retains_only_network_accept_fallbacks_without_application_rules()
+    -> AnyResult<()> {
         let mut state = State::new();
         state.create_rule(manual_rule("kernel-only")?)?;
         state.set_mode(Mode::Enforcing)?;
@@ -2183,7 +3036,9 @@ mod tests {
             .map_err(|error| anyhow!(error.message))?;
         assert!(Arc::ptr_eq(&snapshot, &same_policy));
         assert_eq!(snapshot.mode, Mode::Enforcing);
-        assert!(snapshot.rules.is_empty());
+        assert_eq!(snapshot.rules.len(), 1);
+        assert!(snapshot.rules[0].spec.application.is_none());
+        assert_eq!(snapshot.rules[0].spec.action, RuleAction::Accept);
         assert_eq!(
             engine
                 .application_decision_identity()
@@ -2219,7 +3074,7 @@ mod tests {
             state
                 .learn_new_application_endpoints(endpoints, MAX_RULES)?
                 .len(),
-            256
+            257
         );
         let saturated = learned_application_endpoint(300, 1_000, 1)?;
         let candidate = learned_application_endpoint(301, 1_001, 2)?;
@@ -2258,7 +3113,7 @@ mod tests {
             engine
                 .harvest_application_learning(generation, vec![candidate.clone()])
                 .map_err(|error| anyhow!(error.message))?,
-            1
+            2
         );
         assert_eq!(
             engine
@@ -2368,8 +3223,8 @@ mod tests {
             .join()
             .map_err(|_| anyhow!("learning worker panicked"))?
             .map_err(|error| anyhow!(error.message))?;
-        assert_eq!(learned, 2);
-        for _ in 0..2 {
+        assert_eq!(learned, 4);
+        for _ in 0..4 {
             let event = subscription.recv_timeout(Duration::from_millis(50))?;
             assert!(matches!(event.kind, EventKind::RuleCreated { .. }));
         }
@@ -2381,14 +3236,14 @@ mod tests {
             .persisted_state()?
             .ok_or_else(|| anyhow!("learning candidate was not persisted"))?;
         assert_eq!(persisted, engine.state);
-        assert_eq!(persisted.rules().len(), 2);
+        assert_eq!(persisted.rules().len(), 4);
         assert_eq!(
             engine
                 .harvest_application_learning(generation, vec![endpoint, second_endpoint])
                 .map_err(|error| anyhow!(error.message))?,
             0
         );
-        assert_eq!(engine.state.rules().len(), 2);
+        assert_eq!(engine.state.rules().len(), 4);
         Ok(())
     }
 
@@ -2470,10 +3325,13 @@ mod tests {
         assert_eq!(engine.mode(), Mode::BlockAll);
         assert_eq!(persisted, engine.state);
         assert_eq!(persisted.revision(), ack.revision);
-        assert_eq!(persisted.rules().len(), 1);
+        assert_eq!(persisted.rules().len(), 2);
+        let template_event = subscription.recv_timeout(Duration::from_millis(50))?;
         let learned_event = subscription.recv_timeout(Duration::from_millis(50))?;
         let mode_event = subscription.recv_timeout(Duration::from_millis(50))?;
+        assert!(matches!(template_event.kind, EventKind::RuleCreated { .. }));
         assert!(matches!(learned_event.kind, EventKind::RuleCreated { .. }));
+        assert!(template_event.revision < learned_event.revision);
         assert!(matches!(mode_event.kind, EventKind::ModeChanged { .. }));
         assert!(learned_event.revision < mode_event.revision);
         Ok(())
@@ -2559,7 +3417,7 @@ mod tests {
             .clone()
             .ok_or_else(|| anyhow!("emergency state was not persisted"))?;
         assert_eq!(persisted, engine.state);
-        assert_eq!(persisted.rules().len(), 1);
+        assert_eq!(persisted.rules().len(), 2);
         Ok(())
     }
 
@@ -2606,7 +3464,7 @@ mod tests {
             .clone()
             .ok_or_else(|| anyhow!("emergency state was not persisted"))?;
         assert_eq!(persisted, engine.state);
-        assert_eq!(persisted.rules().len(), 1);
+        assert_eq!(persisted.rules().len(), 2);
         Ok(())
     }
 

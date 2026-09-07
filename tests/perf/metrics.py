@@ -15,7 +15,8 @@ import time
 from typing import Any, BinaryIO, Callable
 
 
-QUEUE_NUMBER = 1_337
+DEFAULT_NFQUEUE_NUMBER = 1_337
+MAX_NFQUEUE_NUMBER = (1 << 16) - 1
 CONTROL_SCHEMA = "openshield.perf.metrics.control.v2"
 METRICS_SCHEMA = "openshield.perf.metrics.v3"
 U32_MODULUS = 1 << 32
@@ -274,8 +275,38 @@ def interface_counters(interface: str) -> dict[str, int | None]:
     }
 
 
-def nfqueue_counters(queue_number: int = QUEUE_NUMBER) -> dict[str, int | None]:
+def validate_nfqueue_number(queue_number: int) -> int:
+    """Accept only a real NFQUEUE u16, never a bool or a wrapped integer."""
+
+    if (
+        isinstance(queue_number, bool)
+        or not isinstance(queue_number, int)
+        or not 0 <= queue_number <= MAX_NFQUEUE_NUMBER
+    ):
+        raise ValueError("NFQUEUE number must be an integer in [0, 65535]")
+    return queue_number
+
+
+def parse_nfqueue_number(value: str) -> int:
+    """Parse one canonical decimal NFQUEUE number for argparse."""
+
+    if not value.isascii() or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
+        raise argparse.ArgumentTypeError(
+            "NFQUEUE number must be a canonical decimal integer in [0, 65535]"
+        )
+    try:
+        return validate_nfqueue_number(int(value, 10))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def nfqueue_counters(
+    queue_number: int = DEFAULT_NFQUEUE_NUMBER,
+    path: Path = Path("/proc/net/netfilter/nfnetlink_queue"),
+) -> dict[str, int | None]:
+    queue_number = validate_nfqueue_number(queue_number)
     result: dict[str, int | None] = {
+        "queue_number": queue_number,
         "depth": None,
         "copy_mode": None,
         "copy_range": None,
@@ -284,9 +315,7 @@ def nfqueue_counters(queue_number: int = QUEUE_NUMBER) -> dict[str, int | None]:
         "sequence": None,
     }
     try:
-        lines = Path("/proc/net/netfilter/nfnetlink_queue").read_text(
-            encoding="ascii"
-        ).splitlines()
+        lines = path.read_text(encoding="ascii").splitlines()
     except OSError:
         return result
     for line in lines:
@@ -392,7 +421,10 @@ def cgroup_cpu_delta(
     }
 
 
-def snapshot(interface: str) -> tuple[dict[str, Any], float, float]:
+def snapshot(
+    interface: str,
+    nfqueue_number: int = DEFAULT_NFQUEUE_NUMBER,
+) -> tuple[dict[str, Any], float, float]:
     transport = transport_counters()
     observed_at_monotonic_ns = time.monotonic_ns()
     collector_cpu_before_cgroup = time.process_time()
@@ -417,7 +449,7 @@ def snapshot(interface: str) -> tuple[dict[str, Any], float, float]:
         "conntrack_count": read_int(
             Path("/proc/sys/net/netfilter/nf_conntrack_count")
         ),
-        "nfqueue": nfqueue_counters(),
+        "nfqueue": nfqueue_counters(nfqueue_number),
     }
     return (
         observation,
@@ -427,7 +459,10 @@ def snapshot(interface: str) -> tuple[dict[str, Any], float, float]:
 
 
 def measurement_boundary(
-    pid: int, workload_pid: int, interface: str
+    pid: int,
+    workload_pid: int,
+    interface: str,
+    nfqueue_number: int = DEFAULT_NFQUEUE_NUMBER,
 ) -> dict[str, Any]:
     """Capture one boundary object that adjacent windows can share exactly."""
 
@@ -435,7 +470,7 @@ def measurement_boundary(
         observation,
         collector_cpu_before_cgroup,
         collector_cpu_after_cgroup,
-    ) = snapshot(interface)
+    ) = snapshot(interface, nfqueue_number)
     return {
         "snapshot": observation,
         "process_cpu_ticks": process_cpu_ticks(pid),
@@ -483,7 +518,10 @@ def _append_boundary_samples(
 
 
 def _append_periodic_samples(
-    samples: dict[str, list[int]], pid: int, workload_pid: int
+    samples: dict[str, list[int]],
+    pid: int,
+    workload_pid: int,
+    nfqueue_number: int,
 ) -> None:
     _append_sample(samples["rss"], process_rss_bytes(pid))
     _append_sample(samples["workload_rss"], process_rss_bytes(workload_pid))
@@ -491,7 +529,9 @@ def _append_periodic_samples(
         samples["conntrack"],
         read_int(Path("/proc/sys/net/netfilter/nf_conntrack_count")),
     )
-    _append_sample(samples["queue_depth"], nfqueue_counters()["depth"])
+    _append_sample(
+        samples["queue_depth"], nfqueue_counters(nfqueue_number)["depth"]
+    )
 
 
 def _metrics_document(
@@ -556,6 +596,7 @@ def _metrics_document(
     queue_before = started_snapshot["nfqueue"]
     queue_after = finished_snapshot["nfqueue"]
     queue = {
+        "queue_number": queue_after.get("queue_number"),
         "hits": counter_delta(
             queue_before.get("sequence"), queue_after.get("sequence")
         ),
@@ -648,6 +689,10 @@ def _metrics_document(
                 "and kernel work remain included"
             ),
             "nfqueue_log_errors": "not included; daemon throttling makes log counts lower bounds",
+            "nfqueue": (
+                "kernel queue counters for explicitly selected NFQUEUE "
+                f"{queue_after.get('queue_number')}"
+            ),
         },
     }
 
@@ -743,9 +788,12 @@ def collect(
     control_channel: ControlChannel | None = None,
     split_callback: Callable[[int, dict[str, Any]], None] | None = None,
     initial_boundary: dict[str, Any] | None = None,
+    *,
+    nfqueue_number: int = DEFAULT_NFQUEUE_NUMBER,
 ) -> dict[str, Any]:
+    nfqueue_number = validate_nfqueue_number(nfqueue_number)
     started = (
-        measurement_boundary(pid, workload_pid, interface)
+        measurement_boundary(pid, workload_pid, interface, nfqueue_number)
         if initial_boundary is None
         else initial_boundary
     )
@@ -761,7 +809,7 @@ def collect(
     stop_reason = "duration_limit"
     split_seen = False
     while True:
-        _append_periodic_samples(samples, pid, workload_pid)
+        _append_periodic_samples(samples, pid, workload_pid, nfqueue_number)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -781,7 +829,9 @@ def collect(
             raise RuntimeError("synchronized collector permits at most one split")
         if split_callback is None:
             raise RuntimeError("synchronized collector has no split handler")
-        boundary = measurement_boundary(pid, workload_pid, interface)
+        boundary = measurement_boundary(
+            pid, workload_pid, interface, nfqueue_number
+        )
         _append_boundary_samples(samples, boundary)
         first_document = _metrics_document(
             pid,
@@ -799,7 +849,9 @@ def collect(
         started = boundary
         samples = _new_window_samples(boundary)
         split_seen = True
-    finished = measurement_boundary(pid, workload_pid, interface)
+    finished = measurement_boundary(
+        pid, workload_pid, interface, nfqueue_number
+    )
     _append_boundary_samples(samples, finished)
     return _metrics_document(
         pid,
@@ -818,6 +870,12 @@ def main() -> int:
     parser.add_argument("--interface", default="eth0")
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--interval", type=float, default=0.1)
+    parser.add_argument(
+        "--nfqueue-number",
+        type=parse_nfqueue_number,
+        default=DEFAULT_NFQUEUE_NUMBER,
+        help="NFQUEUE whose kernel counters are measured (default: 1337)",
+    )
     parser.add_argument(
         "--synchronize",
         action="store_true",
@@ -858,7 +916,10 @@ def main() -> int:
                     "metric control start command exceeded its bounded deadline"
                 )
             initial_boundary = measurement_boundary(
-                arguments.pid, arguments.workload_pid, arguments.interface
+                arguments.pid,
+                arguments.workload_pid,
+                arguments.interface,
+                arguments.nfqueue_number,
             )
             boundary_monotonic_ns = initial_boundary["snapshot"]["monotonic_ns"]
             print(
@@ -912,6 +973,7 @@ def main() -> int:
             control_channel,
             split_callback,
             initial_boundary,
+            nfqueue_number=arguments.nfqueue_number,
         )
     finally:
         if control_channel is not None:

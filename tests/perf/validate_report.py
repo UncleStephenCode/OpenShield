@@ -26,6 +26,8 @@ REPORT_SCHEMA = "openshield.perf.report.v2"
 VALIDATION_SCHEMA = "openshield.perf.independent-validation.v1"
 METRICS_SCHEMA = "openshield.perf.metrics.v3"
 WORKLOAD_SCHEMA = "openshield.perf.workload.v1"
+ENFORCING_NFQUEUE_NUMBER = 1_337
+LEARNING_NFQUEUE_NUMBER = 1_338
 MINIMUM_PAIRED_SAMPLES = 3
 CONFIDENCE_LEVEL = 0.95
 CGROUP_CPU_ACCOUNTING_RESOLUTION_SECONDS = 1e-6
@@ -526,6 +528,30 @@ def _validate_metric_elapsed(metrics: dict[str, Any], label: str) -> float:
         f"{label} metric elapsed time",
     )
     return elapsed
+
+
+def _validate_dut_nfqueue_selection(row: dict[str, Any], label: str) -> None:
+    """Authenticate the mode-specific kernel queue used by DUT metrics."""
+
+    mode = row.get("mode")
+    if mode is None or mode == "enforcing":
+        expected = ENFORCING_NFQUEUE_NUMBER
+    elif mode == "learning":
+        expected = LEARNING_NFQUEUE_NUMBER
+    else:
+        _reject(f"{label} has no defined NFQUEUE metrics queue")
+    metrics = _mapping(row.get("dut_metrics"), f"{label} DUT metrics")
+    nfqueue = _mapping(metrics.get("nfqueue"), f"{label} DUT NFQUEUE metrics")
+    observed = _integer(
+        nfqueue.get("queue_number"),
+        f"{label} DUT NFQUEUE number",
+        0,
+        (1 << 16) - 1,
+    )
+    if observed != expected:
+        _reject(
+            f"{label} DUT NFQUEUE number {observed} does not match mode {mode!r}"
+        )
 
 
 def _validate_cgroup_cpu(row: dict[str, Any], label: str) -> tuple[float, float]:
@@ -1139,6 +1165,8 @@ def validate_documents(
 
     for index, value in enumerate(results):
         row = _mapping(value, f"performance result {index}")
+        if row.get("backend") in active_backends:
+            _validate_dut_nfqueue_selection(row, f"performance result {index}")
         if (
             row.get("backend") not in active_backends
             or row.get("phase_role") not in {"steady", "burst"}

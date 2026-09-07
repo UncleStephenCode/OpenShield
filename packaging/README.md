@@ -11,8 +11,14 @@ runit, s6, and dinit. These files implement the same security lifecycle:
 4. install kernel `BlockAll` again after a supervised stop;
 5. leave the persisted requested mode unchanged across the shutdown quarantine.
 
-The normal initial persisted mode is `Learning`. The pre-start quarantine is a
-temporary kernel policy, not a replacement for that saved mode.
+The normal initial persisted mode is `Learning`. It permits unmatched local
+outbound traffic, keeps enabled explicit `drop`/`reject` rules active, and
+creates enabled `accept` endpoint rules plus one disabled
+template with a path and, when available, cgroup per observed application
+group. The pre-start quarantine
+is a temporary kernel policy, not a replacement for that saved mode. New
+inbound service traffic remains default-deny; exact normal-mode DHCP/IPv6
+control exceptions are absent from `BlockAll`.
 
 ## Staging a package tree
 
@@ -53,6 +59,13 @@ uses only fixed account-management commands.
 Do not start the service automatically during an unattended remote package
 upgrade unless an inbound management rule and an independently tested recovery
 path already exist. Inbound traffic is default-drop even in `Learning`.
+
+State and IPC compatibility is forward-only from v0.2.0 to v0.2.1. v0.2.1 reads
+an absent rule `action` as `accept`, but v0.2.0 cannot read v0.2.1
+`drop`/`reject` actions or `template` origins. Do not run mixed daemon/TUI
+versions or perform an in-place downgrade after v0.2.1 has written state.
+Upgrade or rollback from a protected console with kernel `BlockAll` active, a
+reviewed state backup, and a distribution-tested procedure.
 
 ## Release-package matrix
 

@@ -2,10 +2,14 @@ use ipnet::IpNet;
 use openshield_core::{
     ApplicationPath, ApplicationSelector, CgroupPath, CommandArgument, CommandLineMatch,
     CommandLineSelector, Direction, Event, EventKind, ExecutableFileId, FirewallCounters,
-    InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_LINE_BYTES, Mode,
-    PortRange, Rule, RuleName, RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
+    InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_ARGUMENTS,
+    MAX_COMMAND_LINE_BYTES, Mode, PortRange, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec,
+    Snapshot, TransportProtocol,
 };
-use openshield_protocol::{ControlRequest, FirewallBackendKind, RuntimeCompatibility};
+use openshield_protocol::{
+    ControlRequest, FirewallBackendKind, OutboundGroupAction, OutboundGroupSelector,
+    RuntimeCompatibility,
+};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -22,7 +26,8 @@ const MAX_NETWORK_CHARS: usize = 64;
 const MAX_PORT_CHARS: usize = 11;
 const MAX_INTERFACE_CHARS: usize = 15;
 const MAX_UID_CHARS: usize = 10;
-const MAX_ARGUMENTS_JSON_BYTES: usize = MAX_COMMAND_LINE_BYTES * 3;
+// Each raw byte can expand to `\u00xx`, plus quotes and separators for argv.
+const MAX_ARGUMENTS_JSON_BYTES: usize = MAX_COMMAND_LINE_BYTES * 6 + MAX_COMMAND_ARGUMENTS * 3 + 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum View {
@@ -66,6 +71,7 @@ pub enum ConnectionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormField {
     Name,
+    Action,
     Protocol,
     PeerNetwork,
     Port,
@@ -82,6 +88,7 @@ pub enum FormField {
 impl FormField {
     const OUTBOUND: &'static [Self] = &[
         Self::Name,
+        Self::Action,
         Self::Protocol,
         Self::PeerNetwork,
         Self::Port,
@@ -129,6 +136,7 @@ pub struct RuleForm {
     pub active_field: FormField,
     pub name: String,
     direction: Direction,
+    pub action: RuleAction,
     pub protocol: TransportProtocol,
     pub peer_network: String,
     pub port: String,
@@ -154,6 +162,7 @@ impl Default for RuleForm {
             active_field: FormField::Name,
             name: String::new(),
             direction: Direction::Outbound,
+            action: RuleAction::Accept,
             protocol: TransportProtocol::Any,
             peer_network: String::new(),
             port: String::new(),
@@ -193,18 +202,14 @@ impl RuleForm {
         let application = rule.spec.application.as_ref();
         let command_line = application.and_then(|selector| selector.command_line.as_ref());
         let arguments = command_line.map_or_else(String::new, |selector| {
-            let values: Vec<&str> = selector
-                .arguments
-                .iter()
-                .map(CommandArgument::as_str)
-                .collect();
-            serde_json::to_string(&values).unwrap_or_default()
+            command_arguments_json(&selector.arguments)
         });
         Self {
             id: Some(rule.id),
             active_field: FormField::Name,
             name: rule.spec.name.to_string(),
             direction: rule.spec.direction,
+            action: rule.spec.action,
             protocol: rule.spec.protocol,
             peer_network: rule
                 .spec
@@ -292,6 +297,7 @@ impl RuleForm {
             }
             FormField::Cgroup => (&mut self.cgroup, MAX_CGROUP_PATH_BYTES),
             FormField::Protocol
+            | FormField::Action
             | FormField::Application
             | FormField::CommandMode
             | FormField::Enabled => return,
@@ -332,6 +338,7 @@ impl RuleForm {
                 self.cgroup.pop();
             }
             FormField::Protocol
+            | FormField::Action
             | FormField::Application
             | FormField::CommandMode
             | FormField::Enabled => return,
@@ -341,6 +348,9 @@ impl RuleForm {
 
     pub fn cycle_choice(&mut self, reverse: bool) {
         match self.active_field {
+            FormField::Action => {
+                self.action = cycle_rule_action(self.action, reverse);
+            }
             FormField::Protocol => {
                 self.protocol = cycle_protocol(self.protocol, reverse);
             }
@@ -425,6 +435,7 @@ impl RuleForm {
                 )
             })?,
             direction: self.direction,
+            action: self.action,
             protocol: self.protocol,
             peer_network,
             port,
@@ -523,6 +534,20 @@ impl RuleForm {
                 )
             })
     }
+}
+
+/// Reversible JSON suitable for both the details pane and the editable form.
+/// `CommandArgument` escapes terminal controls and invisible formatting without
+/// changing the values that are sent back to the daemon when the rule is saved.
+pub(crate) fn command_arguments_json(arguments: &[CommandArgument]) -> String {
+    format!(
+        "[{}]",
+        arguments
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn parse_command_arguments(value: &str, i18n: &I18n) -> Result<Vec<CommandArgument>, String> {
@@ -685,6 +710,46 @@ pub struct OutboundGroup<'a> {
     pub rules: Vec<&'a Rule>,
 }
 
+/// An expanded tree row. Root rows include every rule in their group; executable
+/// children include only that path within the cgroup, regardless of arguments.
+#[derive(Debug)]
+pub struct OutboundNode<'a> {
+    pub key: OutboundGroupKey<'a>,
+    pub executable: Option<&'a str>,
+    pub last_child: bool,
+    pub rules: Vec<&'a Rule>,
+    group_index: usize,
+}
+
+struct OutboundSelection {
+    group_index: usize,
+    key: OutboundGroupKey<'static>,
+    executable: Option<String>,
+    member_index: usize,
+    rule_id: Uuid,
+}
+
+impl OutboundNode<'_> {
+    fn selection(&self, member_index: usize) -> Option<OutboundSelection> {
+        self.rules.get(member_index).map(|rule| OutboundSelection {
+            group_index: self.group_index,
+            key: self.key.to_owned_key(),
+            executable: self.executable.map(str::to_owned),
+            member_index,
+            rule_id: rule.id,
+        })
+    }
+}
+
+fn visible_executable(rule: &Rule) -> Option<&str> {
+    rule.spec
+        .application
+        .as_ref()
+        .filter(|application| !application.metadata_redacted)
+        .and_then(|application| application.executable.as_ref())
+        .map(ApplicationPath::as_str)
+}
+
 fn protocol_rank(protocol: TransportProtocol) -> u8 {
     match protocol {
         TransportProtocol::Any => 0,
@@ -747,14 +812,54 @@ const fn cycle_protocol(protocol: TransportProtocol, reverse: bool) -> Transport
     }
 }
 
+const fn cycle_rule_action(action: RuleAction, reverse: bool) -> RuleAction {
+    match (action, reverse) {
+        (RuleAction::Accept, false) | (RuleAction::Reject, true) => RuleAction::Drop,
+        (RuleAction::Drop, false) | (RuleAction::Accept, true) => RuleAction::Reject,
+        (RuleAction::Reject, false) | (RuleAction::Drop, true) => RuleAction::Accept,
+    }
+}
+
+pub const GROUP_ACTIONS: [OutboundGroupAction; 6] = [
+    OutboundGroupAction::Delete,
+    OutboundGroupAction::Accept,
+    OutboundGroupAction::Reject,
+    OutboundGroupAction::Drop,
+    OutboundGroupAction::Disable,
+    OutboundGroupAction::Enable,
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupTarget {
+    pub selector: OutboundGroupSelector,
+    pub label: String,
+    pub count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
     None,
-    ModePicker { selected: Mode },
+    ModePicker {
+        selected: Mode,
+    },
     ConfirmBlockAll,
     Editor(Box<RuleForm>),
-    ConfirmDelete { id: Uuid, name: String },
-    Message { title: String, body: String },
+    ConfirmDelete {
+        id: Uuid,
+        name: String,
+    },
+    GroupMenu {
+        target: GroupTarget,
+        selected: OutboundGroupAction,
+    },
+    ConfirmGroup {
+        target: GroupTarget,
+        action: OutboundGroupAction,
+    },
+    Message {
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -773,6 +878,7 @@ pub struct App {
     selected_outbound_member: usize,
     selected_outbound_rule_id: Option<Uuid>,
     selected_outbound_group_key: Option<OutboundGroupKey<'static>>,
+    selected_outbound_executable: Option<String>,
     selected_inbound_rule: usize,
     selected_inbound_rule_id: Option<Uuid>,
     outbound_details_scroll: Cell<u16>,
@@ -804,6 +910,7 @@ impl App {
             selected_outbound_member: 0,
             selected_outbound_rule_id: None,
             selected_outbound_group_key: None,
+            selected_outbound_executable: None,
             selected_inbound_rule: 0,
             selected_inbound_rule_id: None,
             outbound_details_scroll: Cell::new(0),
@@ -1229,6 +1336,122 @@ impl App {
         })
     }
 
+    pub fn open_group_menu(&mut self) {
+        if !self.require_write_access() || self.view != View::Outbound {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            self.notice = Some(self.i18n.tr("notice.wait_snapshot").to_owned());
+            return;
+        };
+        let revision = snapshot.revision;
+        let Some(target) = self.selected_group_target() else {
+            self.notice = Some(self.i18n.tr("notice.no_rule_selected").to_owned());
+            return;
+        };
+        // Freeze both scope and revision at menu opening. Later learning events
+        // cannot silently enlarge a confirmed group operation.
+        self.pending_revision = Some(revision);
+        self.overlay = Overlay::GroupMenu {
+            target,
+            selected: GROUP_ACTIONS[0],
+        };
+    }
+
+    fn selected_group_target(&self) -> Option<GroupTarget> {
+        let nodes = self.outbound_nodes();
+        let node = &nodes[self.selected_outbound_node_index(&nodes)?];
+        let (selector, label) = match &node.key {
+            OutboundGroupKey::Cgroup(cgroup) => {
+                let executable = node.executable.map(ApplicationPath::new).transpose().ok()?;
+                let label = node
+                    .executable
+                    .map_or_else(|| cgroup.to_string(), |path| format!("{cgroup} → {path}"));
+                (
+                    OutboundGroupSelector::Cgroup {
+                        cgroup: CgroupPath::new(cgroup.as_ref()).ok()?,
+                        executable,
+                    },
+                    label,
+                )
+            }
+            OutboundGroupKey::Executable(path) => (
+                OutboundGroupSelector::Executable {
+                    executable: ApplicationPath::new(path.as_ref()).ok()?,
+                },
+                path.to_string(),
+            ),
+            OutboundGroupKey::Destination(peer_network) => (
+                OutboundGroupSelector::Destination {
+                    peer_network: *peer_network,
+                },
+                peer_network.map_or_else(
+                    || self.i18n.tr("common.any").to_owned(),
+                    |network| network.to_string(),
+                ),
+            ),
+        };
+        Some(GroupTarget {
+            selector,
+            label,
+            count: node.rules.len(),
+        })
+    }
+
+    pub fn move_group_action(&mut self, reverse: bool) {
+        let Overlay::GroupMenu { selected, .. } = &mut self.overlay else {
+            return;
+        };
+        let index = GROUP_ACTIONS
+            .iter()
+            .position(|action| action == selected)
+            .unwrap_or(0);
+        let index = if reverse {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(GROUP_ACTIONS.len() - 1)
+        };
+        *selected = GROUP_ACTIONS[index];
+    }
+
+    pub fn request_group_action(&mut self, action: OutboundGroupAction) {
+        if !self.require_write_access() {
+            self.close_overlay();
+            return;
+        }
+        let Overlay::GroupMenu { target, .. } = &self.overlay else {
+            return;
+        };
+        self.overlay = Overlay::ConfirmGroup {
+            target: target.clone(),
+            action,
+        };
+    }
+
+    pub fn confirm_group_action(&mut self, confirmed: bool) -> Option<ControlRequest> {
+        if !matches!(self.overlay, Overlay::ConfirmGroup { .. }) {
+            return None;
+        }
+        if !confirmed || !self.require_write_access() {
+            self.close_overlay();
+            return None;
+        }
+        let Overlay::ConfirmGroup { target, action } =
+            std::mem::replace(&mut self.overlay, Overlay::None)
+        else {
+            return None;
+        };
+        let Some(expected_revision) = self.pending_revision.take() else {
+            self.notice = Some(self.i18n.tr("notice.base_revision_missing").to_owned());
+            return None;
+        };
+        Some(ControlRequest::ManageOutboundGroup {
+            expected_revision,
+            group: target.selector,
+            action,
+        })
+    }
+
     pub fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
         self.pending_revision = None;
@@ -1263,6 +1486,47 @@ impl App {
     }
 
     #[must_use]
+    pub fn outbound_nodes(&self) -> Vec<OutboundNode<'_>> {
+        let mut nodes = Vec::new();
+        for (group_index, group) in self.outbound_groups().into_iter().enumerate() {
+            let mut children = BTreeMap::<&str, Vec<&Rule>>::new();
+            if matches!(&group.key, OutboundGroupKey::Cgroup(_)) {
+                for rule in &group.rules {
+                    if let Some(executable) = visible_executable(rule) {
+                        children.entry(executable).or_default().push(*rule);
+                    }
+                }
+            }
+            nodes.push(OutboundNode {
+                key: group.key.clone(),
+                executable: None,
+                last_child: false,
+                rules: group.rules,
+                group_index,
+            });
+            let child_count = children.len();
+            for (index, (executable, rules)) in children.into_iter().enumerate() {
+                nodes.push(OutboundNode {
+                    key: group.key.clone(),
+                    executable: Some(executable),
+                    last_child: index + 1 == child_count,
+                    rules,
+                    group_index,
+                });
+            }
+        }
+        nodes
+    }
+
+    #[must_use]
+    pub fn selected_outbound_node_index(&self, nodes: &[OutboundNode<'_>]) -> Option<usize> {
+        nodes.iter().position(|node| {
+            node.group_index == self.selected_outbound_group
+                && node.executable == self.selected_outbound_executable.as_deref()
+        })
+    }
+
+    #[must_use]
     pub fn inbound_rules(&self) -> Vec<&Rule> {
         let mut rules = self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
             snapshot
@@ -1273,11 +1537,6 @@ impl App {
         });
         rules.sort_unstable_by(|left, right| compare_inbound_rules(left, right));
         rules
-    }
-
-    #[must_use]
-    pub const fn selected_outbound_group_index(&self) -> usize {
-        self.selected_outbound_group
     }
 
     #[must_use]
@@ -1314,55 +1573,57 @@ impl App {
 
     fn select_outbound_group(&mut self, reverse: bool) {
         let target = {
-            let groups = self.outbound_groups();
-            if groups.is_empty() {
-                None
-            } else {
-                let index = if reverse {
-                    self.selected_outbound_group.saturating_sub(1)
-                } else {
-                    (self.selected_outbound_group + 1).min(groups.len() - 1)
-                };
-                groups[index]
-                    .rules
-                    .first()
-                    .map(|rule| (index, groups[index].key.to_owned_key(), rule.id))
-            }
+            let nodes = self.outbound_nodes();
+            self.selected_outbound_node_index(&nodes)
+                .and_then(|current| {
+                    let index = if reverse {
+                        current.saturating_sub(1)
+                    } else {
+                        (current + 1).min(nodes.len() - 1)
+                    };
+                    nodes[index].selection(0)
+                })
         };
-        if let Some((index, key, id)) = target {
-            if self.selected_outbound_rule_id != Some(id) {
-                self.outbound_details_scroll.set(0);
-            }
-            self.selected_outbound_group = index;
-            self.selected_outbound_member = 0;
-            self.selected_outbound_group_key = Some(key);
-            self.selected_outbound_rule_id = Some(id);
+        if let Some(target) = target {
+            self.set_outbound_selection(target);
         }
     }
 
     fn select_outbound_member(&mut self, reverse: bool) {
         let target = {
-            let groups = self.outbound_groups();
-            groups.get(self.selected_outbound_group).and_then(|group| {
-                if group.rules.is_empty() {
-                    None
-                } else {
-                    let index = if reverse {
-                        self.selected_outbound_member.saturating_sub(1)
+            let nodes = self.outbound_nodes();
+            self.selected_outbound_node_index(&nodes)
+                .and_then(|node_index| {
+                    let node = &nodes[node_index];
+                    if node.rules.is_empty() {
+                        None
                     } else {
-                        (self.selected_outbound_member + 1).min(group.rules.len() - 1)
-                    };
-                    Some((index, group.rules[index].id))
-                }
-            })
+                        let index = if reverse {
+                            self.selected_outbound_member.saturating_sub(1)
+                        } else {
+                            (self.selected_outbound_member + 1).min(node.rules.len() - 1)
+                        };
+                        node.selection(index)
+                    }
+                })
         };
-        if let Some((index, id)) = target {
-            if self.selected_outbound_rule_id != Some(id) {
-                self.outbound_details_scroll.set(0);
-            }
-            self.selected_outbound_member = index;
-            self.selected_outbound_rule_id = Some(id);
+        if let Some(target) = target {
+            self.set_outbound_selection(target);
         }
+    }
+
+    fn set_outbound_selection(&mut self, target: OutboundSelection) {
+        if self.selected_outbound_rule_id != Some(target.rule_id)
+            || self.selected_outbound_executable != target.executable
+            || self.selected_outbound_group_key.as_ref() != Some(&target.key)
+        {
+            self.outbound_details_scroll.set(0);
+        }
+        self.selected_outbound_group = target.group_index;
+        self.selected_outbound_group_key = Some(target.key);
+        self.selected_outbound_executable = target.executable;
+        self.selected_outbound_member = target.member_index;
+        self.selected_outbound_rule_id = Some(target.rule_id);
     }
 
     fn select_inbound_rule(&mut self, reverse: bool) {
@@ -1393,6 +1654,7 @@ impl App {
         self.selected_outbound_member = 0;
         self.selected_outbound_rule_id = None;
         self.selected_outbound_group_key = None;
+        self.selected_outbound_executable = None;
         self.selected_inbound_rule = 0;
         self.selected_inbound_rule_id = None;
         self.outbound_details_scroll.set(0);
@@ -1405,52 +1667,62 @@ impl App {
         let group_hint = self.selected_outbound_group;
         let member_hint = self.selected_outbound_member;
         let outbound = {
-            let groups = self.outbound_groups();
-            if groups.is_empty() {
+            let nodes = self.outbound_nodes();
+            let roots = nodes
+                .iter()
+                .filter(|node| node.executable.is_none())
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
                 None
             } else {
-                let selected_position = selected_id.and_then(|id| {
-                    groups.iter().enumerate().find_map(|(group_index, group)| {
-                        group
-                            .rules
+                let root = selected_id
+                    .and_then(|id| {
+                        roots
                             .iter()
-                            .position(|rule| rule.id == id)
-                            .map(|member_index| (group_index, member_index))
+                            .copied()
+                            .find(|node| node.rules.iter().any(|rule| rule.id == id))
                     })
-                });
-                let (group_index, member_index) = selected_position.unwrap_or_else(|| {
-                    let group_index = selected_key
-                        .as_ref()
-                        .and_then(|key| {
-                            groups
+                    .or_else(|| {
+                        selected_key.as_ref().and_then(|key| {
+                            roots
                                 .iter()
-                                .position(|group| key.same_identity(&group.key))
+                                .copied()
+                                .find(|node| key.same_identity(&node.key))
                         })
-                        .unwrap_or_else(|| group_hint.min(groups.len() - 1));
-                    let member_index = member_hint.min(groups[group_index].rules.len() - 1);
-                    (group_index, member_index)
-                });
-                Some((
-                    group_index,
-                    member_index,
-                    groups[group_index].key.to_owned_key(),
-                    groups[group_index].rules[member_index].id,
-                ))
+                    })
+                    .unwrap_or(roots[group_hint.min(roots.len() - 1)]);
+                // Follow a selected rule's identity across updates, retaining the
+                // root/child scope. If a child disappears, fall back to its root.
+                let executable = self
+                    .selected_outbound_executable
+                    .as_deref()
+                    .and_then(|path| {
+                        selected_id
+                            .and_then(|id| root.rules.iter().find(|rule| rule.id == id))
+                            .map_or(Some(path), |rule| visible_executable(rule))
+                    });
+                let node = executable
+                    .and_then(|path| {
+                        nodes.iter().find(|node| {
+                            node.group_index == root.group_index && node.executable == Some(path)
+                        })
+                    })
+                    .unwrap_or(root);
+                let member_index = selected_id
+                    .and_then(|id| node.rules.iter().position(|rule| rule.id == id))
+                    .unwrap_or_else(|| member_hint.min(node.rules.len() - 1));
+                node.selection(member_index)
             }
         };
-        if let Some((group, member, key, id)) = outbound {
-            if self.selected_outbound_rule_id != Some(id) {
-                self.outbound_details_scroll.set(0);
-            }
-            self.selected_outbound_group = group;
-            self.selected_outbound_member = member;
-            self.selected_outbound_group_key = Some(key);
-            self.selected_outbound_rule_id = Some(id);
+        if let Some(target) = outbound {
+            self.set_outbound_selection(target);
         } else {
             self.selected_outbound_group = 0;
             self.selected_outbound_member = 0;
             self.selected_outbound_group_key = None;
+            self.selected_outbound_executable = None;
             self.selected_outbound_rule_id = None;
+            self.outbound_details_scroll.set(0);
         }
 
         let selected_id = self.selected_inbound_rule_id;
@@ -1495,11 +1767,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn argument_editor_round_trip_preserves_controls_and_literal_escapes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let arguments = [
+            "client",
+            "line\nnext",
+            "line\\nnext",
+            "\u{1b}[31m\u{202e}name",
+            "",
+        ]
+        .into_iter()
+        .map(CommandArgument::new)
+        .collect::<Result<Vec<_>, _>>()?;
+        let json = command_arguments_json(&arguments);
+        assert!(json.chars().all(is_safe_form_character));
+        assert!(json.contains("\\u001b[31m\\u202ename"));
+        let form = RuleForm {
+            name: "escaped arguments".to_owned(),
+            protocol: TransportProtocol::Tcp,
+            bind_application: true,
+            executable: "/usr/bin/client".to_owned(),
+            command_mode: CommandMode::Exact,
+            arguments: json.clone(),
+            ..RuleForm::default()
+        };
+        let i18n = I18n::test_english();
+        let rule = Rule::new(form.to_rule_spec(&i18n).map_err(io_error)?)?;
+        let edited = RuleForm::from_rule(&rule);
+        assert_eq!(edited.arguments, json);
+        assert_eq!(
+            parse_command_arguments(&edited.arguments, &i18n).map_err(io_error)?,
+            arguments
+        );
+        assert_eq!(edited.to_rule_spec(&i18n).map_err(io_error)?, rule.spec);
+        Ok(())
+    }
+
+    #[test]
+    fn largest_escaped_argument_fits_the_editable_json_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let arguments = vec![CommandArgument::new(
+            "\u{01}".repeat(MAX_COMMAND_LINE_BYTES - 1),
+        )?];
+        let json = command_arguments_json(&arguments);
+        assert!(json.len() > MAX_COMMAND_LINE_BYTES * 3);
+        assert!(json.len() < MAX_ARGUMENTS_JSON_BYTES);
+        assert!(json.chars().all(is_safe_form_character));
+        let mut form = RuleForm {
+            active_field: FormField::Arguments,
+            ..RuleForm::default()
+        };
+        for character in json.chars() {
+            form.insert_char(character);
+        }
+        assert_eq!(form.arguments, json);
+        assert_eq!(
+            parse_command_arguments(&form.arguments, &I18n::test_english()).map_err(io_error)?,
+            arguments
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unprivileged_state_rejects_every_mutation_entry_point() {
         let mut app = App::new(true, I18n::test_english());
 
         app.open_mode_picker();
         app.open_create_rule();
+        app.open_group_menu();
+        app.request_group_action(OutboundGroupAction::Delete);
+        assert!(app.confirm_group_action(true).is_none());
 
         assert_eq!(app.overlay, Overlay::None);
         assert!(app.request_mode(Mode::Learning).is_none());
@@ -1556,6 +1893,44 @@ mod tests {
             assert_eq!(rule.protocol, TransportProtocol::Tcp);
             assert!(rule.port.is_some());
         }
+    }
+
+    #[test]
+    fn outbound_action_and_enabled_state_are_independent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut form = RuleForm {
+            name: "diagnostic deny".to_owned(),
+            active_field: FormField::Action,
+            protocol: TransportProtocol::Tcp,
+            enabled: false,
+            ..RuleForm::default()
+        };
+
+        form.cycle_choice(false);
+        assert_eq!(form.action, RuleAction::Drop);
+        assert!(!form.enabled);
+        form.cycle_choice(false);
+        assert_eq!(form.action, RuleAction::Reject);
+        assert!(!form.enabled);
+        form.cycle_choice(true);
+        assert_eq!(form.action, RuleAction::Drop);
+
+        let specification = form.to_rule_spec(&I18n::test_english()).map_err(io_error)?;
+        assert_eq!(specification.action, RuleAction::Drop);
+        assert!(!specification.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_editor_does_not_offer_non_accept_actions() {
+        let mut form = RuleForm::for_direction(Direction::Inbound);
+        form.move_next();
+        assert_eq!(form.active_field, FormField::Protocol);
+
+        form.name = "invalid inbound deny".to_owned();
+        form.protocol = TransportProtocol::Tcp;
+        form.action = RuleAction::Drop;
+        assert!(form.to_rule_spec(&I18n::test_english()).is_err());
     }
 
     #[test]
@@ -2219,6 +2594,58 @@ mod tests {
     }
 
     #[test]
+    fn group_selection_prefers_the_disabled_application_template()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = test_rule(
+            "learned endpoint",
+            Direction::Outbound,
+            Some("203.0.113.10"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            Some(r#"["client","--one"]"#),
+        )?;
+        let mut template_form = RuleForm {
+            name: "application-wide template".to_owned(),
+            origin: RuleOrigin::Template,
+            enabled: false,
+            bind_application: true,
+            executable: "/usr/bin/client".to_owned(),
+            cgroup: "/system.slice/client.service".to_owned(),
+            ..RuleForm::default()
+        };
+        template_form.action = RuleAction::Accept;
+        let template = Rule::new(
+            template_form
+                .to_rule_spec(&I18n::test_english())
+                .map_err(io_error)?,
+        )?;
+        let template_id = template.id;
+
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![endpoint, template],
+        });
+
+        let groups = app.outbound_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rules[0].id, template_id);
+        assert_eq!(app.selected_rule().map(|rule| rule.id), Some(template_id));
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled {
+                id,
+                enabled: true,
+                ..
+            }) if id == template_id
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn equivalent_destination_networks_share_one_group() -> Result<(), Box<dyn std::error::Error>> {
         let first = test_rule(
             "first subnet spelling",
@@ -2525,6 +2952,578 @@ mod tests {
                 if rule.direction == Direction::Inbound && rule.application.is_none()
         ));
         Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Explicit expected rows document the tree projection.
+    fn outbound_tree_sorts_roots_and_paths_without_splitting_arguments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut rules = outbound_tree_fixture()?;
+        let first_id = rules[0].id;
+        let second_id = rules[1].id;
+        let other_path_id = rules[2].id;
+        let fallback_id = rules[3].id;
+        let earlier_group = test_rule(
+            "same path in another cgroup",
+            Direction::Outbound,
+            Some("203.0.113.1"),
+            Some("/usr/bin/alpha"),
+            Some("/system.slice/aaa.service"),
+            None,
+        )?;
+        let earlier_group_id = earlier_group.id;
+        let fallback_variant = test_rule(
+            "unbound argument variant",
+            Direction::Outbound,
+            Some("203.0.113.41"),
+            Some("/usr/bin/alpha"),
+            None,
+            Some(r#"["alpha","--unbound"]"#),
+        )?;
+        let fallback_variant_id = fallback_variant.id;
+        let redacted = test_rule(
+            "private application",
+            Direction::Outbound,
+            Some("203.0.113.50"),
+            Some("/usr/bin/private"),
+            Some("/system.slice/private.service"),
+            None,
+        )?
+        .redacted_for_observer();
+        let redacted_id = redacted.id;
+        let any = test_rule("any", Direction::Outbound, None, None, None, None)?;
+        let any_id = any.id;
+        rules.extend([
+            earlier_group,
+            fallback_variant,
+            redacted,
+            any,
+            test_rule("inbound", Direction::Inbound, None, None, None, None)?,
+        ]);
+        rules.reverse();
+        let app = outbound_tree_app(false, rules);
+        let nodes = app.outbound_nodes();
+
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| (node.key.clone(), node.executable, node.last_child))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/aaa.service")),
+                    None,
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/aaa.service")),
+                    Some("/usr/bin/alpha"),
+                    true,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/client.service")),
+                    None,
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/client.service")),
+                    Some("/usr/bin/alpha"),
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/client.service")),
+                    Some("/usr/bin/zulu"),
+                    true,
+                ),
+                (
+                    OutboundGroupKey::Executable(Cow::Borrowed("/usr/bin/alpha")),
+                    None,
+                    false,
+                ),
+                (
+                    OutboundGroupKey::Destination(Some("203.0.113.50/32".parse()?)),
+                    None,
+                    false,
+                ),
+                (OutboundGroupKey::Destination(None), None, false),
+            ]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.rules.iter().map(|rule| rule.id).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![earlier_group_id],
+                vec![earlier_group_id],
+                vec![other_path_id, first_id, second_id],
+                vec![first_id, second_id],
+                vec![other_path_id],
+                vec![fallback_id, fallback_variant_id],
+                vec![redacted_id],
+                vec![any_id],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_navigation_visits_every_row_and_limits_members_to_its_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let first_id = rules[0].id;
+        let second_id = rules[1].id;
+        let other_path_id = rules[2].id;
+        let fallback_id = rules[3].id;
+        let mut app = outbound_tree_app(false, rules);
+
+        assert_outbound_selection(&app, 0, 0, other_path_id);
+        app.select_previous_rule();
+        app.select_previous_group_member();
+        assert_outbound_selection(&app, 0, 0, other_path_id);
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 0, 1, first_id);
+        app.select_next_group_member();
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 0, 2, second_id);
+
+        app.select_next_rule();
+        assert_outbound_selection(&app, 1, 0, first_id);
+        app.select_next_group_member();
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 1, 1, second_id);
+        app.select_previous_group_member();
+        app.select_previous_group_member();
+        assert_outbound_selection(&app, 1, 0, first_id);
+
+        app.select_next_rule();
+        app.select_next_group_member();
+        app.select_previous_group_member();
+        assert_outbound_selection(&app, 2, 0, other_path_id);
+        app.select_next_rule();
+        app.select_next_rule();
+        assert_outbound_selection(&app, 3, 0, fallback_id);
+        app.select_previous_rule();
+        assert_outbound_selection(&app, 2, 0, other_path_id);
+        app.select_previous_rule();
+        assert_outbound_selection(&app, 1, 0, first_id);
+        app.select_previous_rule();
+        app.select_previous_rule();
+        assert_outbound_selection(&app, 0, 0, other_path_id);
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_preserves_selected_child_and_uuid_across_snapshot_and_event_inserts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let selected_id = rules[1].id;
+        let mut app = outbound_tree_app(false, rules.clone());
+        app.select_next_rule();
+        app.select_next_group_member();
+        app.outbound_details_scroll.set(4);
+        assert_outbound_selection(&app, 1, 1, selected_id);
+
+        let mut refreshed_rules = rules;
+        refreshed_rules.extend([
+            test_rule(
+                "earlier root",
+                Direction::Outbound,
+                Some("203.0.113.1"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/aaa.service"),
+                None,
+            )?,
+            test_rule(
+                "earlier child",
+                Direction::Outbound,
+                Some("203.0.113.2"),
+                Some("/usr/bin/aardvark"),
+                Some("/system.slice/client.service"),
+                None,
+            )?,
+            test_rule(
+                "earlier member",
+                Direction::Outbound,
+                Some("203.0.113.15"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/client.service"),
+                Some(r#"["alpha","--new"]"#),
+            )?,
+        ]);
+        refreshed_rules.reverse();
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: refreshed_rules,
+        });
+        assert_outbound_selection(&app, 4, 2, selected_id);
+        assert_eq!(app.outbound_details_scroll.get(), 4);
+
+        let inserted = test_rule(
+            "event member",
+            Direction::Outbound,
+            Some("203.0.113.25"),
+            Some("/usr/bin/alpha"),
+            Some("/system.slice/client.service"),
+            Some(r#"["alpha","--event"]"#),
+        )?;
+        assert!(app.push_observer_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleCreated { rule: inserted },
+        }));
+        let mut disabled = app.selected_rule().ok_or("missing selection")?.clone();
+        disabled.spec.enabled = false;
+        assert!(app.push_observer_event(Event {
+            revision: 4,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleEnabledChanged { rule: disabled },
+        }));
+        app.reconcile_rule_selection();
+        assert_outbound_selection(&app, 4, 3, selected_id);
+        assert_eq!(app.outbound_details_scroll.get(), 4);
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled {
+                expected_revision: 4,
+                id,
+                enabled: true,
+            }) if id == selected_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_deleted_members_stay_in_child_then_fall_back_to_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut rules = outbound_tree_fixture()?;
+        rules.pop();
+        let first = rules[0].clone();
+        let second = rules[1].clone();
+        let other_path = rules[2].clone();
+        let mut app = outbound_tree_app(false, rules);
+        app.select_next_rule();
+        app.select_next_group_member();
+        assert_outbound_selection(&app, 1, 1, second.id);
+
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: second },
+        });
+        assert_outbound_selection(&app, 1, 0, first.id);
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: first },
+        });
+        assert_outbound_selection(&app, 0, 0, other_path.id);
+        assert_eq!(app.outbound_nodes().len(), 2);
+
+        app.push_event(Event {
+            revision: 4,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: other_path },
+        });
+        app.select_next_rule();
+        app.select_previous_rule();
+        app.select_next_group_member();
+        app.select_previous_group_member();
+        assert!(app.outbound_nodes().is_empty());
+        assert!(app.selected_outbound_node_index(&[]).is_none());
+        assert!(app.selected_rule().is_none());
+        assert!(app.toggle_selected_rule().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_selected_uuid_follows_cgroup_and_path_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let selected_id = rules[1].id;
+        let mut app = outbound_tree_app(false, rules);
+        app.select_next_rule();
+        app.select_next_group_member();
+        let mut moved = app.selected_rule().ok_or("missing selection")?.clone();
+        let application = moved.spec.application.as_mut().ok_or("missing selector")?;
+        application.cgroup = Some(CgroupPath::new("/system.slice/aaa.service")?);
+        application.executable = Some(ApplicationPath::new("/usr/bin/beta")?);
+        moved.spec.validate()?;
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleUpdated {
+                rule: moved.clone(),
+            },
+        });
+        assert_outbound_selection(&app, 1, 0, selected_id);
+        let nodes = app.outbound_nodes();
+        assert_eq!(nodes[1].executable, Some("/usr/bin/beta"));
+        assert_eq!(
+            nodes[1].key,
+            OutboundGroupKey::Cgroup(Cow::Borrowed("/system.slice/aaa.service"))
+        );
+
+        moved
+            .spec
+            .application
+            .as_mut()
+            .ok_or("missing selector")?
+            .cgroup = None;
+        moved.spec.validate()?;
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleUpdated { rule: moved },
+        });
+        assert_outbound_selection(&app, 4, 0, selected_id);
+        let nodes = app.outbound_nodes();
+        assert_eq!(nodes[4].executable, None);
+        assert_eq!(
+            nodes[4].key,
+            OutboundGroupKey::Executable(Cow::Borrowed("/usr/bin/beta"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_tree_child_actions_target_one_uuid_and_respect_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        let selected_id = rules[1].id;
+        let selected_spec = rules[1].spec.clone();
+        for read_only in [false, true] {
+            let mut app = outbound_tree_app(read_only, rules.clone());
+            app.select_next_rule();
+            app.select_next_group_member();
+            assert_outbound_selection(&app, 1, 1, selected_id);
+            let toggle = app.toggle_selected_rule();
+            app.open_edit_rule();
+            if read_only {
+                assert!(toggle.is_none());
+                assert_eq!(app.overlay, Overlay::None);
+                app.open_delete_confirmation();
+                assert_eq!(app.overlay, Overlay::None);
+                assert!(app.confirm_delete(true).is_none());
+                assert_eq!(app.pending_revision, None);
+                assert_eq!(app.notice.as_deref(), Some(app.i18n.tr("notice.read_only")));
+                continue;
+            }
+
+            assert!(matches!(
+                toggle,
+                Some(ControlRequest::SetRuleEnabled {
+                    expected_revision: 1,
+                    id,
+                    enabled: false,
+                }) if id == selected_id
+            ));
+            assert!(matches!(
+                &app.overlay,
+                Overlay::Editor(form) if form.id == Some(selected_id)
+            ));
+            assert!(matches!(
+                app.submit_editor(),
+                Some(ControlRequest::UpdateRule {
+                    expected_revision: 1,
+                    id,
+                    rule,
+                }) if id == selected_id && rule == selected_spec
+            ));
+            app.open_delete_confirmation();
+            assert!(matches!(
+                &app.overlay,
+                Overlay::ConfirmDelete { id, .. } if *id == selected_id
+            ));
+            assert!(matches!(
+                app.confirm_delete(true),
+                Some(ControlRequest::DeleteRule {
+                    expected_revision: 1,
+                    id,
+                }) if id == selected_id
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_menu_scope_matches_the_displayed_tree_members()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut rules = outbound_tree_fixture()?;
+        rules.push(test_rule(
+            "destination",
+            Direction::Outbound,
+            Some("198.51.100.1"),
+            None,
+            None,
+            None,
+        )?);
+        rules.push(test_rule(
+            "inbound",
+            Direction::Inbound,
+            Some("198.51.100.1"),
+            None,
+            None,
+            None,
+        )?);
+        let mut app = outbound_tree_app(false, rules.clone());
+        let node_count = app.outbound_nodes().len();
+        for index in 0..node_count {
+            let expected = app.outbound_nodes()[index]
+                .rules
+                .iter()
+                .map(|rule| rule.id)
+                .collect::<HashSet<_>>();
+            app.open_group_menu();
+            let Overlay::GroupMenu { target, .. } = &app.overlay else {
+                return Err("missing menu".into());
+            };
+            assert_eq!(target.count, expected.len());
+            let matched = rules
+                .iter()
+                .filter(|rule| target.selector.matches(rule))
+                .map(|rule| rule.id)
+                .collect::<HashSet<_>>();
+            assert_eq!(matched, expected, "row {index}");
+            app.close_overlay();
+            app.select_next_rule();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_menu_freezes_scope_and_revision_until_explicit_confirmation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for action in GROUP_ACTIONS {
+            let mut app = outbound_tree_app(false, outbound_tree_fixture()?);
+            app.select_next_rule();
+            app.open_group_menu();
+            let Overlay::GroupMenu { target, .. } = &app.overlay else {
+                return Err("missing menu".into());
+            };
+            let expected = target.clone();
+            assert_eq!(expected.count, 2);
+            let mut snapshot = app.snapshot.clone().ok_or("missing snapshot")?;
+            snapshot.revision = 2;
+            snapshot.rules.clear();
+            app.set_snapshot(snapshot);
+            app.request_group_action(action);
+            assert!(
+                matches!(&app.overlay, Overlay::ConfirmGroup { target, action: selected } if target == &expected && *selected == action)
+            );
+            assert_eq!(
+                app.confirm_group_action(true),
+                Some(ControlRequest::ManageOutboundGroup {
+                    expected_revision: 1,
+                    group: expected.selector,
+                    action,
+                })
+            );
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(app.confirm_group_action(true).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_menu_cancels_on_disconnect_and_rechecks_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = outbound_tree_fixture()?;
+        for view in [View::Status, View::Inbound, View::Events, View::Help] {
+            let mut app = outbound_tree_app(false, rules.clone());
+            app.view = view;
+            app.open_group_menu();
+            assert_eq!(app.overlay, Overlay::None);
+        }
+        let mut app = outbound_tree_app(true, rules.clone());
+        app.open_group_menu();
+        assert_eq!(app.overlay, Overlay::None);
+        for revoked in [false, true] {
+            let mut app = outbound_tree_app(false, rules.clone());
+            app.open_group_menu();
+            app.request_group_action(OutboundGroupAction::Enable);
+            if revoked {
+                app.read_only = true;
+            } else {
+                app.set_disconnected("test".to_owned());
+            }
+            assert!(app.confirm_group_action(true).is_none());
+            assert_eq!(app.overlay, Overlay::None);
+            assert_eq!(app.pending_revision, None);
+        }
+        let mut app = outbound_tree_app(false, rules);
+        app.open_group_menu();
+        app.request_group_action(OutboundGroupAction::Delete);
+        assert!(app.confirm_group_action(false).is_none());
+        assert_eq!(app.pending_revision, None);
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        });
+        app.open_group_menu();
+        assert_eq!(app.overlay, Overlay::None);
+        Ok(())
+    }
+
+    fn outbound_tree_fixture() -> Result<Vec<Rule>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            test_rule(
+                "alpha first",
+                Direction::Outbound,
+                Some("203.0.113.20"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/client.service"),
+                Some(r#"["alpha","--first"]"#),
+            )?,
+            test_rule(
+                "alpha second",
+                Direction::Outbound,
+                Some("203.0.113.30"),
+                Some("/usr/bin/alpha"),
+                Some("/system.slice/client.service"),
+                Some(r#"["alpha","--second"]"#),
+            )?,
+            test_rule(
+                "zulu",
+                Direction::Outbound,
+                Some("203.0.113.10"),
+                Some("/usr/bin/zulu"),
+                Some("/system.slice/client.service"),
+                None,
+            )?,
+            test_rule(
+                "unbound alpha",
+                Direction::Outbound,
+                Some("203.0.113.40"),
+                Some("/usr/bin/alpha"),
+                None,
+                None,
+            )?,
+        ])
+    }
+
+    fn outbound_tree_app(read_only: bool, rules: Vec<Rule>) -> App {
+        let mut app = App::new(read_only, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules,
+        });
+        app
+    }
+
+    fn assert_outbound_selection(app: &App, node_index: usize, member_index: usize, id: Uuid) {
+        let nodes = app.outbound_nodes();
+        assert_eq!(app.selected_outbound_node_index(&nodes), Some(node_index));
+        assert_eq!(app.selected_outbound_member_index(), member_index);
+        assert_eq!(app.selected_rule().map(|rule| rule.id), Some(id));
+        assert_eq!(nodes[node_index].rules[member_index].id, id);
     }
 
     fn test_rule(

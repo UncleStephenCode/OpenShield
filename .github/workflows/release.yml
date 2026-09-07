@@ -202,6 +202,12 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
+      # jq is available on the Ubuntu runner, not in the pinned Rust image.
+      # Publication is exercised only through deny-by-default offline stubs.
+      - name: Offline release candidate and publication regressions
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests/ci -v
       - name: Fetch locked Rust dependencies in an isolated container
         shell: bash
         env:
@@ -267,13 +273,25 @@ jobs:
                 tests/e2e/native-client.c
               python3 tests/ci/test_release_candidate_artifacts.py
               bash -n tests/perf/ci-smoke.sh
+              sh -n tests/e2e/systemd-sandbox.sh
+              sh -n tests/e2e/systemd-sandbox-init.sh
+              python3 -c "import ast, pathlib; ast.parse(pathlib.Path(\"tests/e2e/systemd-sandbox.py\").read_text())"
               python3 -m json.tool tests/perf/config/ci-smoke.json >/dev/null
               python3 tests/perf/run.py --help >/dev/null
               PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
+                tests/perf/test_ci_output.py \
+                tests/perf/test_control.py \
                 tests/perf/test_harness.py \
                 tests/perf/test_environment.py \
                 tests/perf/test_metrics.py \
-                tests/perf/workloads/test_workloads.py
+                tests/perf/workloads/test_workloads.py \
+                tests/e2e/test_continuous_attribution.py \
+                tests/e2e/test_tcp_session.py \
+                tests/e2e/test_learning_sockets.py \
+                tests/e2e/test_ipc_client.py \
+                tests/e2e/test_downstream_counters.py \
+                tests/e2e/test_udp_client.py \
+                tests/e2e/test_zypper_refresh.py
               scripts/check-target-matrix.sh validate
               scripts/test-init-matrix.sh validate
             '
@@ -684,6 +702,34 @@ jobs:
           fi
           exit "$e2e_status"
 
+      - name: Run packaged systemd sandbox regression
+        id: systemd_sandbox
+        if: ${{ matrix.family == 'tumbleweed' && matrix.platform == 'linux/amd64' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          BACKEND: ${{ matrix.backend }}
+          PACKAGE_DIR: ${{ runner.temp }}/openshield-e2e-package-${{ matrix.evidence_id }}
+          SANDBOX_LOG: ${{ runner.temp }}/openshield-systemd-${{ matrix.evidence_id }}.log
+        run: |
+          set -euo pipefail
+          mapfile -d '' packages < <(find "$PACKAGE_DIR" -mindepth 1 -maxdepth 1 -type f -print0)
+          [[ "${#packages[@]}" -eq 1 && ! -L "${packages[0]}" && "${packages[0]}" == *.rpm ]]
+          # Status 77 (unsupported private systemd/cgroup setup) is not a pass.
+          timeout --signal=TERM --kill-after=30s 12m \
+            sh tests/e2e/systemd-sandbox.sh "$BACKEND" "${packages[0]}" 2>&1 | tee "$SANDBOX_LOG"
+
+      - name: Preserve packaged systemd evidence
+        if: ${{ always() && steps.systemd_sandbox.outcome != 'skipped' && steps.systemd_sandbox.outcome != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: systemd-sandbox-${{ matrix.evidence_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/openshield-systemd-evidence.*/
+            ${{ runner.temp }}/openshield-systemd-${{ matrix.evidence_id }}.log
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Record firewall evidence
         if: ${{ success() }}
         shell: bash
@@ -811,15 +857,28 @@ jobs:
           retention-days: 30
 
       - name: Add the bounded report to the job summary
-        if: ${{ success() }}
+        if: ${{ !cancelled() && (steps.performance_smoke.outcome == 'success' || steps.performance_smoke.outcome == 'failure') }}
         shell: bash
         env:
           REPORT: ${{ runner.temp }}/openshield-performance-report/report.md
+          PERFORMANCE_OUTCOME: ${{ steps.performance_smoke.outcome }}
         run: |
           set -euo pipefail
+          readonly maximum_report_bytes=$((512 * 1024))
           {
             printf '%s\n\n' '## OpenShield performance smoke'
-            cat "$REPORT"
+            printf 'Performance smoke result: **%s**.\n\n' "$PERFORMANCE_OUTCOME"
+            if [[ -f "$REPORT" && ! -L "$REPORT" ]] \
+              && report_size=$(stat -c '%s' -- "$REPORT" 2>/dev/null) \
+              && [[ "$report_size" =~ ^[0-9]+$ ]] \
+              && (( report_size > 0 && report_size <= maximum_report_bytes )); then
+              # Bound the read even if the report grows after the size check.
+              if ! head -c "$maximum_report_bytes" -- "$REPORT"; then
+                printf '\nReport could not be read; inspect the performance step log and failure diagnostics.\n'
+              fi
+            else
+              printf '%s\n' 'Report is missing, empty, unsafe, or larger than 512 KiB; inspect the performance step log and failure diagnostics.'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve bounded performance failure diagnostics

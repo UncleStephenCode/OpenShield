@@ -81,11 +81,14 @@ after and requires
 `openshield-daemon --install-fail-closed` action. The long-running daemon repeats
 the kernel `BlockAll` bootstrap before reading or activating policy. On a fresh
 installation it persists `Learning`; an existing saved mode remains unchanged.
-The saved policy is activated only after validation and a fail-closed NFQUEUE
-consumer are available.
+The saved policy is activated only after validation and all three fixed NFQUEUE
+consumers are available: fail-closed queue 1337 for Enforcing and Learning
+application denies, bounded asynchronous observational Learning queue 1338,
+and fail-closed reply-retry queue 1339. The last queue can only drop or repeat
+the INPUT policy; it never authorizes traffic itself.
 
 The main process uses `Type=notify` and sends `READY=1` only after the policy,
-NFQUEUE consumer, and verified IPC sockets are active. `ExecStopPost` installs
+all NFQUEUE consumers, and verified IPC sockets are active. `ExecStopPost` installs
 kernel `BlockAll` after the main process releases its singleton lock. Graceful
 shutdown inside the daemon also installs this quarantine without changing the
 persisted mode.
@@ -102,6 +105,19 @@ requires distribution-specific validation or an initramfs policy.
 metadata, and locks the same persistent inode before state or firewall changes.
 
 ## Privileges and hardening
+
+The unit uses `ProcSubset=all` with `ReadOnlyPaths=/proc`, not `ProcSubset=pid`.
+The latter hides the nested `/proc/self/net/netfilter/nfnetlink_queue` entry
+needed by the bounded reply scheduler, even when direct `/proc/self/net/icmp`
+lookups work. `ProtectProc=invisible`, kernel-tunable protection, the capability
+set and syscall restrictions remain enabled. General procfs metadata becomes
+readable; this is an explicit filesystem-visibility tradeoff, not a relaxation
+of packet authorization. Do not restore `ProcSubset=pid` in a local override.
+After binding its queues and before starting workers or activating the saved
+policy, the daemon validates the real queue-progress entry and netlink owner.
+Failure leaves the bootstrap `BlockAll` policy in place, without reporting
+readiness. A stale service override or an LSM denial must be corrected before
+startup; the daemon does not guess queue progress or permit unverified replies.
 
 The service runs with UID 0 and primary group `root`, and explicitly adds the
 supplementary group `openshield`. As the socket owner it may assign that group
@@ -127,7 +143,14 @@ boot-parameter change, or MOK enrollment to the packaged service.
 The userspace fast path introduced in v0.1.32 needs no additional capability: it batches at
 most 32 already-ready NFQUEUE packets while retaining per-packet `SOCK_DIAG`,
 bounded before/after procfs owner snapshots, mandatory identity consensus, and
-one 250 ms fail-closed deadline. nftables table/chain/counter observation uses
+one absolute deadline (2 seconds for queue 1337, 5 seconds for asynchronous
+Learning; each `SOCK_DIAG` query is capped at 250 ms). Pinned, rewound fd-directory
+walks with reusable buffers need no additional capability and preserve both owner
+snapshots. Queue 1338 separately limits the first eligible observation wait to
+250 ms, with 128 pending packets and a 5 ms reader poll; pending verdicts require
+the same current Learning mode/generation and no shutdown. It does not introduce
+an authorization cache or guarantee rules for one-way UDP senders that exit before
+procfs capture. nftables table/chain/counter observation uses
 one fixed process per second with the same integrity checks. No package, LSM,
 Secure Boot, or kernel-module configuration change is required.
 
@@ -168,7 +191,17 @@ Fresh state is `Learning`, but inbound traffic is default-drop in every mode.
 First activation can terminate the only SSH or VPN session. Use a local console
 or independent out-of-band access, create a narrowly scoped inbound management
 rule, verify a second session, review learned outbound rules, and only then move
-to `Enforcing`.
+to `Enforcing`. `Learning` permits unmatched locally originated outbound
+traffic while enabled explicit `drop`/`reject` rules remain active;
+successfully attributed endpoints become enabled `accept` rules. It also creates
+one disabled template with a path and, when available, cgroup per application
+group. Enabling that broad template is a root-only change and pins the executable
+version at that moment. Disabling an unchanged template restores its canonical
+unpinned skeleton, so each later enable repins the current file; edited
+non-skeleton templates retain their full specification and pin while disabled.
+In either normal mode, enabled outbound rules apply `accept`, `drop`, or
+`reject`; `enabled: false` makes any rule inert. Learning's default allow does
+not override an enabled explicit deny. Inbound rules remain accept-only.
 
 Do not run another privileged firewall manager unless chain ordering, the upper
 two packet-mark bits, and OpenShield's low 31 conntrack-mark bits have been

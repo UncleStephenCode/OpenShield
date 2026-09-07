@@ -165,6 +165,15 @@ MAX_TCP_SERVER_WORKERS = (
     MAX_TCP_CLIENT_CONCURRENCY * TCP_SERVER_TURNOVER_HEADROOM
 )
 NFQUEUE_DRAIN_POLL_SECONDS = 0.01
+ENFORCING_NFQUEUE_NUMBER = 1_337
+LEARNING_NFQUEUE_NUMBER = 1_338
+# Keep these synchronized with the bounded established-flow Learning observer
+# in the nftables/iptables compilers. Initial SYNs remain independently queued.
+LEARNING_ESTABLISHED_OBSERVATIONS_PER_SECOND = 64
+LEARNING_ESTABLISHED_OBSERVATION_BURST = 32
+PERFORMANCE_NFQUEUE_NUMBERS = frozenset(
+    {ENFORCING_NFQUEUE_NUMBER, LEARNING_NFQUEUE_NUMBER}
+)
 MAX_SUBPROCESS_OUTPUT = 4 * 1024 * 1024
 MAX_HARNESS_COMPONENT_BYTES = 4 * 1024 * 1024
 U64_MAX = (1 << 64) - 1
@@ -179,6 +188,7 @@ EXPECTED_NFTABLES_ONLY_PACKAGE_NAMES = frozenset(
     {"libedit0", "libjansson4", "libnftables1", "nftables"}
 )
 HARNESS_COMPONENT_PATHS = (
+    "tests/perf/bounded_output.py",
     "tests/perf/ci-smoke.sh",
     "tests/perf/control.py",
     "tests/perf/environment.py",
@@ -1295,6 +1305,21 @@ def protected_scenarios_for_profile(
             for variant in config["learning_variants"]
         )
     return scenarios
+
+
+def nfqueue_number_for_mode(mode: Any) -> int:
+    """Select the one daemon queue whose counters describe this DUT mode.
+
+    A pristine baseline has no daemon queue, but retaining the enforcing queue
+    as its explicit default keeps the collector contract deterministic.  Any
+    unexpected mode is rejected instead of silently measuring the wrong queue.
+    """
+
+    if mode is None or mode == "enforcing":
+        return ENFORCING_NFQUEUE_NUMBER
+    if mode == "learning":
+        return LEARNING_NFQUEUE_NUMBER
+    raise HarnessError("scenario has no defined NFQUEUE metrics queue")
 
 
 def expected_runtime_compatibility(scenario: dict[str, Any]) -> dict[str, str]:
@@ -2436,11 +2461,10 @@ def _mark_mask(value: str) -> tuple[int, int] | None:
     return int(parts[0], 0), int(parts[1], 0)
 
 
-def _canonical_mark_clear_rule(tokens: list[str]) -> bool:
+def _canonical_mark_clear_rule(tokens: list[str], chain: str) -> bool:
     return (
         len(tokens) == 11
-        and tokens[:6]
-        == ["-A", "OPENSHIELD_MARK", "-m", "mark", "!", "--mark"]
+        and tokens[:6] == ["-A", chain, "-m", "mark", "!", "--mark"]
         and _mark_mask(tokens[6]) == (0, 0xC000_0000)
         and tokens[7:10] == ["-j", "MARK", "--set-xmark"]
         and _mark_mask(tokens[10]) == (0, 0xC000_0000)
@@ -2448,7 +2472,7 @@ def _canonical_mark_clear_rule(tokens: list[str]) -> bool:
 
 
 def inspect_xtables_block_all(filter_text: str, mangle_text: str) -> dict[str, Any]:
-    """Verify exact IPv4 or IPv6 xtables BlockAll filter and mark topology."""
+    """Verify exact IPv4 or IPv6 xtables BlockAll filter/mangle topology."""
 
     try:
         filter_snapshot = _parse_xtables_save(filter_text, "filter")
@@ -2505,7 +2529,7 @@ def inspect_xtables_block_all(filter_text: str, mangle_text: str) -> dict[str, A
     ):
         failures.append("OpenShield filter dispatchers are missing, duplicated, or redirected")
 
-    mangle_owned = {"OPENSHIELD_MARK"}
+    mangle_owned = {"OPENSHIELD_MARK", "OPENSHIELD_OBSERVE"}
     observed_mangle_owned = {
         chain
         for chain in mangle_snapshot["declarations"]
@@ -2513,36 +2537,48 @@ def inspect_xtables_block_all(filter_text: str, mangle_text: str) -> dict[str, A
     }
     if observed_mangle_owned != mangle_owned:
         failures.append("OpenShield mangle-chain set is not canonical BlockAll")
-    mark_rules = _xtables_rules_for(mangle_snapshot, "OPENSHIELD_MARK")
-    canonical_mark_rules = (
-        len(mark_rules) == 3
-        and mark_rules[0]
-        == [
-            "-A",
-            "OPENSHIELD_MARK",
-            "-m",
-            "comment",
-            "--comment",
-            "openshield:owner:v1",
-        ]
-        and _canonical_mark_clear_rule(mark_rules[1])
-        and mark_rules[2] == ["-A", "OPENSHIELD_MARK", "-j", "RETURN"]
-    )
-    if not canonical_mark_rules:
-        failures.append("OpenShield packet-mark sanitizer is not canonical")
-    expected_mangle_dispatcher = ["-A", "OUTPUT", "-j", "OPENSHIELD_MARK"]
+    for chain, description in (
+        ("OPENSHIELD_MARK", "packet-mark sanitizer"),
+        ("OPENSHIELD_OBSERVE", "observation sanitizer"),
+    ):
+        rules = _xtables_rules_for(mangle_snapshot, chain)
+        canonical_rules = (
+            len(rules) == 3
+            and rules[0]
+            == [
+                "-A",
+                chain,
+                "-m",
+                "comment",
+                "--comment",
+                "openshield:owner:v1",
+            ]
+            and _canonical_mark_clear_rule(rules[1], chain)
+            and rules[2] == ["-A", chain, "-j", "RETURN"]
+        )
+        if not canonical_rules:
+            failures.append(f"OpenShield {description} is not canonical")
+    expected_first_dispatcher = ["-A", "OUTPUT", "-j", "OPENSHIELD_MARK"]
+    expected_last_dispatcher = ["-A", "OUTPUT", "-j", "OPENSHIELD_OBSERVE"]
     output_rules = _xtables_rules_for(mangle_snapshot, "OUTPUT")
-    if not output_rules or output_rules[0] != expected_mangle_dispatcher:
-        failures.append("OpenShield mangle dispatcher is not the exact first rule")
+    if not output_rules or output_rules[0] != expected_first_dispatcher:
+        failures.append("OpenShield mangle mark dispatcher is not the exact first rule")
+    if not output_rules or output_rules[-1] != expected_last_dispatcher:
+        failures.append(
+            "OpenShield mangle observation dispatcher is not the exact last rule"
+        )
     try:
         mangle_references = _xtables_owned_references(mangle_snapshot, mangle_owned)
     except HarnessError as error:
         failures.append(str(error))
         mangle_references = []
     if mangle_references != [
-        ("OUTPUT", "-j", "OPENSHIELD_MARK", expected_mangle_dispatcher)
+        ("OUTPUT", "-j", "OPENSHIELD_MARK", expected_first_dispatcher),
+        ("OUTPUT", "-j", "OPENSHIELD_OBSERVE", expected_last_dispatcher),
     ]:
-        failures.append("OpenShield mangle dispatcher is missing, duplicated, or redirected")
+        failures.append(
+            "OpenShield mangle dispatchers are missing, duplicated, or redirected"
+        )
 
     unique_failures = list(dict.fromkeys(failures))
     block_all = not unique_failures
@@ -4220,7 +4256,14 @@ class DockerBackendRun:
         duration: float,
         interface_override: str | None = None,
         workload_pid: int = 0,
+        nfqueue_number: int = ENFORCING_NFQUEUE_NUMBER,
     ) -> subprocess.Popen[str]:
+        if (
+            isinstance(nfqueue_number, bool)
+            or not isinstance(nfqueue_number, int)
+            or nfqueue_number not in PERFORMANCE_NFQUEUE_NUMBERS
+        ):
+            raise HarnessError("metric collector NFQUEUE number is not allowlisted")
         interval = min(0.1, max(0.02, duration / 5.0))
         interface = interface_override
         if interface is None:
@@ -4250,6 +4293,8 @@ class DockerBackendRun:
                     str(duration),
                     "--interval",
                     str(interval),
+                    "--nfqueue-number",
+                    str(nfqueue_number),
                     "--synchronize",
                 ),
             ],
@@ -4638,6 +4683,7 @@ class DockerBackendRun:
         seed: int,
     ) -> dict[str, Any]:
         profile = scenario["profile"]
+        dut_nfqueue_number = nfqueue_number_for_mode(scenario.get("mode"))
         client_container = self.peer_id if profile["direction"] == "inbound" else self.client_id
         server_container = self.client_id if profile["direction"] == "inbound" else self.peer_id
         if not client_container or not server_container or not self.peer_ip:
@@ -4705,6 +4751,7 @@ class DockerBackendRun:
                     if profile["direction"] == "inbound"
                     else client_pid
                 ),
+                nfqueue_number=dut_nfqueue_number,
             )
             peer_metric = self.metric_process(
                 self.peer_id,
@@ -5745,13 +5792,16 @@ print(json.dumps({"state":"signaled","signal":signum}, sort_keys=True, separator
         return payload
 
     def nfqueue_snapshot(self) -> dict[str, Any]:
-        """Take a direct, timestamped queue-1337 procfs snapshot on the DUT."""
+        """Take a direct enforcing-queue procfs snapshot for overload proof."""
 
         if not self.client_id:
             raise HarnessError("DUT is unavailable for NFQUEUE inspection")
         script = r"""
 import json
 import pathlib
+import sys
+
+queue_number = int(sys.argv[1], 10)
 
 result = {
     "present": False,
@@ -5776,7 +5826,7 @@ for line in lines:
         values = [int(value, 10) for value in fields[:9]]
     except ValueError:
         continue
-    if values[0] != 1337:
+    if values[0] != queue_number:
         continue
     result.update({
         "present": True,
@@ -5791,7 +5841,14 @@ for line in lines:
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 """
         completed = self.docker(
-            ["exec", self.client_id, *isolated_python_inline(script)], timeout=10
+            [
+                "exec",
+                self.client_id,
+                *isolated_python_inline(
+                    script, str(ENFORCING_NFQUEUE_NUMBER)
+                ),
+            ],
+            timeout=10,
         )
         observed_at = time.monotonic_ns()
         try:
@@ -6424,6 +6481,7 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                 self.daemon_pid,
                 metric_duration,
                 interface_override=self.client_interface,
+                nfqueue_number=ENFORCING_NFQUEUE_NUMBER,
             )
             peer_metric = self.metric_process(
                 self.peer_id, pressure_server[1], metric_duration
@@ -7389,6 +7447,21 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
     unreliable: list[str] = []
     failures: list[str] = []
     safety_failures: list[str] = []
+    expected_nfqueue_number = nfqueue_number_for_mode(result.get("mode"))
+    observed_nfqueue_number = nested(
+        result, "dut_metrics", "nfqueue", "queue_number"
+    )
+    if (
+        isinstance(observed_nfqueue_number, bool)
+        or observed_nfqueue_number != expected_nfqueue_number
+    ):
+        reason = (
+            "DUT NFQUEUE metrics did not use the queue selected for the "
+            f"scenario mode (expected {expected_nfqueue_number})"
+        )
+        unreliable.append(reason)
+        if result["policy"] != "baseline":
+            safety_failures.append(reason)
     if result["policy"] == "baseline":
         result["nfqueue_runtime_counters"] = None
     else:
@@ -7745,7 +7818,49 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
         # no longer observable after quarantine and must not be mislabeled as
         # a safety failure.  The mode transition still fails capacity above.
         if not verified_quarantine:
-            if result["policy"] == "network_only":
+            if result["mode"] == "learning":
+                # Learning observes outbound traffic even when an existing
+                # network Accept permits it. Established TCP is also sampled
+                # so applications with pre-existing connections can be learned;
+                # its queue shape is therefore not the Enforcing fast-path.
+                if workload_queue_hits is None:
+                    failures.append("Learning observer queue hits are unavailable")
+                elif result.get("direction") == "outbound":
+                    if transport == "tcp":
+                        ratio = result["derived"]["nfqueue_hits_per_connection"]
+                        elapsed = numeric(nested(result, "dut_metrics", "elapsed_seconds"))
+                        # nft has one inet limiter; xtables has one per family.
+                        limiters = 2 if result["backend"] == "iptables" else 1
+                        sample_allowance = (
+                            None if elapsed is None or elapsed <= 0
+                            else limiters * (
+                                math.ceil(elapsed * LEARNING_ESTABLISHED_OBSERVATIONS_PER_SECOND)
+                                + LEARNING_ESTABLISHED_OBSERVATION_BURST
+                            )
+                        )
+                        maximum_hits = (
+                            None if connections is None or sample_allowance is None
+                            else connections * criteria["application_tcp_maximum_queue_hits_per_connection"]
+                            + sample_allowance
+                        )
+                        if (
+                            ratio is None
+                            or ratio < criteria["application_tcp_minimum_queue_hits_per_connection"]
+                            or maximum_hits is None
+                            or workload_queue_hits > maximum_hits
+                        ):
+                            failures.append("Learning TCP queue hits do not track new connections and bounded established observations")
+                    else:
+                        ratio = result["derived"]["nfqueue_hits_per_datagram"]
+                        if ratio is None or not (
+                            criteria["application_udp_minimum_queue_hits_per_datagram"]
+                            <= ratio
+                            <= criteria["application_udp_maximum_queue_hits_per_datagram"]
+                        ):
+                            failures.append("Learning UDP queue hits do not track outbound datagrams")
+                # Ingress workloads exercise local reply packets, which do not
+                # require positive ORIGINAL-direction learning observations.
+            elif result["policy"] == "network_only":
                 if (
                     workload_queue_hits is None
                     or workload_queue_hits > criteria["network_only_maximum_queue_hits"]
@@ -10155,7 +10270,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             "",
             "- TCP/UDP use real sockets and processes across two container network namespaces; no handcrafted TCP packets are injected.",
             "- NIC PPS/Mbps come from interface counters. Workload operations/s and application bytes/s are reported separately and are not called packet rate.",
-            "- NFQUEUE hits and exact kernel/user drops come from queue 1337 in `/proc/net/netfilter/nfnetlink_queue`.",
+            "- DUT NFQUEUE hits and exact kernel/user drops come from the explicitly selected queue in `/proc/net/netfilter/nfnetlink_queue`: 1337 for baseline/Enforcing and 1338 for observational Learning; controlled overload remains on enforcing queue 1337.",
             "- Daemon attribution/error messages are rate-limited, so parsed log counts are explicitly lower bounds.",
             "- Softirq counters are host-wide and require paired-baseline interpretation on a quiet runner.",
             "- TCP connect p50/p95/p99 are paired separately so SYN/NFQUEUE attribution latency cannot hide behind request latency.",

@@ -13,9 +13,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use openshield_core::{
     COUNTER_ACCEPTED_IN, COUNTER_ACCEPTED_OUT, COUNTER_DROPPED_IN, COUNTER_DROPPED_OUT,
     COUNTER_LEARNED_OUT, CounterValue, FirewallCounters, IPTABLES_FORWARD_CHAIN,
-    IPTABLES_INPUT_CHAIN, IPTABLES_MARK_SANITIZE_CHAIN, IPTABLES_OUTPUT_CHAIN,
-    IPTABLES_OWNERSHIP_COMMENT, IptablesCompiler, IptablesPolicy, NFT_OWNERSHIP_COUNTER,
-    NftablesCompiler, Snapshot, owned_chains, owned_mangle_chains,
+    IPTABLES_INPUT_CHAIN, IPTABLES_LEARNING_OBSERVE_CHAIN, IPTABLES_MARK_SANITIZE_CHAIN,
+    IPTABLES_OUTPUT_CHAIN, IPTABLES_OWNERSHIP_COMMENT, IptablesCompiler, IptablesPolicy,
+    NFT_OWNERSHIP_COUNTER, NftablesCompiler, Snapshot, owned_chains, owned_mangle_chains,
 };
 #[cfg(test)]
 use openshield_core::{
@@ -67,17 +67,26 @@ const LEGACY_BACKEND_UNAVAILABLE_SUFFIXES: [&str; 2] = [
 const XTABLES_CAPABILITY_POLICY: &str = "*mangle\n\
 :OPENSHIELD_PROBE_MARK - [0:0]\n\
 -A OPENSHIELD_PROBE_MARK -m mark ! --mark 0x00000000/0xc0000000 -j MARK --set-xmark 0x00000000/0xc0000000\n\
+-A OPENSHIELD_PROBE_MARK -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1338 --queue-bypass\n\
+-A OPENSHIELD_PROBE_MARK -p tcp -m tcp --tcp-flags FIN,RST NONE -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -m limit --limit 64/sec --limit-burst 32 -j NFQUEUE --queue-num 1338 --queue-bypass\n\
 -A OPENSHIELD_PROBE_MARK -j RETURN\n\
 COMMIT\n\
 *filter\n\
 :OPENSHIELD_PROBE - [0:0]\n\
 :OPENSHIELD_PROBE_GOTO - [0:0]\n\
--A OPENSHIELD_PROBE -p tcp -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -m connmark --mark 0x40000001/0x7fffffff -m comment --comment openshield:probe -j RETURN\n\
+-A OPENSHIELD_PROBE -p tcp -m tcp --tcp-flags RST RST -m conntrack --ctstate RELATED --ctdir REPLY -m comment --comment openshield:probe -j RETURN\n\
+-A OPENSHIELD_PROBE -p tcp -m conntrack --ctstate ESTABLISHED --ctorigdstport 443 --ctdir ORIGINAL -m connmark --mark 0x40000001/0x7fffffff -m comment --comment openshield:probe -j RETURN\n\
+-A OPENSHIELD_PROBE -m conntrack --ctstate UNTRACKED -j RETURN\n\
 -A OPENSHIELD_PROBE -m mark ! --mark 0x00000000/0xc0000000 -j MARK --set-xmark 0x00000000/0xc0000000\n\
 -A OPENSHIELD_PROBE -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1337\n\
+-A OPENSHIELD_PROBE -m mark --mark 0x40000000/0xc0000000 -j REJECT\n\
 -A OPENSHIELD_PROBE -m mark --mark 0x80000000/0xc0000000 -g OPENSHIELD_PROBE_GOTO\n\
 -A OPENSHIELD_PROBE_GOTO -j CONNMARK --set-xmark 0x40000001/0x7fffffff\n\
 -A OPENSHIELD_PROBE_GOTO -j RETURN\n\
+COMMIT\n";
+const IP6TABLES_CONTROL_PLANE_CAPABILITY_POLICY: &str = "*filter\n\
+:OPENSHIELD_PROBE6 - [0:0]\n\
+-A OPENSHIELD_PROBE6 -p ipv6-icmp -m addrtype ! --src-type UNSPEC,MULTICAST -m hl --hl-eq 255 -m icmp6 --icmpv6-type 134 -j RETURN\n\
 COMMIT\n";
 #[cfg(test)]
 const MAX_LEARNED_ENDPOINTS: usize = 6 * 4_096;
@@ -619,7 +628,17 @@ impl XtablesTools {
         self.capture("mangle")
             .context("xtables-save mangle capability probe failed")?;
         self.restore(XTABLES_CAPABILITY_POLICY, true)
-            .context("xtables-restore capability probe failed")
+            .context("xtables-restore capability probe failed")?;
+        if self
+            .command
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("ip6tables"))
+        {
+            self.restore(IP6TABLES_CONTROL_PLANE_CAPABILITY_POLICY, true)
+                .context("ip6tables host control-plane capability probe failed")?;
+        }
+        Ok(())
     }
 
     fn restore(&self, policy: &str, test_only: bool) -> Result<()> {
@@ -652,6 +671,42 @@ impl XtablesTools {
             NFT_TIMEOUT,
         )
         .with_context(|| format!("cannot install fail-closed {built_in} dispatcher"))
+    }
+
+    fn append_dispatch(&self, table: &str, built_in: &str, target: &str) -> Result<()> {
+        run_command(
+            &self.command,
+            &[
+                "--wait",
+                XT_WAIT_SECONDS,
+                "-t",
+                table,
+                "-A",
+                built_in,
+                "-j",
+                target,
+            ],
+            NFT_TIMEOUT,
+        )
+        .with_context(|| format!("cannot append fail-closed {built_in} dispatcher"))
+    }
+
+    fn delete_dispatch(&self, table: &str, built_in: &str, target: &str) -> Result<()> {
+        run_command(
+            &self.command,
+            &[
+                "--wait",
+                XT_WAIT_SECONDS,
+                "-t",
+                table,
+                "-D",
+                built_in,
+                "-j",
+                target,
+            ],
+            NFT_TIMEOUT,
+        )
+        .with_context(|| format!("cannot relocate {built_in} dispatcher"))
     }
 
     fn capture(&self, table: &str) -> Result<Vec<u8>> {
@@ -759,9 +814,33 @@ impl IptablesBackend {
             }
         }
         let mangle = parse_xtables_save(&tools.capture("mangle")?)?;
-        for (built_in, target) in mangle_dispatcher_pairs() {
+        for (built_in, target) in mangle_first_dispatcher_pairs() {
             if mangle.first_rule(built_in) != Some(dispatch_rule(built_in, target).as_str()) {
                 tools.insert_dispatch("mangle", built_in, target)?;
+            }
+        }
+        for (built_in, target) in mangle_last_dispatcher_pairs() {
+            let expected = dispatch_rule(built_in, target);
+            let target_dispatchers: Vec<&str> = mangle
+                .rules_for_chain(built_in)
+                .filter(|rule| rule_jumps_to(rule, target))
+                .collect();
+            ensure!(
+                target_dispatchers
+                    .iter()
+                    .all(|rule| *rule == expected.as_str()),
+                "refusing to relocate a noncanonical mangle {built_in} dispatcher to {target}"
+            );
+            if target_dispatchers.len() != 1
+                || mangle.last_rule(built_in) != Some(expected.as_str())
+            {
+                // append-then-delete keeps one observer reachable throughout
+                // relocation. BlockAll is already installed in the first
+                // filter dispatcher, so even a command failure stays closed.
+                tools.append_dispatch("mangle", built_in, target)?;
+                for _ in 0..target_dispatchers.len() {
+                    tools.delete_dispatch("mangle", built_in, target)?;
+                }
             }
         }
         Self::capture_verified_policy(tools).map(|_captured| ())
@@ -774,10 +853,12 @@ impl IptablesBackend {
         mangle.verify_mangle_topology()?;
         let mut rules = mangle.owned_rules;
         rules.extend(filter.owned_rules);
-        Ok(CapturedXtablesPolicy {
-            rules,
-            counters: filter.counters,
-        })
+        // The observational q1338 rule is intentionally in mangle/OUTPUT so
+        // its NF_ACCEPT/bypass cannot skip another host mangle rule. Only its
+        // exact learned_out comment contributes a counter there; filter keeps
+        // the remaining policy counters.
+        let counters = add_firewall_counters(&filter.counters, &mangle.counters)?;
+        Ok(CapturedXtablesPolicy { rules, counters })
     }
 
     fn prepare(&self, block_policy: &IptablesPolicy) -> Result<()> {
@@ -1435,8 +1516,12 @@ fn filter_dispatcher_pairs() -> [(&'static str, &'static str); 3] {
     ]
 }
 
-fn mangle_dispatcher_pairs() -> [(&'static str, &'static str); 1] {
+fn mangle_first_dispatcher_pairs() -> [(&'static str, &'static str); 1] {
     [("OUTPUT", IPTABLES_MARK_SANITIZE_CHAIN)]
+}
+
+fn mangle_last_dispatcher_pairs() -> [(&'static str, &'static str); 1] {
+    [("OUTPUT", IPTABLES_LEARNING_OBSERVE_CHAIN)]
 }
 
 fn ownership_initialization_policy(table: &str, chains: &[&str]) -> String {
@@ -1694,12 +1779,20 @@ struct XtablesSnapshot {
 }
 
 impl XtablesSnapshot {
-    fn first_rule(&self, chain: &str) -> Option<&str> {
+    fn rules_for_chain<'a>(&'a self, chain: &str) -> impl DoubleEndedIterator<Item = &'a str> + 'a {
         let prefix = format!("-A {chain} ");
         self.ordered_rules
             .iter()
-            .find(|rule| rule.starts_with(&prefix))
+            .filter(move |rule| rule.starts_with(&prefix))
             .map(String::as_str)
+    }
+
+    fn first_rule(&self, chain: &str) -> Option<&str> {
+        self.rules_for_chain(chain).next()
+    }
+
+    fn last_rule(&self, chain: &str) -> Option<&str> {
+        self.rules_for_chain(chain).next_back()
     }
 
     fn verify_filter_topology(&self) -> Result<()> {
@@ -1742,25 +1835,47 @@ impl XtablesSnapshot {
             );
             self.verify_chain_ownership(chain)?;
         }
-        for (built_in, target) in mangle_dispatcher_pairs() {
+        for (built_in, target) in mangle_first_dispatcher_pairs() {
             ensure!(
                 self.first_rule(built_in) == Some(dispatch_rule(built_in, target).as_str()),
                 "OpenShield mark sanitizer is not first in mangle {built_in}"
             );
-            let prefix = format!("-A {built_in} ");
             let owned_dispatchers = self
-                .ordered_rules
-                .iter()
-                .filter(|rule| {
-                    rule.starts_with(&prefix)
-                        && owned_mangle_chains()
-                            .iter()
-                            .any(|chain| rule_jumps_to(rule, chain))
-                })
+                .rules_for_chain(built_in)
+                .filter(|rule| rule_jumps_to(rule, target))
                 .count();
             ensure!(
                 owned_dispatchers == 1,
                 "mangle {built_in} must contain exactly one OpenShield mark sanitizer"
+            );
+        }
+        for (built_in, target) in mangle_last_dispatcher_pairs() {
+            ensure!(
+                self.last_rule(built_in) == Some(dispatch_rule(built_in, target).as_str()),
+                "OpenShield Learning observer is not last in mangle {built_in}"
+            );
+            let observer_dispatchers = self
+                .rules_for_chain(built_in)
+                .filter(|rule| rule_jumps_to(rule, target))
+                .count();
+            ensure!(
+                observer_dispatchers == 1,
+                "mangle {built_in} must contain exactly one OpenShield Learning observer"
+            );
+        }
+
+        for (built_in, _) in mangle_first_dispatcher_pairs() {
+            let owned_dispatchers = self
+                .rules_for_chain(built_in)
+                .filter(|rule| {
+                    owned_mangle_chains()
+                        .iter()
+                        .any(|chain| rule_jumps_to(rule, chain))
+                })
+                .count();
+            ensure!(
+                owned_dispatchers == 2,
+                "mangle {built_in} must contain exactly two OpenShield dispatchers"
             );
         }
         Ok(())
@@ -2037,6 +2152,9 @@ fn accumulate_comment_counter(
             add_xtables_counter(&mut counters.accepted_out, packets, bytes, "accepted_out")?;
             add_xtables_counter(&mut counters.learned_out, packets, bytes, "learned_out")?;
         }
+        Some("openshield:learned_out") => {
+            add_xtables_counter(&mut counters.learned_out, packets, bytes, "learned_out")?;
+        }
         Some(_) | None => {}
     }
     Ok(())
@@ -2178,6 +2296,26 @@ fn order_owned_xtables_rules(mut rules: Vec<(String, String)>) -> Vec<String> {
 
 fn normalize_xtables_tokens(mut tokens: Vec<String>) -> Result<String> {
     ensure!(!tokens.is_empty(), "empty xtables rule");
+
+    // `--syn` is an exact shorthand for this flag mask, but
+    // iptables-save always expands it. Canonicalize the shorthand before
+    // comparing an installed owned rule with the compiled transaction.
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == "--syn" {
+            tokens.splice(
+                index..=index,
+                [
+                    "--tcp-flags".to_owned(),
+                    "FIN,SYN,RST,ACK".to_owned(),
+                    "SYN".to_owned(),
+                ],
+            );
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
 
     // iptables-save inserts the protocol's match module when a port option is
     // present (`-p tcp -m tcp --dport ...`), while iptables-restore accepts the
@@ -3467,19 +3605,24 @@ COMMIT
     }
 
     #[test]
-    fn xtables_observation_requires_first_owned_mangle_sanitizer() -> Result<()> {
+    fn xtables_observation_requires_first_sanitizer_and_last_learning_observer() -> Result<()> {
         let complete = br#"*mangle
 :OUTPUT ACCEPT [0:0]
 :OPENSHIELD_MARK - [0:0]
+:OPENSHIELD_OBSERVE - [0:0]
 [0:0] -A OUTPUT -j OPENSHIELD_MARK
+[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE
 [0:0] -A OPENSHIELD_MARK -m comment --comment "openshield:owner:v1"
 [0:0] -A OPENSHIELD_MARK -m mark ! --mark 0x0/0xc0000000 -j MARK --set-xmark 0x0/0xc0000000
 [0:0] -A OPENSHIELD_MARK -j RETURN
+[0:0] -A OPENSHIELD_OBSERVE -m comment --comment "openshield:owner:v1"
+[0:0] -A OPENSHIELD_OBSERVE -m mark ! --mark 0x0/0xc0000000 -j MARK --set-xmark 0x0/0xc0000000
+[0:0] -A OPENSHIELD_OBSERVE -j RETURN
 COMMIT
 "#;
         let snapshot = parse_xtables_save(complete)?;
         snapshot.verify_mangle_topology()?;
-        assert_eq!(snapshot.owned_rules.len(), 3);
+        assert_eq!(snapshot.owned_rules.len(), 6);
 
         let bypassed = String::from_utf8(complete.to_vec())?.replace(
             "[0:0] -A OUTPUT -j OPENSHIELD_MARK\n",
@@ -3491,9 +3634,25 @@ COMMIT
                 .is_err()
         );
 
+        let foreign_between = String::from_utf8(complete.to_vec())?.replace(
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+            "[0:0] -A OUTPUT -j FOREIGN_MANGLE\n[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+        );
+        parse_xtables_save(foreign_between.as_bytes())?.verify_mangle_topology()?;
+
+        let observer_not_last = String::from_utf8(complete.to_vec())?.replace(
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n[0:0] -A OUTPUT -j FOREIGN_MANGLE\n",
+        );
+        assert!(
+            parse_xtables_save(observer_not_last.as_bytes())?
+                .verify_mangle_topology()
+                .is_err()
+        );
+
         let duplicate = String::from_utf8(complete.to_vec())?.replace(
-            "[0:0] -A OUTPUT -j OPENSHIELD_MARK\n",
-            "[0:0] -A OUTPUT -j OPENSHIELD_MARK\n[0:0] -A OUTPUT -j OPENSHIELD_MARK\n",
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
         );
         assert!(
             parse_xtables_save(duplicate.as_bytes())?
@@ -3593,18 +3752,21 @@ COMMIT
         let policy = super::XTABLES_CAPABILITY_POLICY;
         for required in [
             "-m conntrack",
+            "--ctstate RELATED",
+            "--tcp-flags RST RST",
             "--ctdir ORIGINAL",
             "-m connmark --mark",
             "-m comment --comment openshield:probe",
             "-m mark ! --mark",
             "-j MARK --set-xmark",
             "-j CONNMARK --set-xmark",
+            "-j NFQUEUE --queue-num 1338 --queue-bypass",
             "-j NFQUEUE --queue-num 1337",
+            "-j REJECT",
             "-g OPENSHIELD_PROBE_GOTO",
         ] {
             assert!(policy.contains(required), "probe omitted {required}");
         }
-        assert!(!policy.contains("queue-bypass"));
     }
 
     #[test]
@@ -4051,10 +4213,16 @@ COMMIT
             3,
             30,
         )?;
+        super::accumulate_comment_counter(
+            &mut counters,
+            r#"-A OPENSHIELD_OBSERVE -m comment --comment "openshield:learned_out" -j NFQUEUE --queue-num 1338 --queue-bypass"#,
+            4,
+            40,
+        )?;
         assert_eq!(counters.accepted_out.packets, 5);
         assert_eq!(counters.accepted_out.bytes, 50);
-        assert_eq!(counters.learned_out.packets, 3);
-        assert_eq!(counters.learned_out.bytes, 30);
+        assert_eq!(counters.learned_out.packets, 7);
+        assert_eq!(counters.learned_out.bytes, 70);
 
         assert!(
             super::accumulate_comment_counter(
@@ -4084,6 +4252,12 @@ COMMIT
         assert_eq!(
             super::normalize_xtables_rule(compiled)?,
             super::normalize_xtables_rule(captured)?
+        );
+        let compiled_syn = "-A OPENSHIELD_OBSERVE -p tcp --syn -m conntrack --ctstate NEW --ctdir ORIGINAL -j NFQUEUE --queue-num 1338 --queue-bypass";
+        let captured_syn = "-A OPENSHIELD_OBSERVE -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW --ctdir ORIGINAL -j NFQUEUE --queue-num 1338 --queue-bypass";
+        assert_eq!(
+            super::normalize_xtables_rule(compiled_syn)?,
+            super::normalize_xtables_rule(captured_syn)?
         );
         Ok(())
     }
@@ -4121,7 +4295,7 @@ COMMIT
         filter_saved.push_str("COMMIT\n");
 
         let mut mangle_saved = String::from(
-            "*mangle\n:OUTPUT ACCEPT [0:0]\n:OPENSHIELD_MARK - [0:0]\n[0:0] -A OUTPUT -j OPENSHIELD_MARK\n",
+            "*mangle\n:OUTPUT ACCEPT [0:0]\n:OPENSHIELD_MARK - [0:0]\n:OPENSHIELD_OBSERVE - [0:0]\n[0:0] -A OUTPUT -j OPENSHIELD_MARK\n[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
         );
         for rule in mangle_rules {
             let _infallible = writeln!(mangle_saved, "[0:0] {rule}");

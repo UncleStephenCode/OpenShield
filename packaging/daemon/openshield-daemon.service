@@ -48,7 +48,11 @@ ProtectKernelLogs=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-ProcSubset=pid
+# The nested netfilter/nfnetlink_queue entry is required for reply scheduling.
+# subset=pid hides it even via /proc/self/net. Keep procfs read-only instead;
+# process visibility, kernel tunable protection and capabilities stay restricted.
+ProcSubset=all
+ReadOnlyPaths=/proc
 # openshield.conf pre-creates all three paths as root:root and restores their
 # policy-defined SELinux labels. Do not use RuntimeDirectory= or StateDirectory=:
 # their ownership repair is recursive and can be denied on preserved LSM-labelled

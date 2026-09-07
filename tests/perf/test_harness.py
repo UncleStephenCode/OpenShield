@@ -170,10 +170,15 @@ def xtables_mangle_block_all_fixture() -> str:
     return """*mangle
 :OUTPUT ACCEPT [0:0]
 :OPENSHIELD_MARK - [0:0]
+:OPENSHIELD_OBSERVE - [0:0]
 [0:0] -A OUTPUT -j OPENSHIELD_MARK
+[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE
 [0:0] -A OPENSHIELD_MARK -m comment --comment "openshield:owner:v1"
 [0:0] -A OPENSHIELD_MARK -m mark ! --mark 0x0/0xc0000000 -j MARK --set-xmark 0x0/0xc0000000
 [0:0] -A OPENSHIELD_MARK -j RETURN
+[0:0] -A OPENSHIELD_OBSERVE -m comment --comment "openshield:owner:v1"
+[0:0] -A OPENSHIELD_OBSERVE -m mark ! --mark 0x0/0xc0000000 -j MARK --set-xmark 0x0/0xc0000000
+[0:0] -A OPENSHIELD_OBSERVE -j RETURN
 COMMIT
 """
 
@@ -341,6 +346,74 @@ class KernelBlockAllObservationTests(unittest.TestCase):
         self.assertFalse(observation["block_all"])
         self.assertIn("sanitizer", observation["reason"])
 
+    def test_xtables_mangle_requires_two_exact_boundary_dispatchers(self) -> None:
+        canonical = xtables_mangle_block_all_fixture()
+        foreign_between = canonical.replace(
+            ":OPENSHIELD_MARK - [0:0]\n",
+            ":OPENSHIELD_MARK - [0:0]\n:FOREIGN_MANGLE - [0:0]\n",
+            1,
+        ).replace(
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+            "[0:0] -A OUTPUT -j FOREIGN_MANGLE\n"
+            "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+            1,
+        )
+        allowed = runner.inspect_xtables_block_all(
+            xtables_filter_block_all_fixture(), foreign_between
+        )
+        self.assertTrue(allowed["block_all"])
+
+        malicious = {
+            "mark_not_first": canonical.replace(
+                "[0:0] -A OUTPUT -j OPENSHIELD_MARK\n",
+                "[0:0] -A OUTPUT -j ACCEPT\n"
+                "[0:0] -A OUTPUT -j OPENSHIELD_MARK\n",
+                1,
+            ),
+            "observer_not_last": canonical.replace(
+                "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+                "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n"
+                "[0:0] -A OUTPUT -j ACCEPT\n",
+                1,
+            ),
+            "duplicate_observer_reference": canonical.replace(
+                "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+                "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n"
+                "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE\n",
+                1,
+            ),
+            "redirected_observer": canonical.replace(
+                "[0:0] -A OUTPUT -j OPENSHIELD_OBSERVE",
+                "[0:0] -A OUTPUT -g OPENSHIELD_OBSERVE",
+                1,
+            ),
+            "missing_observer_owner": canonical.replace(
+                "[0:0] -A OPENSHIELD_OBSERVE -m comment --comment "
+                '"openshield:owner:v1"\n',
+                "",
+                1,
+            ),
+            "tampered_observer_sanitizer": canonical.replace(
+                "[0:0] -A OPENSHIELD_OBSERVE -m mark ! --mark "
+                "0x0/0xc0000000 -j MARK --set-xmark 0x0/0xc0000000",
+                "[0:0] -A OPENSHIELD_OBSERVE -m mark ! --mark "
+                "0x0/0xc0000000 -j MARK --set-xmark 0x0/0x80000000",
+                1,
+            ),
+            "extra_owned_chain": canonical.replace(
+                ":OPENSHIELD_OBSERVE - [0:0]\n",
+                ":OPENSHIELD_OBSERVE - [0:0]\n:OPENSHIELD_EXTRA - [0:0]\n",
+                1,
+            ),
+        }
+        for name, mangle_text in malicious.items():
+            with self.subTest(name=name):
+                observation = runner.inspect_xtables_block_all(
+                    xtables_filter_block_all_fixture(), mangle_text
+                )
+                self.assertTrue(observation["inspected"])
+                self.assertFalse(observation["block_all"])
+
     @staticmethod
     def xtables_identity(world: str, state: str) -> dict:
         return {
@@ -362,6 +435,20 @@ class KernelBlockAllObservationTests(unittest.TestCase):
         self.assertEqual(clean["state"], "clean")
         self.assertTrue(canonical["inspected"])
         self.assertTrue(clean["inspected"])
+
+        canonical_identity = self.xtables_identity("legacy", "canonical")
+        canonical_identity["rounds"] = [
+            dict(canonical),
+            dict(canonical),
+        ]
+        clean_identity = self.xtables_identity("nft", "clean")
+        clean_identity["rounds"] = [dict(clean), dict(clean)]
+        quarantine_evidence = runner.evaluate_xtables_family_worlds(
+            "ipv4", [canonical_identity, clean_identity]
+        )
+        self.assertTrue(quarantine_evidence["inspected"])
+        self.assertTrue(quarantine_evidence["block_all"])
+        self.assertEqual(quarantine_evidence["canonical_world"], "legacy")
 
     def test_xtables_world_evidence_requires_one_canonical_and_clean_alternate(self) -> None:
         accepted = runner.evaluate_xtables_family_worlds(
@@ -680,6 +767,40 @@ class ConfigTests(unittest.TestCase):
                 },
                 {"policy": "application_tcp", "mode": "enforcing"},
             )
+
+    def test_nfqueue_metrics_queue_is_selected_strictly_by_mode(self) -> None:
+        self.assertEqual(runner.nfqueue_number_for_mode(None), 1337)
+        self.assertEqual(runner.nfqueue_number_for_mode("enforcing"), 1337)
+        self.assertEqual(runner.nfqueue_number_for_mode("learning"), 1338)
+        for mode in ("", "block_all", "Learning", 1338, False):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    runner.HarnessError, "no defined NFQUEUE metrics queue"
+                ):
+                    runner.nfqueue_number_for_mode(mode)
+
+    def test_metric_process_passes_only_an_allowlisted_queue(self) -> None:
+        topology = object.__new__(runner.DockerBackendRun)
+        topology.client_id = "dut"
+        topology.peer_id = "peer"
+        topology.canary_id = "canary"
+        topology.client_interface = "eth0"
+        topology.peer_interface = "eth0"
+        topology.canary_peer_interface = "eth1"
+        with mock.patch.object(runner.subprocess, "Popen") as popen:
+            topology.metric_process(
+                "dut", 123, 1.0, nfqueue_number=runner.LEARNING_NFQUEUE_NUMBER
+            )
+        command = popen.call_args.args[0]
+        queue_option = command.index("--nfqueue-number")
+        self.assertEqual(command[queue_option + 1], "1338")
+
+        for queue_number in (-1, 0, 1336, 1337.0, 1339, 65_536, True):
+            with self.subTest(queue_number=queue_number):
+                with self.assertRaisesRegex(runner.HarnessError, "not allowlisted"):
+                    topology.metric_process(
+                        "dut", 123, 1.0, nfqueue_number=queue_number
+                    )
 
     def test_interface_pattern_is_linux_bounded_and_path_safe(self) -> None:
         for valid in ("eth0", "veth.1", "br-test_0", "a" * 15):
@@ -1223,6 +1344,8 @@ class ConfigTests(unittest.TestCase):
         for contract in (
             '.dut_metrics.schema == "openshield.perf.metrics.v3"',
             '.peer_metrics.schema == "openshield.perf.metrics.v3"',
+            ".dut_metrics.nfqueue.queue_number",
+            'if .mode == "learning" then 1338 else 1337 end',
             "collector_excluded_cgroup_cpu($metrics.elapsed_seconds)",
             ".cpu_percent_one_core - (.cpu_seconds * 100 / $elapsed)",
         ):
@@ -1428,6 +1551,7 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
             "conntrack_count_start": 2,
             "conntrack_count_peak": 10,
             "nfqueue": {
+                "queue_number": 1337,
                 "hits": queue_hits,
                 "kernel_dropped": 0,
                 "user_dropped": 0,
@@ -1600,8 +1724,15 @@ def independent_validation_fixture(
                 row["comparison_pair_id"] = f"p{pair_index:05d}"
             measured["mode"] = scenario["mode"]
             measured["learning_variant"] = scenario["learning_variant"]
+            measured["dut_metrics"]["nfqueue"]["queue_number"] = (
+                runner.nfqueue_number_for_mode(scenario["mode"])
+            )
             measured["status_before"]["mode"] = scenario["mode"]
             measured["status_after"]["mode"] = scenario["mode"]
+            if scenario["mode"] == "learning" and profile["direction"] == "outbound":
+                measured["dut_metrics"]["nfqueue"]["hits"] = (
+                    10 if profile["transport"] == "tcp" else 104
+                )
             if scenario["policy"].startswith("application_"):
                 measured["identity_probe"] = {
                     "blocked": True,
@@ -1774,6 +1905,21 @@ class IndependentReleaseValidationTests(unittest.TestCase):
         config, report = independent_validation_fixture()
         report["configuration_sha256"] = "0" * 64
         with self.assertRaises(release_validator.ValidationError):
+            release_validator.validate_documents(config, report)
+
+    def test_independent_validator_rejects_wrong_mode_nfqueue(self) -> None:
+        config, report = independent_validation_fixture()
+        learning = next(
+            row
+            for row in report["results"]
+            if row["mode"] == "learning"
+        )
+        self.assertEqual(learning["dut_metrics"]["nfqueue"]["queue_number"], 1338)
+        learning["dut_metrics"]["nfqueue"]["queue_number"] = 1337
+        with self.assertRaisesRegex(
+            release_validator.ValidationError,
+            "does not match mode 'learning'",
+        ):
             release_validator.validate_documents(config, report)
 
     def test_empty_backend_or_pair_coverage_cannot_pass(self) -> None:
@@ -2126,6 +2272,118 @@ class EvaluationTests(unittest.TestCase):
                 self.assertTrue(result["safety_pass"])
                 self.assertTrue(result["capacity_pass"])
                 self.assertTrue(result["passed"])
+
+    def test_wrong_mode_nfqueue_metrics_invalidate_the_window(self) -> None:
+        result = synthetic_result("network_only")
+        result["mode"] = "learning"
+        result["status_before"]["mode"] = "learning"
+        result["status_after"]["mode"] = "learning"
+        # Deliberately retain the enforcing queue recorded by the fixture.
+        runner.evaluate_result(result, self.criteria)
+        reason = (
+            "DUT NFQUEUE metrics did not use the queue selected for the "
+            "scenario mode (expected 1338)"
+        )
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["safety_pass"])
+        self.assertIn(reason, result["unreliable_reasons"])
+        self.assertIn(reason, result["safety_failure_reasons"])
+
+    @staticmethod
+    def learning_result(policy: str, transport: str = "tcp") -> dict:
+        result = synthetic_result(policy, transport)
+        result["mode"] = "learning"
+        result["status_before"]["mode"] = "learning"
+        result["status_after"]["mode"] = "learning"
+        result["dut_metrics"]["nfqueue"].update({
+            "queue_number": 1338,
+            "hits": 100 if transport == "tcp" else 104,
+        })
+        return result
+
+    def test_learning_observes_network_accept_and_established_tcp(self) -> None:
+        for backend in ("nftables", "iptables"):
+            for policy in ("network_only", "application_tcp"):
+                with self.subTest(backend=backend, policy=policy):
+                    result = self.learning_result(policy)
+                    result["backend"] = backend
+                    for status in ("status_before", "status_after"):
+                        result[status]["backend"] = backend
+                    runner.evaluate_result(result, self.criteria)
+                    # Ten new connections and a hundred observed packets:
+                    # valid bounded Learning sampling, not an Enforcing fast-path.
+                    self.assertEqual(result["derived"]["nfqueue_hits_per_connection"], 10)
+                    self.assertGreater(
+                        result["derived"]["nfqueue_hits_per_operation"],
+                        self.criteria["application_tcp_keepalive_maximum_queue_hits_per_operation"],
+                    )
+                    self.assertTrue(result["passed"], result["failure_reasons"])
+
+    def test_enforcing_still_requires_kernel_and_conntrack_fast_paths(self) -> None:
+        for policy in ("network_only", "application_tcp"):
+            with self.subTest(policy=policy):
+                result = synthetic_result(policy)
+                result["dut_metrics"]["nfqueue"]["hits"] = 100
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["capacity_pass"])
+                self.assertFalse(result["passed"])
+                if policy == "application_tcp":
+                    self.assertIn(
+                        "established TCP did not demonstrate the conntrack fast-path",
+                        result["failure_reasons"],
+                    )
+
+    def test_learning_tcp_rejects_missing_or_unbounded_observation(self) -> None:
+        for backend, maximum in (("nftables", 136), ("iptables", 232)):
+            for hits in (None, 0, maximum + 1):
+                with self.subTest(backend=backend, hits=hits):
+                    result = self.learning_result("network_only")
+                    result["backend"] = backend
+                    result["dut_metrics"]["nfqueue"]["hits"] = hits
+                    runner.evaluate_result(result, self.criteria)
+                    self.assertFalse(result["capacity_pass"])
+                    self.assertFalse(result["passed"])
+
+    def test_learning_udp_network_accept_requires_per_datagram_observation(self) -> None:
+        for policy in ("network_only", "application_udp"):
+            for hits, passed in ((104, True), (0, False), (208, False)):
+                with self.subTest(policy=policy, hits=hits):
+                    result = self.learning_result(policy, "udp")
+                    result["dut_metrics"]["nfqueue"]["hits"] = hits
+                    runner.evaluate_result(result, self.criteria)
+                    self.assertEqual(result["passed"], passed, result["failure_reasons"])
+
+    def test_learning_ingress_does_not_require_observing_reply_packets(self) -> None:
+        result = self.learning_result("network_only")
+        result["direction"] = "inbound"
+        result["dut_metrics"]["nfqueue"]["hits"] = 0
+        runner.evaluate_result(result, self.criteria)
+        self.assertTrue(result["passed"], result["failure_reasons"])
+        result["dut_metrics"]["nfqueue"]["hits"] = None
+        runner.evaluate_result(result, self.criteria)
+        self.assertFalse(result["passed"])
+
+    def test_learning_observation_retains_safety_and_capacity_budgets(self) -> None:
+        mutations = {
+            "NFQUEUE drop": lambda row: row["dut_metrics"]["nfqueue"].update({"kernel_dropped": 1}),
+            "NFQUEUE error": lambda row: row["status_after"]["nfqueue"].update({"terminal_queue_error": 1}),
+            "NIC drop": lambda row: row["dut_metrics"]["network"].update({"rx_dropped": 1}),
+            "fail-open": lambda row: row.update({"identity_probe": {"fail_open": True, "attempts_completed": 1}}),
+            "daemon CPU": lambda row: row["dut_metrics"]["daemon"].update({
+                "cpu_percent_one_core": self.criteria["maximum_daemon_cpu_percent_one_core"] + 1,
+            }),
+            "latency": lambda row: row["workload"]["metrics"]["latency_ms"].update({
+                "p99": self.criteria["maximum_latency_p99_ms"] + 1,
+            }),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                result = self.learning_result("network_only")
+                mutate(result)
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["passed"])
+                if defect not in {"daemon CPU", "latency"}:
+                    self.assertFalse(result["safety_pass"])
 
     def test_metric_schema_and_cpu_percent_identity_are_authoritative(self) -> None:
         cases = {
@@ -3833,7 +4091,9 @@ class MetricAndOutputTests(unittest.TestCase):
             ".dut_metric_boundary.boundary_monotonic_ns",
             '== "openshield.perf.metrics.control.v2"',
             '.dut_metrics.stop_reason == "split_boundary"',
+            ".dut_metrics.nfqueue.queue_number == 1337",
             ".post_resume_dut_metrics.stop_reason",
+            ".post_resume_dut_metrics.nfqueue.queue_number == 1337",
             ".metric_starts",
             "$metric_starts.dut",
             '== "openshield.perf.metrics.v3"',

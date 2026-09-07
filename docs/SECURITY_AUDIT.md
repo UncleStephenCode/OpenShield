@@ -2,10 +2,9 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-05, OpenShield 0.2.0 source tree (the audited v0.1.32
-code plus release-version and documentation updates), Rust stable 1.98.0.
-Exact v0.1.32 E2E and performance evidence below remains labelled with the
-version that was measured and is not silently relabelled as v0.2.0 evidence.
+Review snapshot: 2026-09-05, OpenShield 0.2.1 source tree, Rust stable 1.98.0.
+Exact evidence collected for earlier versions below remains labelled with the
+version that was measured and is not silently relabelled as v0.2.1 evidence.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -91,15 +90,49 @@ The normative boundary is defined by the
   either requested policy. Failure can cause temporary denial but must not
   create a cross-family authorization window; verification failure triggers an
   emergency `BlockAll` attempt.
-- New local inbound traffic is default-deny and requires an explicit enabled
-  inbound allow. Outbound behavior follows the selected mode. `BlockAll` also
+- New local inbound service traffic is default-deny and requires an explicit
+  enabled inbound allow. Exact normal-mode DHCP bootstrap and essential IPv6
+  control traffic are built-in; `BlockAll` contains no exception. Outbound behavior follows the selected mode. `BlockAll` also
   drops forwarded traffic; `Learning` and `Enforcing` return forwarded traffic
   to the pre-existing firewall policy instead of granting it or managing
   forwarding rules.
-- NFQUEUE 1337 is installed without a fail-open bypass. Kernel queue length,
-  packet copy length, procfs work, and attribution time are bounded. Parse,
-  ownership, identity, ambiguity, or terminal queue failures deny traffic or
-  request emergency `BlockAll`.
+- Independent packet-consumer threads own fail-closed NFQUEUE 1337 (Enforcing
+  and Learning application-deny candidates) and observational Learning NFQUEUE
+  1338. Queue 1338 delegates to a bounded asynchronous attribution worker.
+  The first eligible TCP SYN or datagram of a recently unseen flow may await
+  completion for at most 250 ms; at most 128 packets are pending, with a 5 ms
+  reader poll and no synchronous procfs work on that reader. Repeats are accepted
+  immediately. Expiry or full backlog retains the ordinary Learning allow
+  policy, but pending verdicts require the same current mode/generation under
+  the engine lock and no shutdown. Serial/generation tickets reject stale
+  completions. A separate bounded worker persists successful Learning
+  observations. Both outgoing queues are bounded by queue length, packet
+  copy length, procfs work, and attribution time.
+  Queue 1337 deliberately has no queue bypass:
+  parse, ownership, identity, ambiguity, or queue-pressure failures deny the
+  affected traffic. `Learning` allows unmatched traffic but retains enabled
+  explicit network and application denies. Its observational queue uses
+  backend-native bypass; ordinary parse, attribution, quota, or persistence
+  pressure may lose an observation without turning ordinary Learning into a
+  successful-attribution allow policy. A terminal
+  queue-integrity or policy-engine failure
+  still requests emergency `BlockAll` rather than continuing in an unknown
+  state.
+- A third reader owns fail-closed INPUT queue 1339 for eligible delayed
+  UDP/ICMP echo replies. It returns only Drop or `NF_REPEAT`, never Accept.
+  Its bounded readiness state waits for actual outgoing verdicts through the
+  kernel sequence captured on admission, without requiring queue 1337 to become
+  empty. Missing metadata or a different queue owner/runtime cannot release a
+  reply. This scheduling state cannot authorize a flow. Current kernel rules and
+  conntrack generation still decide delivery on every retry. At most 128 replies
+  wait, for up to 2 seconds per attempt and three attempts per packet. The
+  attempt bits preserve all unreserved packet-mark bits. Timeouts, policy
+  changes, and exhaustion remain fail-closed; sustained load may still lose replies.
+- In the iptables fallback, the reserved-mark sanitizer is the first mangle
+  OUTPUT dispatcher and the separate Learning observer is the last. The daemon
+  requires each exactly once. Pre-existing host marking, QoS, and policy-routing
+  rules therefore run before queue 1338 can return `NF_ACCEPT`, bypass an absent
+  listener, or accept on overflow.
 - The reported active-path classification is derived conservatively from
   committed enabled rules. `KernelNative` is limited to `BlockAll` or application-free
   `Enforcing`; TCP-only application `Enforcing` is `ConntrackHybrid`; `Learning`
@@ -112,8 +145,10 @@ The normative boundary is defined by the
   successive fallback implementations for an unchanged policy.
 - The engine rechecks mode and generation under its lock through verdict
   delivery and reinjection. nftables uses `NF_ACCEPT` followed by its later
-  authorization base chain; iptables uses `NF_REPEAT` with an authenticated
-  `NFQA_MARK` handoff consumed by the first repeated OpenShield OUTPUT rule.
+  authorization base chain for fail-closed queue 1337; iptables uses `NF_REPEAT`
+  with an authenticated `NFQA_MARK` handoff consumed by the first repeated
+  OpenShield OUTPUT rule. Learning queue 1338 instead returns `NF_ACCEPT` from
+  its late observation position.
   Verdict delivery is nonblocking, and a terminal send error requests emergency
   `BlockAll` instead of indefinitely retaining the policy lock.
 
@@ -148,36 +183,93 @@ The normative boundary is defined by the
   revalidated before identity capture, falls back to a bounded rescan of that same
   task if stale, and is rechecked after capture. The absence of a matching-UID
   holder, multiple matching TGIDs, an incomplete scan, an unstable identity, or
-  exhausted bounds results in denial.
-- In v0.1.32 the consumer drains at most 32 already-ready NFQUEUE packets
+  exhausted bounds fails attribution. This denies in Enforcing; in Learning it
+  suppresses persistence while the outbound packet remains allowed.
+- Since v0.1.32 attribution batches contain at most 32 already-ready items
   without waiting to fill a batch. Each packet still performs its own
-  `SOCK_DIAG` lookup. The optimization shares only two complete bounded procfs
-  owner snapshots, one before and one after identity capture, under one absolute
-  250 ms deadline. Each snapshot has a global cap of 131,072 owner records
-  across all targets. Identity capture is
-  memoized only inside that batch for an identical inode, socket UID, and
-  capture requirement. Duplicate requests must reach consensus on PID, process
+  `SOCK_DIAG` lookup. The optimization shares two complete bounded procfs
+  owner snapshots, one before and one after identity capture, including a
+  single-item batch. The absolute operation deadline is 2 seconds for queue
+  1337 and 5 seconds for asynchronous Learning; individual `SOCK_DIAG` queries
+  remain capped at 250 ms within that deadline. Each snapshot has a global cap of 131,072 owner records
+  across all targets. Within a batch, metadata is read once per exact TGID/TID,
+  task path, socket UID, and capture requirements. Every socket FD is checked
+  before and after that read; all owning tasks must agree. Per-socket results
+  remain keyed by inode, UID, and requirements and are discarded with the batch.
+  Duplicate requests must reach consensus on PID, process
   start time, executable path and complete file version, and filesystem UID.
   The typed attribution-timeout marker is preserved into NFQUEUE accounting.
   A changed snapshot, inconsistent identity, timeout, ambiguity, or exceeded
-  bound denies the affected packet. No identity or authorization result survives
+  bound denies the affected packet in Enforcing and only suppresses observation
+  persistence in Learning. No identity or authorization result survives
   into the next batch, so otherwise-unmatched UDP/ICMP remains repeatedly
   attributed.
+- Full fd scans use pinned, rewound directories and safe `RawDir`/`readlinkat_raw`
+  with reusable bounded buffers, avoiding full-path allocation for negative fd
+  entries. Truncated links cannot satisfy the socket-inode parser. Scan-local
+  descriptor hints skip a full walk only after every target inode for that UID
+  is revalidated; fallback preserves a verified preferred descriptor for sockets
+  with duplicate fds. Both complete owner snapshots, thread/UID checks,
+  executable pins, race revalidation, and all work bounds remain mandatory.
+  This adds no PID authorization cache, eBPF tier, kernel module, `CAP_BPF`, or
+  MOK/boot configuration requirement. Selector-mismatch diagnostics report
+  bounded field categories/counts rather than argv, executable paths, or cgroups.
+- Owner snapshots may use two fd-scanning workers only at 64 or more external
+  tasks, multiple TGIDs, and two available CPUs. The caller and one scoped helper
+  scan whole TGIDs distributed by task count. Complete PID/TID enumeration
+  keeps one global task bound; a shared positive-owner accumulator keeps one
+  record cap and cross-worker ambiguity checks. Both workers share the existing
+  deadline, every helper is joined, and sorted owner sets retain exact before/
+  after equality. Small or single-TGID scans remain serial. Worker failures deny
+  attribution; parallelism does not reduce proof requirements or worst-case work.
+  Learning's 250 ms first-observation deadline and 5 ms poll are not hard
+  real-time guarantees under scheduler or policy-lock contention.
 - On cgroup v2, exactly one unified `0::/path` entry supplies the cgroup
   identity. On a v1-only host, bounded controller memberships are validated but
   no cgroup identity is returned. Executable path, full file version, filesystem
   UID, and argv attribution still work; an explicit cgroup-path selector fails
   closed.
 - Authorized established TCP traffic is tied to the current nonzero policy
-  generation. Policy-invalidating changes increment that generation by one. UDP and ICMP
+  generation. Policy-invalidating changes, including enabling or creating a
+  deny, increment that generation by one. UDP and ICMP
   are attributed per otherwise-unmatched outbound packet; successful attribution
   refreshes the current generation for its reply, while unsolicited inbound
   traffic still needs an explicit allow.
-- `Learning` creates only successfully attributed, exact
-  application/protocol/endpoint/interface permits. A bounded learning queue,
-  batch limit, and deduplication bound work. Automatic insertion stops when
-  existing learned counts reach 7,500 globally, 512 per filesystem UID, or 256
-  per pair of filesystem UID and complete executable file version. These are
+- Native rejection replies are admitted through local default-deny only for
+  the exact RELATED/REPLY TCP RST, IPv4 ICMP destination-unreachable /
+  port-unreachable, or IPv6 ICMPv6 destination-unreachable / port-unreachable
+  shape, and only with the current nonzero 30-bit rejection generation attested
+  in OpenShield's low-31 connmark domain with the accept-domain bit clear.
+  Policy-generation changes invalidate stale attestations; all other RELATED
+  traffic follows the ordinary policy.
+- Before a broader network accept, application envelopes drop matching
+  UNTRACKED current tuples that cannot enter attribution. Destination- or
+  port-constrained envelopes additionally drop a matching conntrack-original
+  destination/port while retaining the final output-interface constraint. This
+  closes a local-DNAT bypass conservatively and may deny a translated flow
+  rather than attribute a rule written for the pre-translation endpoint.
+- Rule activation and verdict are independent. An outbound rule may be disabled
+  or enabled and, when enabled in either normal mode, may `accept`, silently
+  `drop`, or natively `reject`; overlapping rules use deterministic deny-before-allow
+  precedence. Inbound rules remain accept-only and inbound service traffic
+  remains default-deny outside the exact built-in normal-mode control set.
+- `Learning` allows unmatched locally originated outbound traffic while enabled
+  explicit denies remain active. Successfully attributed observations create enabled `accept` rules with exact
+  application/protocol/endpoint/interface selectors. For every new
+  cgroup/executable-path grouping identity it also creates one disabled
+  `accept` template containing only that cgroup and path. The template is inert
+  and deliberately unpinned while disabled. A privileged enable reopens and
+  validates the executable, adds its complete file-version pin atomically with
+  the policy update, and thereby grants that application broad outbound access;
+  an absent or changed path rejects the enable instead of weakening identity.
+  Disabling an unchanged Template restores its canonical unpinned skeleton and
+  every later enable repins the then-current executable. An edited non-skeleton
+  Template and disabled Manual or Learned rules retain their complete
+  specification and pin. A bounded learning queue, batch-size limit, and
+  deduplication cap bound the work. Automatic insertion stops when
+  exact learned rules plus templates reach 7,500 globally, or exact learned
+  rules reach 512 per filesystem UID or 256 per pair of filesystem UID and
+  complete executable file version. These are
   admission budgets, not validation invariants for legacy or root-edited state;
   distinct subordinate UIDs count separately. The total limit remains 10,000
   rules, normally reserving 2,500 count slots for privileged manual rules; the
@@ -186,8 +278,12 @@ The normative boundary is defined by the
   attributed observation before queue admission. Exact-known, saturated, and
   persistence-paused observations keep the current Learning allow without
   entering the queue; only a potential new candidate consumes a slot, and the
-  worker coalesces exact duplicates in each bounded drain. A policy/cache mismatch
-  or full/disconnected queue for a candidate fails closed. At a learning quota,
+  worker coalesces exact duplicates in each bounded drain. A policy/cache mismatch,
+  full queue, disconnected learning worker, or attribution failure suppresses
+  persistence but does not block an ordinary Learning packet. A transition out
+  of Learning denies an in-flight stale decision; a Learning-to-Learning
+  generation change retains its already-permissive Accept verdict but may
+  discard the stale observation. At a learning quota,
   no permit is persisted for Enforcing. Preparation, persistence reservation,
   and the pending admission index run under the engine mutex; atomic save and
   `fsync` do not. Exact pending endpoints are deduplicated, and state/events are
@@ -211,8 +307,13 @@ The normative boundary is defined by the
 - Startup increments the persisted nonzero 30-bit policy generation by exactly
   one before the requested policy is activated. Values are not reused before
   exhaustion; exhaustion retains `BlockAll` and fails startup rather than
-  wrapping. Readiness is announced only after the policy, fail-closed queue
-  consumer, and verified IPC sockets are active.
+  wrapping. While bootstrap `BlockAll` remains active, the first v0.2.1 start
+  over v0.2.0 state adds missing canonical disabled templates for existing
+  Learned application groups. The additive migration respects automatic-rule,
+  total-rule, and 8 MiB limits and never removes endpoint rules when no room
+  remains; it is persisted before policy activation. Readiness is announced
+  only after the policy, both fixed NFQUEUE consumers, and verified IPC sockets
+  are active.
 - Graceful daemon shutdown and packaged post-stop hooks reinstall kernel
   `BlockAll` without replacing the saved requested mode.
 - Service definitions are provided for systemd, OpenRC, SysVinit, runit, s6, and
@@ -237,6 +338,15 @@ The normative boundary is defined by the
   `/run` or `/var/lib`, writable. This preserves serialization with other
   xtables processes without recursively changing saved state. The unit reduces
   attack surface but is not a sandbox against a compromised daemon.
+  `ProcSubset=all` with `ReadOnlyPaths=/proc` is required for the nested
+  `/proc/self/net/netfilter/nfnetlink_queue` progress record. `ProcSubset=pid`
+  hides that entry even when `/proc/self/net/tcp` is readable. This change
+  expands read visibility of general procfs metadata; it does not restore procfs
+  writes or change network authorization. Queue ownership/configuration and
+  progress readability are checked before worker startup and desired-policy
+  activation. A failed check leaves bootstrap `BlockAll` in place.
+  Previously recorded systemd exposure scores below are historical, not a new
+  score for this revised procfs configuration.
 
 ## Verification evidence
 
@@ -266,14 +376,21 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   and temporary Unix sockets and did not touch the host firewall. These are
   component results and remain distinct from the full performance-gate result
   below.
-- The v0.2.0 release-version preparation resolved all four workspace crates and
-  their exact internal dependency pins as `0.2.0`. The locked all-target Rust
-  suite passed 350 tests with six environment-dependent live tests explicitly
-  ignored, formatting and all-target Clippy with warnings denied passed, the
-  release matrix validated 43 binary builds, 43 packages, 86 declared
-  platforms, 37 package-install jobs, and 74 firewall jobs, and both locally
-  built release executables reported version `0.2.0`. This is source/build
-  evidence; the v0.2.0 GitHub release workflow has not yet run.
+- The v0.2.1 release-version preparation resolved all four workspace crates and
+  their exact internal dependency pins as `0.2.1`. In the pinned Rust 1.98.0
+  container, the locked all-target suite passed 377 tests while the normal run
+  ignored six environment-dependent tests; the separate ignored-test invocation
+  passed all six. Formatting, all-target Clippy with warnings denied, and the
+  x86-64 static-PIE musl release build passed, and both executables reported
+  `0.2.1`. The performance-harness unit suite passed 219 tests with 11
+  intentional environment-dependent skips. The release matrix validated 43
+  binary builds, 43 packages, 86 declared platforms, 37 package-install jobs,
+  and 74 firewall jobs. The locally container-built Tumbleweed x86-64 RPM,
+  SHA-256 `fa638b0503447a7c85815a5a51d6add653330b92e2d5e05e854eb1dc1602d373`,
+  passed metadata and installation validation followed by the complete nftables
+  and iptables-fallback E2E in disposable containers. Those runs did not inspect
+  or modify the host firewall. This is local source/build/runtime evidence; the
+  v0.2.1 GitHub release workflow has not yet run.
 - The final local v0.1.32 x86-64 Tumbleweed CI-smoke performance gate completed
   with `PASS` for both nftables and the iptables fallback. It used daemon SHA-256
   `d3b824e680baebb30e30f65e2fa010cd0643d3272a2f370bc0001ee727487c29` and
@@ -391,7 +508,7 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The CI observation thresholds remain 10%. Under the current v0.2.0
+  The CI observation thresholds remain 10%. Under the current v0.2.1
   field-evaluation policy, the authenticated criterion
   `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
   means to `observe`; throughput and PPS means retain the blocking `fail`
@@ -477,9 +594,10 @@ Commands and exact interpretation are documented in
   management allow first, and keep a recovery procedure ready before enabling
   the service.
 - Learning is an operator-controlled trust window. Any successfully attributed
-  local process can create exact application-and-endpoint rules and consume its
-  per-application or per-UID quota. Multiple UIDs/applications can still consume
-  the 7,500 learned-rule capacity or the independent 8 MiB state budget and
+  local process can create exact application-and-endpoint rules plus disabled
+  templates and consume its per-application or per-UID quota. Multiple
+  UIDs/applications can still consume the 7,500 automatic-rule capacity or the
+  independent 8 MiB state budget and
   pause further learning. Reaching the byte limit or a recoverable save failure
   discards the current batch and pauses automatic learning until a successful
   privileged mutation or daemon restart, while the active Learning traffic
@@ -488,9 +606,12 @@ Commands and exact interpretation are documented in
 - An authorized root operator can still fill the 10,000-rule total with manual
   mutations. Root is inside the administrative trust boundary, but this remains
   an operational availability limit.
-- Procfs attribution and one bounded NFQUEUE consumer can be forced into
-  fail-closed denial by process, thread, fd, or queue pressure. This is a
-  material availability/DoS risk, not a fail-open path. In particular, the
+- In `Enforcing`, procfs attribution and the active bounded NFQUEUE consumer can be
+  forced into fail-closed denial by process, thread, fd, or queue pressure.
+  This is a material availability/DoS risk, not a fail-open path. In
+  `Learning`, the same pressure can lose observations and therefore leave the
+  later `Enforcing` rule set incomplete, but unmatched traffic continues under
+  the declared default allow. In particular, the
   one bounded directory walk inspects at most 4,096 fd entries for a task whose
   filesystem UID matches the socket UID and denies attribution if proof would
   require a later entry; global enumeration admits at most 131,072 proc/task
@@ -500,14 +621,18 @@ Commands and exact interpretation are documented in
   self-TGID and scan-local fd-hint optimizations reduce the common-case scan cost.
   Every completed owner snapshot still includes two shared self-table checks.
   The v0.1.32 micro-batch shares its before/after snapshots across at most 32
-  already-ready packets, retains per-packet `SOCK_DIAG`, and applies one 250 ms
-  deadline to the whole batch plus a 131,072-owner-record cap to each snapshot.
-  Intra-batch
-  identity reuse is keyed by inode, UID, and capture requirements and is accepted
-  only with mandatory-identity consensus and unchanged ownership; nothing is
+  already-ready packets, retains per-packet `SOCK_DIAG`, and applies one 2-second
+  deadline to a queue-1337 batch (5 seconds for asynchronous Learning) plus a
+  131,072-owner-record cap to each snapshot. Per-query `SOCK_DIAG` remains capped
+  at 250 ms. Fixed-buffer, directory-relative reads reduce common-case overhead,
+  not the worst-case scan size.
+  Intra-batch metadata grouping is keyed by TGID/TID, task path, socket UID, and
+  capture requirements. Per-socket FD checks, mandatory-identity consensus,
+  and unchanged ownership remain required; nothing is
   cached across batches. These optimizations do not alter worst-case complexity. A
-  sustained packet stream or hostile procfs cardinality
-  can still saturate the queue consumer and deny legitimate traffic. The
+  sustained packet stream or hostile procfs cardinality can still saturate the
+  active consumer and deny legitimate application-bound traffic in `Enforcing`.
+  The
   immutable packet-policy cache removes the previous per-packet full-state clone
   and indexes enabled rules by complete executable file version. A lookup scans
   only the policy-ordered bucket for the observed version. Matching within that
@@ -515,8 +640,10 @@ Commands and exact interpretation are documented in
   rules under one pin despite the 256-rule automatic-insertion budget.
   The Learning admission index prevents already-known, saturated, or paused
   observations from filling the persistence queue, but classification follows
-  mandatory procfs attribution. New eligible candidates can still fill the
-  queue and fail closed; all classes retain the procfs availability cost.
+  procfs attribution attempt. New eligible candidates can still fill the
+  persistence queue and lose observations without changing Learning's allow
+  verdict. Learning-only scheduling suppression can avoid duplicate work before
+  attribution; candidates that reach attribution retain its procfs cost.
   Nonblocking verdict delivery prevents an indefinite policy-lock stall, but
   sustained netlink send pressure can request emergency `BlockAll`; this is an
   intentional fail-closed availability tradeoff.
@@ -526,6 +653,12 @@ Commands and exact interpretation are documented in
 
 ### Identity and privilege
 
+- The bounded first-observation wait is not a historical process/socket event
+  collector. A fire-and-forget UDP process may exit after `sendto()` before
+  attribution, even while its packet is queued. Learning then allows ordinary
+  traffic without a rule; stale PIDs or guessed identities are not substitutes.
+  Request/response and one-way UDP coverage are reported separately by the
+  [short-lived regression](../tests/compat/README.md#short-lived-application-regression).
 - Procfs attribution is a repeated post-event consistency check, not an atomic
   kernel sender/exec record. An exec or descriptor transfer concurrent with
   packet processing can expose only the later observable identity. UDP
@@ -551,8 +684,10 @@ Commands and exact interpretation are documented in
   daemon compromise. The syscall deny list does not prevent ordinary I/O to a
   successfully opened `/proc/pid/mem` or every traversal through procfs magic
   links.
-- Application selectors constrain allow rules; they are not deny overrides. A
-  broader matching network-only allow can authorize the same flow first.
+- Application selectors can constrain `accept`, `drop`, or `reject` rules.
+  Network-only denies take precedence; application candidates are attributed
+  before an overlapping network-only accept fallback, and application actions
+  are ordered `drop`, `reject`, then `accept`.
 
 ### Coexistence and protocol scope
 
@@ -594,6 +729,12 @@ Commands and exact interpretation are documented in
 
 ### Compatibility and localization
 
+- State and IPC compatibility is forward-only from v0.2.0 to v0.2.1. The new
+  reader treats an absent `action` as `accept`, but v0.2.0 cannot parse v0.2.1
+  `drop`/`reject` actions or the `template` origin. Mixed daemon/TUI versions and
+  an in-place downgrade after v0.2.1 has written state are unsupported. Upgrade
+  and rollback require a protected console, active kernel `BlockAll`, a reviewed
+  state backup, and a distribution-tested procedure.
 - Static `--version` smoke tests share the host kernel and do not exercise libc
   integration, init boot, firewall tools, NFQUEUE, package upgrades, or real
   traffic. Archived and rolling images are probes, not supported-lifecycle

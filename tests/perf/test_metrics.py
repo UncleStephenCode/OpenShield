@@ -10,6 +10,7 @@ from pathlib import Path
 import selectors
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -36,7 +37,9 @@ class MetricCollectorProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.output_buffers: dict[int, bytearray] = {}
 
-    def start_collector(self) -> subprocess.Popen[bytes]:
+    def start_collector(
+        self, nfqueue_number: int = metrics.DEFAULT_NFQUEUE_NUMBER
+    ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
             [
                 sys.executable,
@@ -52,6 +55,8 @@ class MetricCollectorProtocolTests(unittest.TestCase):
                 "3",
                 "--interval",
                 "0.02",
+                "--nfqueue-number",
+                str(nfqueue_number),
                 "--synchronize",
             ],
             stdin=subprocess.PIPE,
@@ -136,6 +141,7 @@ class MetricCollectorProtocolTests(unittest.TestCase):
             self.assertIsInstance(boundary, int)
             self.assertGreater(boundary, 0)
             self.assertEqual(first["schema"], metrics.METRICS_SCHEMA)
+            self.assertEqual(first["nfqueue"]["queue_number"], 1337)
             self.assertEqual(first["stop_reason"], "split_boundary")
             self.assertEqual(
                 first["started_at_monotonic_ns"],
@@ -177,6 +183,7 @@ class MetricCollectorProtocolTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, stderr)
             self.assertEqual(remaining_stdout, "")
             self.assertEqual(document["schema"], metrics.METRICS_SCHEMA)
+            self.assertEqual(document["nfqueue"]["queue_number"], 1337)
             self.assertEqual(document["stop_reason"], "requested")
             self.assertEqual(
                 document["started_at_monotonic_ns"],
@@ -186,6 +193,26 @@ class MetricCollectorProtocolTests(unittest.TestCase):
                 document["started_at_monotonic_ns"],
                 document["finished_at_monotonic_ns"],
             )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=1)
+
+    def test_explicit_learning_queue_is_recorded_in_the_metric_document(self) -> None:
+        process = self.start_collector(1338)
+        try:
+            self.read_json_line(process)
+            self.write_command(process, "start")
+            self.read_json_line(process)
+            self.write_command(process, "stop")
+            self.close_stdin(process)
+            document = self.read_json_line(process)
+            remaining_stdout, stderr = self.reap(process)
+
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(remaining_stdout, "")
+            self.assertEqual(document["nfqueue"]["queue_number"], 1338)
+            self.assertIn("NFQUEUE 1338", document["scope_notes"]["nfqueue"])
         finally:
             if process.poll() is None:
                 process.kill()
@@ -229,6 +256,35 @@ class MetricCollectorProtocolTests(unittest.TestCase):
                     metrics.decode_control_command(
                         payload, frozenset({"start", "split", "stop"})
                     )
+
+    def test_nfqueue_snapshot_selects_only_the_requested_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "nfnetlink_queue"
+            source.write_text(
+                "1337 10 2 2 65535 3 4 100 1\n"
+                "1338 11 7 2 65535 5 6 200 1\n",
+                encoding="ascii",
+            )
+            enforcing = metrics.nfqueue_counters(1337, source)
+            learning = metrics.nfqueue_counters(1338, source)
+
+        self.assertEqual(enforcing["queue_number"], 1337)
+        self.assertEqual(enforcing["depth"], 2)
+        self.assertEqual(enforcing["sequence"], 100)
+        self.assertEqual(learning["queue_number"], 1338)
+        self.assertEqual(learning["depth"], 7)
+        self.assertEqual(learning["sequence"], 200)
+
+    def test_nfqueue_number_rejects_noncanonical_or_out_of_range_values(self) -> None:
+        for value in (-1, 65_536, True, 1.0, "1337"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    metrics.validate_nfqueue_number(value)
+        for value in ("-1", "65536", "01337", "+1337", "١٣٣٧"):
+            with self.subTest(value=value):
+                with self.assertRaises(metrics.argparse.ArgumentTypeError):
+                    metrics.parse_nfqueue_number(value)
+        self.assertEqual(metrics.parse_nfqueue_number("1338"), 1338)
 
 
 if __name__ == "__main__":

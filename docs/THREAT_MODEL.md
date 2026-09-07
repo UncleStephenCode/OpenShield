@@ -10,13 +10,19 @@
 3. Policy input cannot select commands, plugins, or executable code. An
    application path is identity data only and is never executed.
 4. Failed parsing, persistence, identity attribution, or firewall-backend updates
-   preserve or strengthen the last known policy; they must not silently allow
-   traffic.
-5. New inbound traffic is denied unless an enabled inbound rule matches.
+   preserve or strengthen the last known restrictive policy. The explicit
+   exception is observational queue 1338 in `Learning`: it accepts ordinary
+   unmatched traffic independently of attribution success, so a failed observation
+   creates no rule. Its first-observation wait is bounded to 250 ms and pending
+   verdicts require the same current Learning mode and generation.
+   Enabled explicit denies still apply through the kernel or fail-closed queue 1337.
+5. New inbound service traffic is denied unless an enabled inbound rule matches;
+   only the exact built-in normal-mode DHCP/IPv6 control set is exempt.
 6. In enforcing mode, new outbound traffic is denied unless all fields of an
    enabled outbound rule match, including its application selector when present.
-7. Missing, ambiguous, stale, unsupported, or over-limit application identity
-   information results in DROP, not a network-wide fallback allow.
+7. In `Enforcing`, missing, ambiguous, stale, unsupported, or over-limit
+   application identity information results in DROP, not a network-wide
+   fallback allow.
 8. A non-root observer cannot obtain executable paths, complete file-version
    identities, command arguments, UID or cgroup selectors, or identifying names of
    application-bound rules through the observation protocol.
@@ -85,9 +91,13 @@ are broader than firewall administration alone.
   Before serializing a response for a non-root observer, the daemon replaces the
   complete application selector and its potentially identifying rule name with
   fixed redacted values.
-- Network-only decisions remain in default-drop backend chains. Initial
-  application decisions use the fixed NFQUEUE 1337 with no fail-open bypass flag, a
-  maximum kernel queue length of 256 packets, and a 512-byte copy range.
+- Network-only decisions remain in backend chains. Enforcing application
+  decisions and Learning application-deny candidates use fixed fail-closed
+  NFQUEUE 1337; ordinary Learning observations use the
+  separate fixed NFQUEUE 1338. Both have a maximum kernel queue length of 256
+  packets and a 512-byte copy range. Queue bypass and accept-on-overflow are
+  present only on queue 1338, whose outbound `Learning` default already permits
+  unmatched traffic; `Enforcing` and `BlockAll` never reference that queue.
 - `StatusV2` reports policy mode, firewall backend, and the dynamically
   recomputed active-policy path classification as separate typed fields. It is
   not kernel-capability attestation or fallback negotiation. The value is derived from committed
@@ -98,16 +108,37 @@ are broader than firewall administration alone.
   cannot broaden a rule. Network-only traffic stays in the kernel at every
   known level. Failure to initialize mandatory NFQUEUE leaves the bootstrap
   `BlockAll` policy installed and terminates the daemon instead of falling back
-  to a network-only or queue-bypass policy.
+  to a weaker policy. Learning's explicit queue bypass becomes reachable only
+  after successful startup activation.
   The only automatic startup backend fallback is nftables to the complete
   iptables/ip6tables bundle when nftables cannot be validated.
-- The queue consumer accepts only successfully parsed TCP, UDP, ICMP echo, and
-  ICMPv6 echo traffic. It drains no more than 32 already-ready packets and never
+- Two independent outgoing packet consumers own the fixed kernel queues: queue 1337 has
+  neither bypass nor `NFQA_CFG_F_FAIL_OPEN`, while observational queue 1338 has
+  both. A separate fail-closed reader of INPUT queue 1339 can briefly hold
+  eligible UDP/ICMP echo replies and repeat current kernel policy, never accept
+  them itself. Its captured outgoing sequence, flow readiness and three-attempt packet mark
+  are scheduling state, not an authorization cache. Bounded waits and fresh
+  mode/generation checks apply; see [the architecture](ARCHITECTURE.md).
+  Queue 1338 normally returns `NF_ACCEPT` immediately; the first eligible
+  TCP SYN or datagram of a recently unseen flow may wait for an asynchronous
+  attribution attempt, bounded by 250 ms and 128 pending packets. Its reader
+  remains responsive with a 5 ms pending-work poll. Expiry, full backlog, or full
+  pending capacity does not make successful attribution a Learning allow
+  requirement. A pending verdict is accepted only under the engine lock while
+  the same Learning mode/generation remains active and shutdown has not started;
+  otherwise it is dropped. Serial/generation tickets reject stale completions.
+  Another bounded worker persists successful observations. Queue
+  1337 permits only a successful matching decision and conservatively drops an
+  unresolved deny candidate, except for a kernel-UID mismatch deferred to
+  best-effort observation. Attribution handles parsed TCP, UDP, ICMP echo, and
+  ICMPv6 echo traffic in batches of no more than 32 ready items and never
   waits to fill a batch. Every packet independently maps its kernel UID and
   network tuple to a socket inode through `SOCK_DIAG`. One bounded external
   PID/TID owner snapshot before identity capture and another after capture are
-  shared across the batch. One absolute 250 ms deadline covers the complete
-  operation, and each snapshot has one global cap of 131,072 owner records
+  shared across the batch, including single-item batches. One absolute deadline
+  covers the complete operation: 2 seconds for queue 1337 and 5 seconds for
+  asynchronous Learning attribution; every `SOCK_DIAG` query is additionally
+  capped at 250 ms within that deadline. Each snapshot has one global cap of 131,072 owner records
   across all targets. These bounds are not multiplied by packet count. Identity
   capture is memoized only inside the batch for the
   same inode, socket UID, and capture requirements. Requests sharing a socket
@@ -120,15 +151,20 @@ are broader than firewall administration alone.
   by TGID. When the UIDs match, the
   daemon's shared `/proc/<self>/fd` table is checked immediately before the
   external scan and again after that scan completes: two bounded checks per
-  completed owner scan replace per-self-thread fd scans. A target socket or
-  failed check produces DROP, and self task fd tables
+  completed owner scan replace per-self-thread fd scans. In Enforcing, a target
+  socket or failed check produces DROP in Enforcing, and self task fd tables
   are excluded from attribution. Within one external scan, a descriptor number
   found for one task is tried first on later matching-UID tasks. Only an exact
-  target link with a repeated UID check is accepted; a mismatch or read error
-  falls back to a complete bounded fd-table scan, and the hint is not retained
-  across batches. A changed before/after owner snapshot, the absence of a matching-UID holder, different matching TGIDs,
+  target link with a repeated UID check is accepted; all target inodes for that
+  UID must be confirmed to skip the complete fd walk. A missing target, mismatch,
+  or read error falls back to the bounded scan; verified preferred descriptors
+  make duplicate-fd selection stable. The hint is not retained across batches.
+  Full walks pin and rewind the fd directory and use safe `RawDir`/`readlinkat_raw`
+  with fixed reusable buffers. A truncated link cannot be a valid socket link;
+  read errors, disappearance checks, UID checks, and all work bounds retain their
+  fail-closed meaning. A changed before/after owner snapshot, the absence of a matching-UID holder, different matching TGIDs,
   an incomplete or unavailable live process/task scan, or candidate
-  descriptor-bound exhaustion produces DROP. Sibling holder TIDs in one TGID
+  descriptor-bound exhaustion fails attribution. Sibling holder TIDs in one TGID
   count as one process only if their captured executable path/file version, argv,
   filesystem-UID, and cgroup identities agree. The exact fd path found by the owner scan is not trusted as
   authorization: it is revalidated before identity capture, a vanished or moved
@@ -137,12 +173,16 @@ are broader than firewall administration alone.
   entry is skipped only after procfs confirms disappearance. `PermissionDenied`
   on a TGID-leader fd table is skipped only after two bounded `stat` reads
   confirm stable zombie state `Z`; every other error, non-zombie state, or
-  unconfirmed state produces DROP. Any remaining failure, ambiguity, configured
-  bound, or the shared 250 ms procfs deadline also produces
-  DROP. The policy generation is rechecked under the engine lock, which remains
+  unconfirmed state fails attribution. Any remaining failure, ambiguity, configured
+  bound, or the shared procfs deadline produces DROP in Enforcing and
+  for a Learning application-deny candidate; on queue 1338 it suppresses
+  persistence without changing Learning's ordinary allow policy, subject to
+  pending-verdict mode/generation checks. The
+  policy generation is rechecked under the engine lock, which remains
   held through the backend-specific verdict and packet reinjection. nftables
   returns `NF_ACCEPT` and completes authorization in a later base chain;
-  iptables returns `NF_REPEAT` with an authenticated `NFQA_MARK` handoff that
+  fail-closed queue 1337 on iptables returns `NF_REPEAT` with an authenticated
+  `NFQA_MARK` handoff that
   the first repeated OpenShield OUTPUT rule consumes. The verdict socket is
   nonblocking: terminal send failure requests emergency `BlockAll` instead of
   indefinitely holding the policy lock.
@@ -155,9 +195,13 @@ are broader than firewall administration alone.
   outbound cache: the low 31 bits are cleared before every original packet,
   the packet is re-attributed, and successful authorization refreshes those
   bits for the matching inbound reply.
-- A persisted application selector requires a canonical absolute executable path
-  and the full file-version tuple `(device, inode, size, ctime seconds, ctime
-  nanoseconds)`. For manual create/update, the daemon must resolve the path in
+- An enabled persisted application selector requires a canonical absolute
+  executable path and the full file-version tuple `(device, inode, size, ctime
+  seconds, ctime nanoseconds)`. An automatically learned disabled template is
+  the only unpinned persisted exception: it contains a path and optional cgroup
+  but no network, argv, UID, or file-version selector. Enabling it is root-only
+  and the daemon must resolve and pin the current executable before applying it.
+  For manual create/update, the daemon must resolve the path in
   its own mount namespace and compares repeated canonical-path and opened-file
   snapshots; it fills an omitted pin and rejects a stale supplied pin. Exact
   filesystem UID, exact unified-cgroup-v2 path, and tokenized exact or prefix
@@ -168,27 +212,47 @@ are broader than firewall administration alone.
   remains available, while an explicit cgroup-path selector cannot match. Older
   persisted two-field application pins are rejected rather than silently
   repinned; network-only state remains compatible.
-- Stateful reverse traffic is tied to the current generation of a live
-  application allow rule; an old conntrack entry alone is not an authorization
-  in enforcing mode. Unsolicited inbound traffic still requires an explicit
-  inbound allow.
-- Learned authorizations retain the observed application identity, protocol,
+- In Enforcing, stateful reverse traffic is tied to the current generation of a
+  live application accept rule; an old conntrack entry alone is not an
+  authorization. Learning permits conntrack replies to locally initiated
+  traffic admitted by its outbound default or rules. Unsolicited inbound service
+  traffic still requires an explicit inbound allow in both modes; the exact
+  DHCPv4/DHCPv6 bootstrap and essential IPv6 control forms are separate built-ins.
+- Native rejection replies receive one narrow exception from local
+  default-deny. Only an exact RELATED/REPLY TCP RST, IPv4 ICMP
+  destination-unreachable/port-unreachable, or IPv6 ICMPv6
+  destination-unreachable/port-unreachable is admitted, and only when its
+  OpenShield-owned low-31 connmark bits attest the current nonzero 30-bit
+  rejection generation with the accept-domain bit clear. A generation change
+  invalidates stale attestation; other RELATED traffic receives no exception.
+- Before a broader network accept, application envelopes also drop a matching
+  UNTRACKED current tuple that cannot enter attribution. Destination- or
+  port-constrained envelopes add a conntrack-original destination/port DROP,
+  while retaining the final output-interface constraint, to close a local-DNAT
+  bypass. This guard may conservatively deny a translated flow rather than
+  attribute a rule written for the pre-translation endpoint.
+- Learned endpoint authorizations use action `accept` and retain the observed application identity, protocol,
   endpoint, and outbound interface, so a VPN or link-local endpoint does not
   silently become allowed for another program or on every interface.
 - Application learning uses a separate bounded 512-item queue and persists no
-  more than 256 observations per batch. Automatic insertion stops when existing
-  learned counts reach 7,500 globally, 512 per filesystem UID, or 256 per pair
+  more than 256 automatic rules per batch. Automatic insertion stops when
+  learned endpoint rules plus templates reach 7,500 globally, or endpoint
+  rules reach 512 per filesystem UID or 256 per pair
   of filesystem UID and complete executable file version. These are admission
   budgets rather than validation invariants for legacy or root-edited state.
   Distinct subordinate UIDs count separately, so one operator-controlled UID
   range can distribute activity until the global budget. The 10,000 total-rule
   limit normally leaves 2,500 count slots for privileged manual rules; the exact
-  8 MiB encoded-state quota is independent. After mandatory procfs attribution,
+  8 MiB encoded-state quota is independent. After successful procfs attribution,
   a revision-checked immutable admission index classifies an exact-known,
   count-saturated, persistence-paused, or potential-new observation. Only the
   potential new candidate enters the 512-item queue; the other three retain the
-  current `Learning` allow without consuming queue capacity. A mode/generation,
-  poison, or cache-consistency mismatch fails closed, and the worker coalesces
+  current `Learning` allow without consuming queue capacity. A benign
+  admission-cache mismatch suppresses persistence without changing that allow;
+  a transition out of Learning denies the stale queued decision. A concurrent
+  Learning-to-Learning generation change retains the already-permissive Accept
+  verdict but may suppress the stale observation, while a poisoned or terminal
+  runtime enters emergency `BlockAll`. The worker coalesces
   exact duplicates in each bounded 256-observation drain. A count-saturated
   endpoint therefore has no persisted permit in Enforcing. Reaching
   the byte quota or a recoverable save failure discards that batch and pauses
@@ -201,19 +265,39 @@ are broader than firewall administration alone.
   `Conflict`. Root `BlockAll` instead installs the kernel deny immediately and
   is serialized last. Unsafe storage or base-state outcomes enter fail-closed
   quarantine rather than publishing an uncommitted candidate.
+- Rule activation and action are separate. A disabled rule is inert. In either
+  normal mode, enabled outbound rules may accept, silently drop, or actively
+  reject. `Learning` admits unmatched traffic and creates learned `Accept`
+  rules, but does not override enabled explicit denies.
+  Inbound rules are accept-only. Deny actions are evaluated before accepts so a broad accept
+  cannot override a matching deny. Enabling an automatically generated broad
+  application template therefore cannot override a matching drop/reject rule.
+  Disabling an unchanged Template restores its canonical unpinned skeleton and
+  every later enable securely repins the current file. An edited non-skeleton
+  Template and disabled Manual or Learned rules retain their complete
+  specification and file pin.
 - Every daemon start first installs kernel `BlockAll`. Missing state is persisted
   as `Learning`; an existing saved mode is preserved. The engine increments the
   persisted nonzero 30-bit flow generation by exactly one, persists the new
   value, and only then applies the requested policy. Generations are never
   reused before exhaustion, so TCP authorization marks from every earlier daemon
   process remain invalid. Exhaustion retains `BlockAll` and fails startup rather
-  than wrapping the counter.
+  than wrapping the counter. While bootstrap `BlockAll` remains active, the
+  first v0.2.1 start over v0.2.0 state adds missing disabled template skeletons
+  for existing Learned application groups. This additive migration respects the
+  automatic-rule, total-rule, and 8 MiB limits and never removes endpoint rules
+  when no room remains; migrated state is persisted before policy activation.
+- State and IPC compatibility is forward-only from v0.2.0 to v0.2.1. v0.2.1
+  accepts a missing rule `action` as `accept`; v0.2.0 cannot parse v0.2.1
+  `drop`/`reject` actions or the `template` origin. Mixed daemon/TUI versions and
+  an in-place downgrade after v0.2.1 has written state are outside the supported
+  boundary and require a protected-console rollback procedure.
 - Graceful daemon shutdown and every packaged post-stop hook install kernel
   `BlockAll` without overwriting the persisted requested mode. Forced
   termination, early boot, and initramfs paths remain deployment boundaries.
 - The packaged unit installs `BlockAll` before its main process and reports
-  systemd readiness only after the selected policy, fail-closed queue consumer,
-  and IPC endpoints are active. It requires tmpfiles setup to pre-create the
+  systemd readiness only after the selected policy, both fixed NFQUEUE
+  consumers, and IPC endpoints are active. It requires tmpfiles setup to pre-create the
   root-owned runtime/state directories and standard `0600` `/run/xtables.lock`,
   and grants write access to those exact paths rather than all of `/run` or
   `/var/lib`. Non-recursive relabeling preserves their policy-defined SELinux
@@ -251,6 +335,18 @@ are broader than firewall administration alone.
   The only automatic startup backend fallback is nftables to the complete
   iptables/ip6tables bundle when nftables cannot be validated.
 
+- Learning is intentionally permissive for outbound traffic. An untrusted local
+  process can reach arbitrary remote endpoints during a Learning window even if
+  attribution fails, the learning queue is saturated, or no rule can be stored.
+  Queue bypass is therefore expected in this mode. Operators must limit Learning
+  to a controlled interval, review generated rules/templates, and switch to
+  Enforcing before relying on outbound containment.
+- A generated disabled template contains only executable path and optional
+  cgroup. Once root enables it, the daemon pins the current executable version,
+  but the rule deliberately omits endpoint, port, interface, argv, and UID. It
+  grants substantially broader access than an exact learned endpoint and must
+  be reviewed like any other privileged wildcard rule.
+
 - The packaged `RequiredBy=network-pre.target` relationship is created by
   `systemctl enable`; merely installing the unit does not activate it. A network
   manager, unit, initramfs, or early packet path that bypasses
@@ -265,6 +361,22 @@ are broader than firewall administration alone.
   Authorization happens when a Unix connection is accepted; an authorized
   member can relay the already-connected socket fd to another process, so this
   group check is not a non-delegable confidentiality boundary.
+- At 64 or more external tasks across multiple TGIDs and two available CPUs, an
+  owner snapshot may scan fd tables with two workers. The complete PID/TID list
+  is enumerated first under the global task cap; whole TGIDs are distributed
+  greedily by task count. One positive-owner accumulator retains the global
+  record cap and cross-worker ambiguity checks. One absolute deadline covers
+  both workers, and every helper is joined before use of the sorted result.
+  Spawn/join errors and incomplete scans fail closed. This may increase
+  instantaneous CPU use; one large TGID and small process sets remain serial.
+- Learning is not a historical process/socket event collector. The first-packet
+  250 ms capture opportunity is a userspace deadline, not a hard real-time bound
+  under scheduler or policy-lock contention. It helps short-lived request/response clients, but a
+  one-way UDP sender can return from `sendto()` and exit before attribution.
+  Queuing the datagram does not pin its process identity. Such a missing rule
+  must not be filled from a stale PID or guessed identity; review the learned
+  rule set before Enforcing. Bounded duplicate suppression can also lose
+  observations under churn, without authorizing an Enforcing packet.
 - Procfs attribution is a bounded, repeated post-hoc consistency check, not an
   atomic kernel record of the process generation that initiated an operation.
   In particular, a process can enqueue a packet and then exec an allowed image
@@ -314,15 +426,16 @@ are broader than firewall administration alone.
   connection until reconnection or a policy-generation change. UDP/ICMP is
   re-attributed for every outbound packet, but neither path is kernel
   exec-lifecycle enforcement.
-- One bounded NFQUEUE consumer performs procfs work that is worst-case
+- The active mode-specific bounded NFQUEUE consumer performs procfs work that is worst-case
   proportional to process/task enumeration plus the descriptor tables of tasks
   whose filesystem UID matches the socket UID. One directory walk inspects at
   most 4,096 fd entries per matching-UID task and fails if proof requires a later
   entry. Since v0.1.32, a batch performs two owner snapshots, each admitting at most
-  131,072 owner records globally across all of its targets; its single 250 ms
-  deadline bounds both scans and every intervening lookup and capture.
+  131,072 owner records globally across all of its targets. A single 2-second
+  deadline bounds both scans and every intervening lookup and capture for queue
+  1337; asynchronous Learning uses 5 seconds, not a 5-second packet hold.
   Process/thread floods, a matching-UID fd flood, queue pressure, or the
-  250 ms deadline can therefore deny legitimate traffic. This is an
+  attribution deadline can therefore deny legitimate traffic in Enforcing. This is an
   availability/denial-of-service risk, not a fail-open path. An incomplete live
   process/task enumeration remains globally fail-closed; an oversized fd table
   affects attribution for traffic with its matching socket UID, while unrelated
@@ -336,7 +449,9 @@ are broader than firewall administration alone.
   to the complete bounded scan. These changes do not skip the fresh external
   PID/TID scan, introduce an authorization-result cache, or change the worst-case
   complexity. Sustained packet rates or hostile procfs cardinality can therefore
-  still saturate the consumer and deny legitimate traffic.
+  still saturate the active consumer. In Enforcing this denies legitimate
+  traffic; in Learning it loses observations while the declared outbound allow
+  remains in force.
   The micro-batch introduced in v0.1.32 amortizes those two snapshots across at most 32
   already-ready packets, but it deliberately retains per-packet `SOCK_DIAG`,
   permits identity reuse only inside the current batch, and requires stable
@@ -352,7 +467,10 @@ are broader than firewall administration alone.
   The Learning admission index prevents already-known, saturated, and paused
   observations from filling the persistence queue, but it runs only after the
   mandatory process attribution. A stream of new eligible candidates can still
-  fill that queue and fail closed, and every class can still consume procfs work.
+  fill the observation or persistence queue and consume procfs work. In
+  Learning this suppresses an observation while the packet remains allowed;
+  the same resource pressure in Enforcing remains a fail-closed availability
+  limit.
   The nonblocking verdict socket prevents a send stall from retaining the policy
   lock indefinitely, but sustained netlink send pressure can request emergency
   `BlockAll`; this is an intentional fail-closed availability tradeoff.
@@ -365,10 +483,21 @@ are broader than firewall administration alone.
   following `/proc/<pid>/root` and related procfs magic links may additionally
   reach a target process's mount view despite the service's mount hardening. The
   daemon therefore retains broader readable-procfs and filesystem access.
-- Application rules are allow rules, not deny overrides. A broader matching
-  network-only rule is evaluated before the application queue and can authorize
-  the same traffic without application identity. Operators must avoid such
-  overlap when application binding is intended to be mandatory.
+- Reply scheduling requires the nested network procfs queue-progress entry.
+  The unit therefore uses `ProcSubset=all` plus `ReadOnlyPaths=/proc`, retaining
+  `ProtectProc=invisible` and the other capability, syscall and kernel-tunable
+  restrictions. This exposes additional general procfs metadata compared with
+  `subset=pid`; it does not broaden packet authorization. Startup validates the
+  actual entry before activation. A missing/hidden/malformed entry cannot become
+  a successful readiness signal or a guessed reply grant.
+- Outbound application rules support `accept`, `drop`, and `reject`. Enabled
+  network-only deny rules run first; an overlapping application candidate is
+  then attributed before a broader network-only accept may be used as a
+  fallback. Within the application class, `drop` precedes `reject`, which
+  precedes `accept`. This deterministic order prevents a broad network allow
+  from bypassing an application deny, but operators must still review
+  overlapping rules because a network deny intentionally overrides an
+  application allow.
 - OpenShield reserves the upper two packet-mark bits and preserves the lower
   30. It reserves the low 31 conntrack-mark bits for application authorization
   and preserves bit 31. Other packet-mark users must avoid those upper two bits;
@@ -416,10 +545,13 @@ are broader than firewall administration alone.
   parsed as ordered, bounded JSON documents. This reduces process-launch cost
   but retains the same one-second cadence, validation coverage, and fail-closed
   repair behavior; it does not strengthen the trust boundary against root.
-- Strict inbound filtering can block required ICMPv6 neighbour/router discovery.
-  Version 0.1 has no ICMP type/code selector; operators must scope explicit
-  ICMPv6 allows by link-local network and interface where possible. Application
-  attribution supports only echo requests for ICMP/ICMPv6.
+- Normal modes include exact hop-limit/source-constrained IPv6 Router
+  Advertisement, Neighbor Solicitation/Advertisement, MLD query, and required
+  RELATED-error forms so basic IPv6 control traffic is not accidentally lost.
+  Other ICMPv6 needs still require an explicit network/interface-scoped inbound
+  allow, and the rule model has no ICMP type/code selector. `BlockAll` contains
+  no control-plane exception. Application attribution supports only echo
+  requests for ICMP/ICMPv6.
 - The `inet` table covers host IPv4/IPv6, not layer-2 ARP or direct frame
   injection by a privileged `AF_PACKET`/`CAP_NET_RAW` peer. OpenShield 0.1 is
   not an L2 firewall.
