@@ -2760,6 +2760,72 @@ mod tests {
     }
 
     #[test]
+    fn learning_pending_capture_does_not_block_other_flows_or_out_of_order_completion() -> Result<()>
+    {
+        let mut fixture = LearningQueueFixture::new(LEARNING_QUEUE_CAPACITY)?;
+        fixture.submit(1, learning_attribution_work(1, 0)?.packet)?;
+        let first = fixture.work.try_recv()?;
+        fixture.submit(2, learning_attribution_work(1, 1)?.packet)?;
+        let second = fixture.work.try_recv()?;
+        let before_deadline = fixture.pending.packets[&1]
+            .deadline
+            .checked_sub(Duration::from_nanos(1))
+            .ok_or_else(|| anyhow!("test deadline underflow"))?;
+
+        let mut established = learning_attribution_work(1, 2)?.packet;
+        established.initial_observation = false;
+        fixture.submit(3, established)?;
+        assert_eq!(fixture.queue.0, [(3, NF_ACCEPT)]);
+        assert_eq!(fixture.pending.packets.len(), 2);
+
+        // A slow first capture cannot delay a later capture's verdict.
+        complete_learning_capture(second.ticket, &fixture.completion_sender);
+        fixture.release(before_deadline)?;
+        assert_eq!(fixture.queue.0, [(3, NF_ACCEPT), (2, NF_ACCEPT)]);
+        assert!(fixture.pending.packets.contains_key(&1));
+        assert_eq!(fixture.pending.packets.len(), 1);
+
+        complete_learning_capture(first.ticket, &fixture.completion_sender);
+        fixture.release(before_deadline)?;
+        assert_eq!(
+            fixture.queue.0,
+            [(3, NF_ACCEPT), (2, NF_ACCEPT), (1, NF_ACCEPT)]
+        );
+        assert!(fixture.pending.packets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn learning_pending_deadlines_expire_together_without_serial_capture_waits() -> Result<()> {
+        let mut fixture = LearningQueueFixture::new(LEARNING_QUEUE_CAPACITY)?;
+        for id in 0..32 {
+            fixture.submit(id, learning_attribution_work(1, id)?.packet)?;
+        }
+        assert!(fixture.queue.0.is_empty());
+        assert_eq!(fixture.pending.packets.len(), 32);
+        let first_deadline = fixture.pending.packets[&0].deadline;
+        let last_deadline = fixture.pending.packets[&31].deadline;
+        fixture.release(
+            first_deadline
+                .checked_sub(Duration::from_nanos(1))
+                .ok_or_else(|| anyhow!("test deadline underflow"))?,
+        )?;
+        assert!(fixture.queue.0.is_empty());
+
+        // No worker completion is sent. All concurrently pending flows expire
+        // by the latest individual deadline, not 32 successive hold intervals.
+        fixture.release(last_deadline)?;
+        fixture.queue.0.sort_unstable();
+        assert_eq!(
+            fixture.queue.0,
+            (0..32).map(|id| (id, NF_ACCEPT)).collect::<Vec<_>>()
+        );
+        assert!(fixture.pending.packets.is_empty());
+        assert_eq!(fixture.pending.poll_millis(), RECEIVE_POLL_MILLIS);
+        Ok(())
+    }
+
+    #[test]
     fn learning_only_first_datagram_waits_and_repeated_observations_stay_async() -> Result<()> {
         let mut fixture = LearningQueueFixture::new(LEARNING_QUEUE_CAPACITY)?;
         let mut packet = learning_attribution_work(1, 0)?.packet;

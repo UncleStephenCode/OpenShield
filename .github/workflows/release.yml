@@ -278,7 +278,12 @@ jobs:
                 tests/perf/test_metrics.py \
                 tests/perf/workloads/test_workloads.py \
                 tests/e2e/test_continuous_attribution.py \
-                tests/e2e/test_tcp_session.py
+                tests/e2e/test_tcp_session.py \
+                tests/e2e/test_learning_sockets.py \
+                tests/e2e/test_ipc_client.py \
+                tests/e2e/test_downstream_counters.py \
+                tests/e2e/test_udp_client.py \
+                tests/e2e/test_zypper_refresh.py
               scripts/check-target-matrix.sh validate
               scripts/test-init-matrix.sh validate
             '

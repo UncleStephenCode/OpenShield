@@ -2,7 +2,7 @@
 
 # OpenShield
 
-Current source release: **v0.2.2**.
+Current source release: **v0.2.3**.
 
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
@@ -447,7 +447,7 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. Under the current v0.2.2 CI policy, relative DUT-cgroup CPU
+confidence bound. Under the current v0.2.3 CI policy, relative DUT-cgroup CPU
 and request/connect-latency crossings are explicitly advisory;
 relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
 p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
@@ -458,7 +458,7 @@ explicit action. The
 retained full v0.1.31 run was structurally valid but failed its performance
 gate. The retained full local v0.1.32 run passed its authenticated performance
 gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
-and report and is not silently promoted to v0.2.2.
+and report and is not silently promoted to v0.2.3.
 
 ## Installation and init systems
 
@@ -747,6 +747,64 @@ results until the corresponding workflow has completed. They run in disposable
 namespaces on a Unix-socket Docker engine. OpenShield applies rules only inside
 those namespaces; Docker itself manages host bridge/NAT rules. These checks are
 not production or native-hardware certification.
+
+The Learning pressure check separates 24 sequential NEW TCP/UDP flows from
+the concurrent phase: the permitted 250 ms first-packet capture window is not
+queue head-of-line blocking. Each NEW flow has a one-second end-to-end limit.
+The concurrent phase retains its strict six-second deadline, runs 192 NEW-flow
+jobs with up to 64 active NEW sockets, and checks repeated exchanges on warmed
+TCP/UDP probes. A nonblocking selector drives the burst without creating a
+Python thread for each active connection. Opening each NEW socket, connecting,
+and validating all its replies remain inside that flow's absolute one-second
+budget; all concurrent NEW traffic remains inside the six-second phase. The
+TCP peer also uses bounded nonblocking I/O, and the UDP peer handles its small
+replies without creating a thread for every datagram. Payload errors, per-flow
+timeouts, and concurrent deadline failures
+remain fatal. The check also requires a bound Learning queue 1338 and an
+unchanged terminal queue-error counter before the policy generation rotates.
+The shared IPC helper supports Python 3.9 in EL9 images. One-shot status
+exchanges have a five-second absolute deadline; rule pagination retains a
+five-second timeout per socket operation. A control command has a separate
+30-second absolute completion deadline because its acknowledgement follows
+kernel-policy verification and durable persistence. Each command is sent once
+on its original socket and must receive an actual acknowledgement. A timeout
+does not trigger a retry or allow a later status to substitute for the response.
+These test-client budgets do not change daemon or packet-processing deadlines.
+
+The default UDP rule client supervises the distribution's real `nc`/Ncat process
+with unchanged arguments; Python does not own its network socket. Its stdin stays
+open while the process starts and receives the exact echo, within one absolute
+two-second budget measured before process creation. After a timely reply, the
+socket owner remains alive for a separate second for Learning attribution;
+this does not extend the response deadline. Early EOF, missing/corrupt/trailing
+output and late responses fail. Child cleanup is bounded, including SIGTERM sent
+to the supervisor. A shell producer's one-second sleep is not used as a network
+timeout: it starts before the network client and can close its input before a
+timely echo arrives.
+
+The downstream-firewall check uses the same learned executable and arguments
+for successful and blocked requests. Fresh, uniquely identified DROP counters
+must record both a new TCP handshake SYN and a UDP datagram at the tested
+endpoints. A generic TCP counter is not sufficient: it may count a closing
+packet from an earlier connection. Missing or ambiguous counters, an earlier
+OpenShield denial, or failure to recover after removing the DROP rules cannot
+count as successful downstream precedence.
+
+openSUSE E2E provisioning uses HTTPS for the official OSS repository. A failed
+refresh can retry against the alternate official `cdn.opensuse.org` or
+`download.opensuse.org` origin, with fresh metadata and at most three attempts.
+TLS and repository signature checks remain enabled; exhausted retries fail
+the test instead of skipping package installation.
+
+Local coverage also depends on Docker's firewall backend. Docker can create
+legacy-iptables NAT rules for embedded DNS inside a private bridge namespace.
+If an image supplies only nft-based xtables tools, OpenShield cannot inspect
+that alternate legacy world and may safely select the iptables fallback. The
+nftables-preference E2E then fails; it is not counted as a successful nftables
+run. Keep the inspection guard and private namespace isolation: use a separate
+test engine with compatible firewall tooling for the remaining coverage, not
+a change to the production host firewall. See
+[Docker's DNS firewall rules](https://docs.docker.com/engine/network/firewall-iptables/).
 
 ## TUI localization
 

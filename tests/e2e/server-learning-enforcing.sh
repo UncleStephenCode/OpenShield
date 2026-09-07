@@ -151,30 +151,8 @@ begin_stage() {
 refresh_zypper_repository() {
     container=$1
     repository=$2
-    attempt=1
-    maximum_attempts=3
-    while :; do
-        if docker exec "$container" zypper --non-interactive refresh "$repository"; then
-            return 0
-        else
-            refresh_status=$?
-        fi
-        if [ "$refresh_status" -ne 4 ]; then
-            printf 'zypper refresh for %s failed with non-retryable status %s\n' \
-                "$repository" "$refresh_status" >&2
-            return "$refresh_status"
-        fi
-        if [ "$attempt" -ge "$maximum_attempts" ]; then
-            printf 'zypper refresh for %s failed after %s attempts (status %s)\n' \
-                "$repository" "$attempt" "$refresh_status" >&2
-            return "$refresh_status"
-        fi
-        retry_delay=$((attempt * 5))
-        printf 'zypper refresh for %s failed (status %s); retrying in %s seconds\n' \
-            "$repository" "$refresh_status" "$retry_delay" >&2
-        sleep "$retry_delay"
-        attempt=$((attempt + 1))
-    done
+    docker exec -i "$container" sh -s -- "$repository" \
+        < "$script_directory/zypper-refresh.sh"
 }
 
 wait_for_marker() {
@@ -403,14 +381,19 @@ cleanup() {
                  uname -a 2>/dev/null || true
                  cat /tmp/openshield.exit-status /var/lib/openshield/state.json 2>/dev/null || true
                  printf "%s\n" "--- daemon logs ---"
-                 cat /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
+                 cat /tmp/openshield-preflight.log /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
                  printf "%s\n" "--- TCP session ---"
                  cat /tmp/openshield-l2-client.log /tmp/openshield-l2-client.status 2>/dev/null || true
                  printf "%s\n" "--- application queue status ---"
                  cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null || true
                  python3 /opt/ipc_client.py status 2>&1 || true
                  printf "%s\n" "--- nftables OpenShield table ---"
+                 nft --version 2>&1 || true
                  nft -nn list table inet openshield 2>&1 || true
+                 for registry in /proc/net/ip_tables_names /proc/net/ip6_tables_names; do
+                     printf "%s\n" "--- $registry ---"
+                     cat "$registry" 2>/dev/null || true
+                 done
                  for save in \
                      /usr/sbin/iptables-legacy-save /usr/sbin/ip6tables-legacy-save \
                      /usr/sbin/iptables-nft-save /usr/sbin/ip6tables-nft-save; do
@@ -455,8 +438,10 @@ if [ -n "$native_client_source" ]; then
         --env PYTHONDONTWRITEBYTECODE=1 \
         --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$script_directory/downstream-counters.py,dst=/opt/downstream-counters.py,readonly" \
         --mount "type=bind,src=$script_directory/learning-sockets.py,dst=/opt/learning-sockets.py,readonly" \
         --mount "type=bind,src=$script_directory/tcp-session.py,dst=/opt/tcp-session.py,readonly" \
+        --mount "type=bind,src=$script_directory/udp-client.py,dst=/opt/udp-client.py,readonly" \
         --mount "type=bind,src=$native_client_source,dst=/opt/openshield-e2e-client,readonly" \
         "$client_image" sleep infinity)
 else
@@ -467,8 +452,10 @@ else
         --env PYTHONDONTWRITEBYTECODE=1 \
         --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$script_directory/downstream-counters.py,dst=/opt/downstream-counters.py,readonly" \
         --mount "type=bind,src=$script_directory/learning-sockets.py,dst=/opt/learning-sockets.py,readonly" \
         --mount "type=bind,src=$script_directory/tcp-session.py,dst=/opt/tcp-session.py,readonly" \
+        --mount "type=bind,src=$script_directory/udp-client.py,dst=/opt/udp-client.py,readonly" \
         "$client_image" sleep infinity)
 fi
 docker start "$client_id" >/dev/null
@@ -934,9 +921,11 @@ wait_for_marker "$server" /tmp/openshield-learning-sockets-18086-18087.ready \
     'Learning burst TCP/UDP server'
 # A same-UID process with many shared descriptors and threads makes bounded
 # procfs attribution deliberately expensive without touching the host. The
-# Learning packet consumer must return ACCEPT before that asynchronous work;
-# the previous synchronous design accumulates per-batch deadlines and violates
-# this real-socket burst's bound.
+# first packet of each unseen flow may wait up to 250 ms for identity capture.
+# Check serial NEW flows separately; 24 legitimate serial holds alone can use
+# the old six-second total budget. Keep the strict six-second limit for the
+# concurrent NEW load and repeated exchanges on already-seen TCP/UDP probes,
+# which must not wait behind other flows' asynchronous attribution work.
 docker exec --detach "$client" /bin/sh -c '
     status_file=/tmp/openshield-procfs-pressure.status
     python3 /opt/learning-sockets.py procfs-pressure \
@@ -954,9 +943,17 @@ procfs_pressure_pid=$(docker exec "$client" cat /tmp/openshield-procfs-pressure.
 case "$procfs_pressure_pid" in
     ''|*[!0-9]*) printf '%s\n' 'invalid procfs-pressure pid' >&2; exit 1 ;;
 esac
+learning_burst_terminal_errors=$(docker exec "$client" python3 /opt/ipc_client.py \
+    learning-queue-health)
 burst_passed=true
 if ! docker exec "$client" python3 /opt/learning-sockets.py burst \
     "$server_ip" 18086 18087; then
+    burst_passed=false
+fi
+# Learning observation queue 1338 uses bypass on reader loss. Successful sockets alone
+# therefore cannot establish that the observation reader survived the burst.
+if ! docker exec "$client" python3 /opt/ipc_client.py learning-queue-health \
+    --expected-terminal-errors "$learning_burst_terminal_errors" >/dev/null; then
     burst_passed=false
 fi
 docker exec "$client" /bin/sh -c 'kill -TERM "$1"' \
@@ -965,7 +962,7 @@ wait_for_marker "$client" /tmp/openshield-procfs-pressure.status \
     'bounded procfs-pressure fixture exit'
 [ "$burst_passed" = true ] || {
     docker exec "$client" cat /tmp/openshield-procfs-pressure.log >&2 || true
-    printf '%s\n' 'Learning burst was delayed or dropped by asynchronous attribution' >&2
+    printf '%s\n' 'Learning burst failed or its observation queue stopped' >&2
     exit 1
 }
 # Invalidate any deliberately saturated observation backlog before testing a
@@ -1069,19 +1066,12 @@ run_udp_client() {
         docker exec "$client" "$udp_executable" udp \
             "$server_ip" 18082 19000 2000 "$udp_payload"
     else
-        docker exec "$client" /bin/sh -c '
-            payload=$1
-            executable=$2
-            source_port=$3
-            server_address=$4
-            server_port=$5
-            # Keep stdin open briefly after the datagram is written.  Nmap
-            # Ncat otherwise exits on EOF before the daemon can attribute the
-            # short-lived UDP socket and before the echo reply is received.
-            { printf "%s" "$payload"; sleep 1; } \
-                | "$executable" -u -w 2 -p "$source_port" "$server_address" "$server_port"
-        ' openshield-udp-client \
-            "$udp_payload" "$udp_executable" 19000 "$server_ip" 18082
+        # Keep the real nc socket owner alive through exact echo validation
+        # and the separate attribution hold; startup must not race stdin EOF.
+        docker exec "$client" python3 /opt/udp-client.py \
+            --executable "$udp_executable" --peer "$server_ip" \
+            --source-port 19000 --payload "$udp_payload" \
+            --timeout-ms 2000 --hold-ms 1000
     fi
 }
 
@@ -1281,16 +1271,18 @@ docker exec "$client" python3 /opt/ipc_client.py set-named-rule-enabled \
 
 # An OpenShield allow must not bypass a later DROP owned by another firewall.
 begin_stage 'verify downstream firewall DROP precedence'
+# Prove that these exact commands are allowed under the final policy before
+# introducing downstream rules. Their identities must not change for negatives.
+run_tcp_client 5 >/dev/null
+udp_reply=$(run_udp_client)
+[ "$udp_reply" = "$udp_payload" ] || {
+    printf '%s\n' 'UDP echo failed before downstream DROP installation' >&2
+    exit 1
+}
 if [ "$backend" = iptables ]; then
     # Each policy mutation replaces the owned chains and resets their
     # counters. Exercise both application paths under the final policy before
     # asserting that NF_REPEAT reached the authorization chains.
-    run_tcp_client 5 >/dev/null
-    udp_reply=$(run_udp_client)
-    [ "$udp_reply" = "$udp_payload" ] || {
-        printf '%s\n' 'UDP echo failed before NF_REPEAT counter inspection' >&2
-        exit 1
-    }
     if docker exec "$client" /usr/sbin/iptables-legacy-save -t filter 2>/dev/null \
         | grep -Fq -- '-A OUTPUT -j OPENSHIELD_OUT'; then
         iptables_command=/usr/sbin/iptables-legacy
@@ -1322,20 +1314,37 @@ if [ "$backend" = iptables ]; then
         printf '%s\n' 'NF_REPEAT did not reach the post-queue UDP authorization chain' >&2
         exit 1
     }
-    docker exec "$client" "$iptables_command" --wait 5 -A OUTPUT -p tcp -d "$server_ip" \
-        --dport 18081 -m comment --comment openshield-e2e-downstream -j DROP
-    docker exec "$client" "$iptables_command" --wait 5 -A OUTPUT -p udp -d "$server_ip" \
-        --dport 18082 -m comment --comment openshield-e2e-downstream -j DROP
+    docker exec "$client" "$iptables_command" --wait 5 -N OPENSHIELD_E2E_DOWNSTREAM
+    docker exec "$client" "$iptables_command" --wait 5 -A OUTPUT -j OPENSHIELD_E2E_DOWNSTREAM
+    # Only the fresh SYN counter proves the new TCP probe reached downstream;
+    # a late FIN from the preceding successful connection must not count.
+    docker exec "$client" "$iptables_command" --wait 5 -A OPENSHIELD_E2E_DOWNSTREAM \
+        -s "$client_ip/32" -d "$server_ip/32" -p tcp --dport 18081 --syn \
+        -m comment --comment openshield-e2e-downstream-syn -j DROP
+    docker exec "$client" "$iptables_command" --wait 5 -A OPENSHIELD_E2E_DOWNSTREAM \
+        -s "$client_ip/32" -d "$server_ip/32" -p tcp --dport 18081 \
+        -m comment --comment openshield-e2e-downstream-tcp -j DROP
+    docker exec "$client" "$iptables_command" --wait 5 -A OPENSHIELD_E2E_DOWNSTREAM \
+        -s "$client_ip/32" -d "$server_ip/32" -p udp --dport 18082 \
+        -m comment --comment openshield-e2e-downstream-udp -j DROP
 else
     docker exec "$client" nft add table inet openshield_e2e_downstream
     docker exec "$client" nft add chain inet openshield_e2e_downstream output \
         '{ type filter hook output priority 10; policy accept; }'
     docker exec "$client" nft add rule inet openshield_e2e_downstream output \
-        ip daddr "$server_ip" tcp dport 18081 drop
+        ip saddr "$client_ip/32" ip daddr "$server_ip/32" tcp dport 18081 \
+        tcp flags '&' '(fin|syn|rst|ack)' '==' syn counter drop \
+        comment '"openshield-e2e-downstream-syn"'
     docker exec "$client" nft add rule inet openshield_e2e_downstream output \
-        ip daddr "$server_ip" udp dport 18082 drop
+        ip saddr "$client_ip/32" ip daddr "$server_ip/32" tcp dport 18081 counter drop \
+        comment '"openshield-e2e-downstream-tcp"'
+    docker exec "$client" nft add rule inet openshield_e2e_downstream output \
+        ip saddr "$client_ip/32" ip daddr "$server_ip/32" udp dport 18082 counter drop \
+        comment '"openshield-e2e-downstream-udp"'
 fi
-if run_tcp_client 2 >/dev/null 2>&1; then
+# Keep the learned 5000-ms argument byte-for-byte: a 2000-ms argument would be
+# rejected by OpenShield's exact application selector before reaching DROP.
+if run_tcp_client 5 >/dev/null 2>&1; then
     printf '%s\n' 'an OpenShield allow bypassed a downstream firewall DROP' >&2
     exit 1
 fi
@@ -1345,11 +1354,16 @@ if [ "$udp_reply" = "$udp_payload" ]; then
     exit 1
 fi
 if [ "$backend" = iptables ]; then
-    docker exec "$client" "$iptables_command" --wait 5 -D OUTPUT -p tcp -d "$server_ip" \
-        --dport 18081 -m comment --comment openshield-e2e-downstream -j DROP
-    docker exec "$client" "$iptables_command" --wait 5 -D OUTPUT -p udp -d "$server_ip" \
-        --dport 18082 -m comment --comment openshield-e2e-downstream -j DROP
+    docker exec "$client" "$iptables_save" -c -t filter \
+        | docker exec -i "$client" python3 /opt/downstream-counters.py \
+            iptables "$client_ip" "$server_ip"
+    docker exec "$client" "$iptables_command" --wait 5 -D OUTPUT -j OPENSHIELD_E2E_DOWNSTREAM
+    docker exec "$client" "$iptables_command" --wait 5 -F OPENSHIELD_E2E_DOWNSTREAM
+    docker exec "$client" "$iptables_command" --wait 5 -X OPENSHIELD_E2E_DOWNSTREAM
 else
+    docker exec "$client" nft -j list chain inet openshield_e2e_downstream output \
+        | docker exec -i "$client" python3 /opt/downstream-counters.py \
+            nftables "$client_ip" "$server_ip"
     docker exec "$client" nft delete table inet openshield_e2e_downstream
 fi
 run_tcp_client 5
