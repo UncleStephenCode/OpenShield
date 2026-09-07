@@ -391,7 +391,7 @@ fn handle_observe_client(
         };
 
         match request {
-            request @ (ReadRequest::Status | ReadRequest::StatusV2) => {
+            request @ (ReadRequest::Status | ReadRequest::StatusV2 | ReadRequest::StatusV3) => {
                 if pages_started || status_requests >= 2 {
                     write_error(
                         &mut stream,
@@ -402,7 +402,9 @@ fn handle_observe_client(
                 }
                 status_requests += 1;
                 let response = lock_engine(engine).map_or_else(Response::Error, |engine| {
-                    if matches!(request, ReadRequest::StatusV2) {
+                    if matches!(request, ReadRequest::StatusV3) {
+                        engine.status_v3_response()
+                    } else if matches!(request, ReadRequest::StatusV2) {
                         engine.status_v2_response()
                     } else {
                         engine.status_response()
@@ -1432,80 +1434,95 @@ mod tests {
 
     #[test]
     fn observation_session_reuses_one_connection_and_rejects_request_floods() -> Result<()> {
-        let temporary = tempdir()?;
-        let store = AtomicStateStore::for_owner(
-            temporary.path().join("persistent-observer.json"),
-            geteuid().as_raw(),
-        );
-        let events = EventBus::new();
-        let engine = Arc::new(Mutex::new(Engine::load(
-            Box::new(MemoryBackend::default()),
-            Box::new(store),
-            events.clone(),
-        )?));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let admission = ObserverAdmission::production();
-        let permit = admission
-            .try_acquire_at(1_000, Instant::now())
-            .ok_or_else(|| anyhow!("observer admission unexpectedly denied"))?;
-        let (server_stream, mut client_stream) = UnixStream::pair()?;
-        let server_engine = Arc::clone(&engine);
-        let server_events = events.clone();
-        let server_shutdown = Arc::clone(&shutdown);
-        let server = thread::spawn(move || {
-            handle_observe_client(
-                server_stream,
-                &server_engine,
-                &server_events,
-                &server_shutdown,
-                &permit,
-            )
-        });
+        for status_request in [
+            ReadRequest::Status,
+            ReadRequest::StatusV2,
+            ReadRequest::StatusV3,
+        ] {
+            let temporary = tempdir()?;
+            let store = AtomicStateStore::for_owner(
+                temporary.path().join("persistent-observer.json"),
+                geteuid().as_raw(),
+            );
+            let events = EventBus::new();
+            let engine = Arc::new(Mutex::new(Engine::load(
+                Box::new(MemoryBackend::default()),
+                Box::new(store),
+                events.clone(),
+            )?));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let admission = ObserverAdmission::production();
+            let permit = admission
+                .try_acquire_at(1_000, Instant::now())
+                .ok_or_else(|| anyhow!("observer admission unexpectedly denied"))?;
+            let (server_stream, mut client_stream) = UnixStream::pair()?;
+            let server_engine = Arc::clone(&engine);
+            let server_events = events.clone();
+            let server_shutdown = Arc::clone(&shutdown);
+            let server = thread::spawn(move || {
+                handle_observe_client(
+                    server_stream,
+                    &server_engine,
+                    &server_events,
+                    &server_shutdown,
+                    &permit,
+                )
+            });
 
-        write_request(&mut client_stream, &Request::Read(ReadRequest::Status))?;
-        assert!(matches!(
-            read_response(&mut client_stream)?,
-            Response::Status { rule_count: 0, .. }
-        ));
-        write_request(&mut client_stream, &Request::Read(ReadRequest::StatusV2))?;
-        assert!(matches!(
-            read_response(&mut client_stream)?,
-            Response::StatusV2 {
-                rule_count: 0,
-                runtime_compatibility,
-                ..
-            } if runtime_compatibility == openshield_protocol::RuntimeCompatibility::default()
-        ));
-        write_request(
-            &mut client_stream,
-            &Request::Read(ReadRequest::RulesPage {
-                after: None,
-                limit: MAX_RULES_PER_PAGE,
-            }),
-        )?;
-        assert!(matches!(
-            read_response(&mut client_stream)?,
-            Response::RulesPage {
-                rules,
-                next_after: None,
-                ..
-            } if rules.is_empty()
-        ));
+            write_request(&mut client_stream, &Request::Read(ReadRequest::Status))?;
+            assert!(matches!(
+                read_response(&mut client_stream)?,
+                Response::Status { rule_count: 0, .. }
+            ));
+            write_request(&mut client_stream, &Request::Read(status_request.clone()))?;
+            let response = read_response(&mut client_stream)?;
+            match (&status_request, &response) {
+                (ReadRequest::Status, Response::Status { .. })
+                | (ReadRequest::StatusV2, Response::StatusV2 { .. }) => {}
+                (ReadRequest::StatusV3, Response::StatusV3 { learning, .. }) => {
+                    assert_eq!(learning.automatic_rules, 0);
+                    assert_eq!(learning.quota_skipped_observations, 0);
+                    assert!(learning.per_uid_limit > 512);
+                }
+                _ => return Err(anyhow!("status response version mismatch")),
+            }
+            assert!(matches!(
+                response,
+                Response::Status { rule_count: 0, .. }
+                    | Response::StatusV2 { rule_count: 0, .. }
+                    | Response::StatusV3 { rule_count: 0, .. }
+            ));
+            write_request(
+                &mut client_stream,
+                &Request::Read(ReadRequest::RulesPage {
+                    after: None,
+                    limit: MAX_RULES_PER_PAGE,
+                }),
+            )?;
+            assert!(matches!(
+                read_response(&mut client_stream)?,
+                Response::RulesPage {
+                    rules,
+                    next_after: None,
+                    ..
+                } if rules.is_empty()
+            ));
 
-        // A status flood after pagination violates the bounded session FSM.
-        write_request(&mut client_stream, &Request::Read(ReadRequest::Status))?;
-        assert!(matches!(
-            read_response(&mut client_stream)?,
-            Response::Error(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                ..
-            })
-        ));
-        let _ignored = client_stream.shutdown(Shutdown::Both);
-        server
-            .join()
-            .map_err(|_| anyhow!("observation session thread panicked"))??;
-        assert_eq!(admission.active(), 0);
+            // A status flood after pagination violates the bounded session FSM.
+            write_request(&mut client_stream, &Request::Read(ReadRequest::StatusV3))?;
+            assert!(matches!(
+                read_response(&mut client_stream)?,
+                Response::Error(ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                })
+            ));
+            let _ignored = client_stream.shutdown(Shutdown::Both);
+            server
+                .join()
+                .map_err(|_| anyhow!("observation session thread panicked"))??;
+            assert_eq!(admission.active(), 0);
+        }
         Ok(())
     }
 

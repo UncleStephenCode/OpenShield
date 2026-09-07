@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Ӏаморан дозанаш: UID {uid}; программа {application}; автоматан {automatic}; дерриге {total}",
+  "learning.counts": "Автоматан бакъонаш: {rules}; дозанга кхачна UID/программазаш: {uids}/{applications}",
+  "learning.skipped": "Демон болабеллачул тӀаьхьа квотан бахьанехь дӀатесна зийр: {skipped}",
+  "learning.unknown": "Ӏаморан квоташ: хаамаш бац я хьал жимма кхуьйсуш ду",
+  "learning.warning": "Ӏамор дуккха кхочуш ца хила тарло: дозанга кхачна я зийр дӀатесна. Enforcing чуьхьал бакъонаш талла.",
   "group.title": " Тобан гӀуллакхаш ",
   "group.scope": "Тоба: {group}\nБакъонаш: {count}",
   "group.delete": "ДӀадаккха",

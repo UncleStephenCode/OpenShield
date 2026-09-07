@@ -165,6 +165,7 @@ fn draw_status(
             Style::default().fg(Color::Green),
         )));
     }
+    lines.extend(learning_status_lines(app));
     // The compact 80x24 layout keeps the attested backend, mode, level and
     // reason ahead of all optional detail. The explanatory scope is omitted
     // there because it can wrap to several rows in translated interfaces.
@@ -882,12 +883,52 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+fn learning_status_lines(app: &App) -> Vec<Line<'_>> {
+    let i18n = &app.i18n;
+    let Some(learning) = app.learning_status else {
+        return vec![Line::from(Span::styled(
+            i18n.tr("learning.unknown"),
+            Style::default().fg(Color::DarkGray),
+        ))];
+    };
+    let mut lines = vec![
+        Line::from(i18n.format(
+            "learning.limits",
+            &[
+                ("uid", &learning.per_uid_limit.to_string()),
+                ("application", &learning.per_application_limit.to_string()),
+                ("automatic", &learning.automatic_rule_limit.to_string()),
+                ("total", &learning.total_rule_limit.to_string()),
+            ],
+        )),
+        Line::from(i18n.format(
+            "learning.counts",
+            &[
+                ("rules", &learning.automatic_rules.to_string()),
+                ("uids", &learning.saturated_uids.to_string()),
+                ("applications", &learning.saturated_applications.to_string()),
+            ],
+        )),
+        Line::from(i18n.format(
+            "learning.skipped",
+            &[("skipped", &learning.quota_skipped_observations.to_string())],
+        )),
+    ];
+    if app.learning_needs_attention() {
+        lines.push(Line::from(Span::styled(
+            i18n.tr("learning.warning"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines
+}
+
 fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let i18n = &app.i18n;
     match &app.overlay {
         Overlay::None => {}
         Overlay::ModePicker { selected } => {
-            let area = centered_rect(54, 11, frame.area());
+            let area = centered_rect(76, 15, frame.area());
             frame.render_widget(Clear, area);
             let modes = [Mode::BlockAll, Mode::Learning, Mode::Enforcing];
             let lines = modes.into_iter().enumerate().map(|(index, mode)| {
@@ -901,7 +942,17 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
                     style,
                 ))
             });
-            let text = Text::from(lines.collect::<Vec<_>>());
+            let mut lines = lines.collect::<Vec<_>>();
+            // Keep this visible even before selecting Enforcing: numeric
+            // shortcuts may submit the mode directly. This never blocks root.
+            if app.learning_needs_attention() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    i18n.tr("learning.warning"),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            let text = Text::from(lines);
             frame.render_widget(
                 Paragraph::new(text)
                     .block(
@@ -1600,6 +1651,64 @@ mod tests {
 
     use super::*;
     use crate::i18n::Locale;
+
+    #[test]
+    fn learning_quota_status_is_translated_and_warning_visible_in_mode_picker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for &locale in Locale::SUPPORTED {
+            let mut app = App::new(false, I18n::load(locale)?);
+            assert_eq!(
+                learning_status_lines(&app)[0].to_string(),
+                app.i18n.tr("learning.unknown")
+            );
+            app.learning_status = Some(openshield_protocol::LearningStatus {
+                per_uid_limit: 2_048,
+                per_application_limit: 1_024,
+                automatic_rule_limit: 4_000,
+                total_rule_limit: 4_096,
+                automatic_rules: 512,
+                saturated_uids: 1,
+                saturated_applications: 0,
+                quota_skipped_observations: 19,
+            });
+            let lines = learning_status_lines(&app);
+            assert_eq!(lines.len(), 4);
+            assert!(lines[0].to_string().contains("2048"));
+            assert!(lines[0].to_string().contains("1024"));
+            assert!(lines[0].to_string().contains("4000"));
+            assert!(lines[0].to_string().contains("4096"));
+            assert!(lines[1].to_string().contains("512"));
+            assert!(lines[1].to_string().contains("1/0"));
+            assert!(lines[2].to_string().contains("19"));
+            assert_eq!(lines[3].to_string(), app.i18n.tr("learning.warning"));
+            for line in &lines {
+                assert!(!line.to_string().contains('{'));
+            }
+
+            {
+                app.overlay = Overlay::ModePicker {
+                    selected: Mode::Learning,
+                };
+                let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+                terminal.draw(|frame| draw_overlay(frame, &app))?;
+                let compact = |text: &str| {
+                    text.chars()
+                        .filter(|character| {
+                            !character.is_whitespace()
+                                && !matches!(character, '│' | '─' | '┌' | '┐' | '└' | '┘')
+                        })
+                        .collect::<String>()
+                };
+                let screen = buffer_text(terminal.backend());
+                assert!(
+                    compact(&screen).contains(&compact(app.i18n.tr("learning.warning"))),
+                    "missing {} warning: {screen}",
+                    locale.code()
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn counter_columns_align_in_every_locale() -> Result<(), Box<dyn std::error::Error>> {

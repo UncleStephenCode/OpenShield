@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Ліміты навучання: UID {uid}; праграма {application}; аўтаматычныя {automatic}; усяго {total}",
+  "learning.counts": "Аўтаматычных правіл: {rules}; UID/праграм на ліміце: {uids}/{applications}",
+  "learning.skipped": "Назіранняў, прапушчаных праз квоты з запуску дэмана: {skipped}",
+  "learning.unknown": "Квоты навучання: даныя недаступныя або яшчэ не атрыманыя",
+  "learning.warning": "Навучанне можа быць няпоўным: дасягнуты ліміт або прапушчаны назіранні. Праверце правілы перад уключэннем Enforcing.",
   "group.title": " Дзеянні з групай ",
   "group.scope": "Група: {group}\nПравілы: {count}",
   "group.delete": "Выдаліць",

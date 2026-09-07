@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Үйрену шектері: UID {uid}; қолданба {application}; автоматты {automatic}; барлығы {total}",
+  "learning.counts": "Автоматты ережелер: {rules}; шекке жеткен UID/қолданбалар: {uids}/{applications}",
+  "learning.skipped": "Демон іске қосылғаннан бері квотаға байланысты өткізілген бақылаулар: {skipped}",
+  "learning.unknown": "Үйрену квоталары: деректер қолжетімсіз немесе күй күтілуде",
+  "learning.warning": "Үйрену толық болмауы мүмкін: шекке жетті немесе бақылаулар өткізілді. Enforcing алдында ережелерді тексеріңіз.",
   "group.title": " Топ әрекеттері ",
   "group.scope": "Топ: {group}\nЕрежелер: {count}",
   "group.delete": "Жою",

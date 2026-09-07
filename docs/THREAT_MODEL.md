@@ -237,8 +237,10 @@ are broader than firewall administration alone.
 - Application learning uses a separate bounded 512-item queue and persists no
   more than 256 automatic rules per batch. Automatic insertion stops when
   learned endpoint rules plus templates reach 7,500 globally, or endpoint
-  rules reach 512 per filesystem UID or 256 per pair
-  of filesystem UID and complete executable file version. These are admission
+  rules reach the configured quotas: by default 4,096 per filesystem UID or
+  1,024 per pair of filesystem UID and complete executable file version.
+  Disabled learned rules count, and older file versions still count toward the
+  UID quota. These are admission
   budgets rather than validation invariants for legacy or root-edited state.
   Distinct subordinate UIDs count separately, so one operator-controlled UID
   range can distribute activity until the global budget. The 10,000 total-rule
@@ -265,6 +267,18 @@ are broader than firewall administration alone.
   `Conflict`. Root `BlockAll` instead installs the kernel deny immediately and
   is serialized last. Unsafe storage or base-state outcomes enter fail-closed
   quarantine rather than publishing an uncommitted candidate.
+- Learning quotas can be set only through the fixed optional root-owned
+  `/etc/openshield/learning-limits.json`, with
+  `1 <= per_application <= per_uid <= 7500`. Missing configuration uses
+  defaults 1,024/4,096 respectively. The file and parent directories must be
+  root-owned, safely permissioned, and nonsymlinks. Parsing and metadata
+  validation occur at startup after bootstrap `BlockAll`; invalid or unsafe
+  configuration fails startup. Global count and state-byte limits are unchanged.
+  `StatusV3` exposes bounded scalar quota diagnostics, without selector lists;
+  the TUI warns about incomplete learning, including on a root request for
+  Enforcing. This is an advisory warning, not a new permission or a veto on
+  authorized mode changes. Missed endpoints must be observed again in Learning;
+  no warning is proof of complete attribution or persistence.
 - Rule activation and action are separate. A disabled rule is inert. In either
   normal mode, enabled outbound rules may accept, silently drop, or actively
   reject. `Learning` admits unmatched traffic and creates learned `Accept`
@@ -462,8 +476,9 @@ are broader than firewall administration alone.
   packet and indexes enabled rules by complete executable file version. A lookup
   scans only the policy-ordered bucket for the observed version, rather than all
   application rules. Matching within that bucket remains linear; a root-edited or
-  legacy state can concentrate many rules under one pin despite the 256-rule
-  automatic-insertion budget.
+  legacy state can concentrate many rules under one pin regardless of the
+  configurable per-UID/file-version automatic-insertion budget. That budget
+  defaults to 1,024 and is not an absolute bound on a pin shared across UIDs.
   The Learning admission index prevents already-known, saturated, and paused
   observations from filling the persistence queue, but it runs only after the
   mandatory process attribution. A stream of new eligible candidates can still
@@ -523,11 +538,13 @@ are broader than firewall administration alone.
 - Learning creates application-and-endpoint rules, not trust in remote content.
   A learned server or local executable can later become malicious, so learned
   entries should be reviewed. Any attributable local process can deliberately
-  contact many endpoints and consume its 256-rule application quota or a
-  filesystem UID's 512-rule quota. Distributed activity can still consume the
+  contact many endpoints and consume its configured application or UID quota
+  (by default 1,024 and 4,096 respectively). Distributed activity can still consume the
   7,500-rule learned capacity or 8 MiB state quota during a Learning window.
   The 2,500-slot manual reserve is count-only. These limits preserve bounds but
   can cause learning to pause and do not remove rule-poisoning risk.
+  Increasing these budgets expands the admission window and does not reduce
+  process-attribution CPU cost or latency.
 - Root can still consume the complete 10,000-rule count through privileged
   manual mutations. This is inside the administrative trust boundary but can
   cause an operator-created availability limit.

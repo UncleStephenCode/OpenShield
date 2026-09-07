@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Batas pembelajaran: UID {uid}; aplikasi {application}; otomatis {automatic}; total {total}",
+  "learning.counts": "Aturan otomatis: {rules}; UID/aplikasi yang mencapai batas: {uids}/{applications}",
+  "learning.skipped": "Pengamatan dilewati karena kuota sejak daemon dimulai: {skipped}",
+  "learning.unknown": "Kuota pembelajaran: tidak tersedia atau menunggu status",
+  "learning.warning": "Pembelajaran mungkin belum lengkap: batas tercapai atau pengamatan dilewati. Periksa aturan sebelum Enforcing.",
   "group.title": " Tindakan grup ",
   "group.scope": "Grup: {group}\nAturan: {count}",
   "group.delete": "Hapus",

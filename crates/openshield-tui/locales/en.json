@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Learning limits: UID {uid}; application {application}; automatic {automatic}; total {total}",
+  "learning.counts": "Automatic rules: {rules}; saturated UIDs/applications: {uids}/{applications}",
+  "learning.skipped": "Quota-skipped observations since daemon start: {skipped}",
+  "learning.unknown": "Learning quotas: unavailable or awaiting status",
+  "learning.warning": "Learning may be incomplete: quota reached or observations skipped. Review rules before Enforcing.",
   "group.title": " Group actions ",
   "group.scope": "Group: {group}\nRules: {count}",
   "group.delete": "Delete",

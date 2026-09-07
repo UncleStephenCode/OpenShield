@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Лимиты обучения: UID {uid}; приложение {application}; автоматические {automatic}; всего {total}",
+  "learning.counts": "Автоматических правил: {rules}; UID/приложений на лимите: {uids}/{applications}",
+  "learning.skipped": "Наблюдений, пропущенных из-за квот с запуска демона: {skipped}",
+  "learning.unknown": "Квоты обучения: данные недоступны или ещё не получены",
+  "learning.warning": "Обучение может быть неполным: достигнут лимит или пропущены наблюдения. Проверьте правила перед включением Enforcing.",
   "group.title": " Действия с группой ",
   "group.scope": "Группа: {group}\nПравил: {count}",
   "group.delete": "Удалить",

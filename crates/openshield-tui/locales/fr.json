@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Limites d’apprentissage : UID {uid} ; application {application} ; automatiques {automatic} ; total {total}",
+  "learning.counts": "Règles automatiques : {rules} ; UID/applications à la limite : {uids}/{applications}",
+  "learning.skipped": "Observations ignorées à cause des quotas depuis le démarrage du démon : {skipped}",
+  "learning.unknown": "Quotas d’apprentissage : indisponibles ou en attente",
+  "learning.warning": "Apprentissage potentiellement incomplet : limite atteinte ou observations ignorées. Vérifiez les règles avant Enforcing.",
   "group.title": " Actions sur le groupe ",
   "group.scope": "Groupe: {group}\nRègles: {count}",
   "group.delete": "Supprimer",

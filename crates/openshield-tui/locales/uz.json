@@ -1,4 +1,9 @@
 {
+  "learning.limits": "O‘rganish chegaralari: UID {uid}; ilova {application}; avtomatik {automatic}; jami {total}",
+  "learning.counts": "Avtomatik qoidalar: {rules}; chegaraga yetgan UID/ilovalar: {uids}/{applications}",
+  "learning.skipped": "Demon ishga tushganidan beri kvota sabab o‘tkazib yuborilgan kuzatuvlar: {skipped}",
+  "learning.unknown": "O‘rganish kvotalari: ma’lumot yo‘q yoki holat kutilmoqda",
+  "learning.warning": "O‘rganish to‘liq bo‘lmasligi mumkin: chegaraga yetildi yoki kuzatuvlar o‘tkazib yuborildi. Enforcing oldidan qoidalarni tekshiring.",
   "group.title": " Guruh amallari ",
   "group.scope": "Guruh: {group}\nQoidalar: {count}",
   "group.delete": "Olib tashlash",

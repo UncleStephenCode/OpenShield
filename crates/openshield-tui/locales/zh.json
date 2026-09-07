@@ -1,4 +1,9 @@
 {
+  "learning.limits": "学习限制：UID {uid}；应用 {application}；自动规则 {automatic}；总计 {total}",
+  "learning.counts": "自动规则：{rules}；达到上限的 UID/应用：{uids}/{applications}",
+  "learning.skipped": "守护进程启动以来因配额跳过的观测：{skipped}",
+  "learning.unknown": "学习配额：数据不可用或等待状态",
+  "learning.warning": "学习可能不完整：已达到上限或跳过了观测。启用 Enforcing 前请检查规则。",
   "group.title": " 组操作 ",
   "group.scope": "组: {group}\n规则数: {count}",
   "group.delete": "删除",

@@ -1,4 +1,9 @@
 {
+  "learning.limits": "ขีดจำกัดการเรียนรู้: UID {uid}; แอป {application}; อัตโนมัติ {automatic}; รวม {total}",
+  "learning.counts": "กฎอัตโนมัติ: {rules}; UID/แอปที่ถึงขีดจำกัด: {uids}/{applications}",
+  "learning.skipped": "การสังเกตที่ข้ามเพราะโควตาตั้งแต่เริ่มดีมอน: {skipped}",
+  "learning.unknown": "โควตาการเรียนรู้: ไม่มีข้อมูลหรือกำลังรอสถานะ",
+  "learning.warning": "การเรียนรู้อาจไม่ครบถ้วน: ถึงขีดจำกัดหรือข้ามการสังเกต โปรดตรวจสอบกฎก่อนเปิด Enforcing",
   "group.title": " การดำเนินการกับกลุ่ม ",
   "group.scope": "กลุ่ม: {group}\nกฎ: {count}",
   "group.delete": "ลบ",

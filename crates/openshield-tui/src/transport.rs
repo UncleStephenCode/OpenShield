@@ -17,8 +17,8 @@ use nix::unistd::{Group, getegid, geteuid, getgroups};
 use openshield_core::{Event, MAX_RULES, Mode, Rule, Snapshot};
 use openshield_protocol::{
     Ack, CONTROL_SOCKET_PATH, ControlRequest, ErrorCode, FirewallBackendKind, FrameError,
-    MAX_RULES_PER_PAGE, OBSERVE_GROUP_NAME, OBSERVE_SOCKET_PATH, ReadRequest, Request, Response,
-    RuntimeCompatibility, read_response, write_request,
+    LearningStatus, MAX_RULES_PER_PAGE, OBSERVE_GROUP_NAME, OBSERVE_SOCKET_PATH, ReadRequest,
+    Request, Response, RuntimeCompatibility, read_response, write_request,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -33,7 +33,7 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const STATUS_V2_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
+const STATUS_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_SOCKET_MODE: u32 = 0o600;
 const OBSERVE_SOCKET_MODE: u32 = 0o660;
 
@@ -171,6 +171,10 @@ pub enum ObserverUpdate {
     Disconnected(String),
     TelemetryConnected,
     TelemetryDisconnected(String),
+    LearningStatus {
+        revision: u64,
+        learning: Option<LearningStatus>,
+    },
     Snapshot {
         snapshot: Snapshot,
         backend: FirewallBackendKind,
@@ -215,7 +219,7 @@ struct RevisionEpoch {
     backend: Option<FirewallBackendKind>,
     runtime_compatibility: Option<RuntimeCompatibility>,
     status_protocol: StatusProtocol,
-    next_status_v2_probe_at: Option<std::time::Instant>,
+    next_status_probe_at: Option<std::time::Instant>,
     resync_required: bool,
     restart_update_pending: bool,
 }
@@ -229,8 +233,8 @@ impl Default for RevisionEpoch {
             rule_count: None,
             backend: None,
             runtime_compatibility: None,
-            status_protocol: StatusProtocol::ProbeV2,
-            next_status_v2_probe_at: None,
+            status_protocol: StatusProtocol::ProbeV3,
+            next_status_probe_at: None,
             resync_required: true,
             restart_update_pending: false,
         }
@@ -244,12 +248,14 @@ struct PolicyStatus {
     rule_count: u32,
     backend: FirewallBackendKind,
     runtime_compatibility: RuntimeCompatibility,
+    learning: Option<LearningStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum StatusProtocol {
     #[default]
-    ProbeV2,
+    ProbeV3,
+    V3,
     V2,
     Legacy,
 }
@@ -472,7 +478,7 @@ pub fn send_control(paths: &SocketPaths, request: ControlRequest) -> Result<Ack,
             code: error.code,
             message: error.message,
         }),
-        Response::Status { .. } | Response::StatusV2 { .. } => {
+        Response::Status { .. } | Response::StatusV2 { .. } | Response::StatusV3 { .. } => {
             Err(IpcError::Unexpected("status on control socket"))
         }
         Response::RulesPage { .. } => Err(IpcError::Unexpected("rules page on control socket")),
@@ -611,13 +617,13 @@ fn refresh_snapshot(
     let known_revision = {
         let cursor = lock_revision_epoch(revision)?;
         if status_is_unchanged(&cursor, first) {
-            return Ok(None);
+            return Ok(Some(offer_learning_status(sender, dropped, first)));
         }
         cursor.revision
     };
     if first.revision >= known_revision {
         let snapshot = fetch_consistent_snapshot_from_status(&mut stream, first, status_protocol)?;
-        return enqueue_snapshot(
+        let outcome = enqueue_snapshot(
             sender,
             revision,
             dropped,
@@ -626,7 +632,11 @@ fn refresh_snapshot(
             first.runtime_compatibility,
             false,
             status_protocol,
-        );
+        )?;
+        if outcome == Some(OfferOutcome::Delivered) {
+            let _outcome = offer_learning_status(sender, dropped, first);
+        }
+        return Ok(outcome);
     }
 
     // A lower first read can be a harmless race with an event received after
@@ -636,10 +646,10 @@ fn refresh_snapshot(
     let confirmed = fetch_status(&mut stream, status_protocol)?;
     let restarted = confirmed.revision < known_revision;
     if !restarted && shared_status_is_unchanged(revision, confirmed)? {
-        return Ok(None);
+        return Ok(Some(offer_learning_status(sender, dropped, confirmed)));
     }
     let snapshot = fetch_consistent_snapshot_from_status(&mut stream, confirmed, status_protocol)?;
-    enqueue_snapshot(
+    let outcome = enqueue_snapshot(
         sender,
         revision,
         dropped,
@@ -648,6 +658,25 @@ fn refresh_snapshot(
         confirmed.runtime_compatibility,
         restarted,
         status_protocol,
+    )?;
+    if outcome == Some(OfferOutcome::Delivered) {
+        let _outcome = offer_learning_status(sender, dropped, confirmed);
+    }
+    Ok(outcome)
+}
+
+fn offer_learning_status(
+    sender: &SyncSender<ObserverUpdate>,
+    dropped: &DroppedCounter,
+    status: PolicyStatus,
+) -> OfferOutcome {
+    offer_update(
+        sender,
+        dropped,
+        ObserverUpdate::LearningStatus {
+            revision: status.revision,
+            learning: status.learning,
+        },
     )
 }
 
@@ -683,16 +712,18 @@ fn enqueue_snapshot(
         cursor.rule_count = Some(rule_count);
         cursor.backend = Some(backend);
         cursor.runtime_compatibility = Some(runtime_compatibility);
-        cursor.status_protocol = if status_protocol == StatusProtocol::Legacy {
-            // A confirmed new daemon epoch may have gained StatusV2 support.
+        cursor.status_protocol = if status_protocol == StatusProtocol::V3 {
+            status_protocol
+        } else {
+            // A confirmed new daemon epoch may have gained StatusV3 support.
             // Probe once on the next snapshot instead of retaining a capability
             // conclusion made about the previous process forever.
-            StatusProtocol::ProbeV2
-        } else {
-            status_protocol
+            StatusProtocol::ProbeV3
         };
-        if cursor.status_protocol != StatusProtocol::Legacy {
-            cursor.next_status_v2_probe_at = None;
+        if cursor.status_protocol != StatusProtocol::Legacy
+            && cursor.status_protocol != StatusProtocol::V2
+        {
+            cursor.next_status_probe_at = None;
         }
         cursor.resync_required = true;
         cursor.restart_update_pending = true;
@@ -918,37 +949,49 @@ fn open_status_session(
     testing_override: bool,
     revision: &Mutex<RevisionEpoch>,
 ) -> Result<(UnixStream, PolicyStatus, StatusProtocol), IpcError> {
+    open_status_session_with(revision, || {
+        connect_verified(path, testing_override, SocketTrust::Observe)
+    })
+}
+
+fn open_status_session_with(
+    revision: &Mutex<RevisionEpoch>,
+    mut connect: impl FnMut() -> Result<UnixStream, IpcError>,
+) -> Result<(UnixStream, PolicyStatus, StatusProtocol), IpcError> {
     let now = std::time::Instant::now();
-    let requested = {
+    let mut requested = {
         let cursor = lock_revision_epoch(revision)?;
         status_protocol_for_connection(&cursor, now)
     };
-    let mut stream = connect_verified(path, testing_override, SocketTrust::Observe)?;
-    set_request_timeouts(&stream)?;
-    match fetch_status(&mut stream, requested) {
-        Ok(status) => {
-            let mut cursor = lock_revision_epoch(revision)?;
-            cursor.status_protocol = requested;
-            if requested == StatusProtocol::V2 {
-                cursor.next_status_v2_probe_at = None;
+    // At most three sessions: v3 -> v2 -> legacy. Older daemons close the
+    // session after an unknown request, so each explicit rejection reconnects.
+    // Never downgrade on an authorization, decode, consistency or I/O error.
+    loop {
+        let mut stream = connect()?;
+        set_request_timeouts(&stream)?;
+        match fetch_status(&mut stream, requested) {
+            Ok(status) => {
+                let mut cursor = lock_revision_epoch(revision)?;
+                cursor.status_protocol = requested;
+                if requested == StatusProtocol::V3 {
+                    cursor.next_status_probe_at = None;
+                } else if cursor
+                    .next_status_probe_at
+                    .is_none_or(|deadline| now >= deadline)
+                {
+                    cursor.next_status_probe_at = now.checked_add(STATUS_REPROBE_INTERVAL);
+                }
+                return Ok((stream, status, requested));
             }
-            Ok((stream, status, requested))
+            Err(error) if status_is_unsupported(&error) => {
+                requested = match requested {
+                    StatusProtocol::ProbeV3 | StatusProtocol::V3 => StatusProtocol::V2,
+                    StatusProtocol::V2 => StatusProtocol::Legacy,
+                    StatusProtocol::Legacy => return Err(error),
+                };
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) if requested == StatusProtocol::V2 && status_v2_is_unsupported(&error) => {
-            // A legacy daemon closes the observation session after rejecting
-            // the unknown request. Reconnect before sending the old Status
-            // shape, and cache the result so a healthy legacy daemon receives
-            // at most one StatusV2 probe per bounded re-probe interval.
-            drop(stream);
-            let mut legacy = connect_verified(path, testing_override, SocketTrust::Observe)?;
-            set_request_timeouts(&legacy)?;
-            let status = fetch_status(&mut legacy, StatusProtocol::Legacy)?;
-            let mut cursor = lock_revision_epoch(revision)?;
-            cursor.status_protocol = StatusProtocol::Legacy;
-            cursor.next_status_v2_probe_at = now.checked_add(STATUS_V2_REPROBE_INTERVAL);
-            Ok((legacy, status, StatusProtocol::Legacy))
-        }
-        Err(error) => Err(error),
     }
 }
 
@@ -957,18 +1000,21 @@ fn status_protocol_for_connection(
     now: std::time::Instant,
 ) -> StatusProtocol {
     match cursor.status_protocol {
-        StatusProtocol::Legacy
+        StatusProtocol::Legacy | StatusProtocol::V2
             if cursor
-                .next_status_v2_probe_at
+                .next_status_probe_at
                 .is_some_and(|probe_at| now < probe_at) =>
         {
-            StatusProtocol::Legacy
+            cursor.status_protocol
         }
-        StatusProtocol::ProbeV2 | StatusProtocol::V2 | StatusProtocol::Legacy => StatusProtocol::V2,
+        StatusProtocol::ProbeV3
+        | StatusProtocol::V3
+        | StatusProtocol::V2
+        | StatusProtocol::Legacy => StatusProtocol::V3,
     }
 }
 
-fn status_v2_is_unsupported(error: &IpcError) -> bool {
+fn status_is_unsupported(error: &IpcError) -> bool {
     matches!(
         error,
         IpcError::Rejected {
@@ -983,7 +1029,8 @@ fn fetch_status(
     protocol: StatusProtocol,
 ) -> Result<PolicyStatus, IpcError> {
     let request = match protocol {
-        StatusProtocol::ProbeV2 | StatusProtocol::V2 => ReadRequest::StatusV2,
+        StatusProtocol::ProbeV3 | StatusProtocol::V3 => ReadRequest::StatusV3,
+        StatusProtocol::V2 => ReadRequest::StatusV2,
         StatusProtocol::Legacy => ReadRequest::Status,
     };
     write_request(stream, &Request::Read(request))?;
@@ -1003,9 +1050,10 @@ fn fetch_status(
             rule_count,
             backend,
             runtime_compatibility: RuntimeCompatibility::default(),
+            learning: None,
         }),
         (
-            StatusProtocol::ProbeV2 | StatusProtocol::V2,
+            StatusProtocol::V2,
             Response::StatusV2 {
                 revision,
                 mode,
@@ -1015,6 +1063,45 @@ fn fetch_status(
                 ..
             },
         ) => validated_v2_policy_status(revision, mode, rule_count, backend, runtime_compatibility),
+        (
+            StatusProtocol::ProbeV3 | StatusProtocol::V3,
+            Response::StatusV3 {
+                revision,
+                mode,
+                rule_count,
+                backend,
+                runtime_compatibility,
+                learning,
+                ..
+            },
+        ) => {
+            let mut status = validated_v2_policy_status(
+                revision,
+                mode,
+                rule_count,
+                backend,
+                runtime_compatibility,
+            )?;
+            let max_rules = u32::try_from(MAX_RULES).unwrap_or(u32::MAX);
+            if [
+                learning.per_uid_limit,
+                learning.per_application_limit,
+                learning.automatic_rule_limit,
+                learning.total_rule_limit,
+            ]
+            .into_iter()
+            .any(|limit| limit == 0 || limit > max_rules)
+                || learning.automatic_rules > rule_count
+                || learning.saturated_uids > learning.automatic_rules
+                || learning.saturated_applications > learning.automatic_rules
+            {
+                return Err(IpcError::InvalidSnapshot(
+                    "invalid StatusV3 learning quotas".to_owned(),
+                ));
+            }
+            status.learning = Some(learning);
+            Ok(status)
+        }
         (_, Response::Error(error)) => Err(IpcError::Rejected {
             code: error.code,
             message: error.message,
@@ -1024,11 +1111,10 @@ fn fetch_status(
         (_, Response::RulesPage { .. }) => {
             Err(IpcError::Unexpected("rules page instead of status"))
         }
-        (StatusProtocol::Legacy, Response::StatusV2 { .. }) => {
-            Err(IpcError::Unexpected("status v2 instead of legacy status"))
-        }
-        (StatusProtocol::ProbeV2 | StatusProtocol::V2, Response::Status { .. }) => {
-            Err(IpcError::Unexpected("legacy status instead of status v2"))
+        (_, Response::Status { .. } | Response::StatusV2 { .. } | Response::StatusV3 { .. }) => {
+            Err(IpcError::Unexpected(
+                "status protocol version does not match request",
+            ))
         }
     }
 }
@@ -1051,6 +1137,7 @@ fn validated_v2_policy_status(
         rule_count,
         backend,
         runtime_compatibility,
+        learning: None,
     })
 }
 
@@ -1077,7 +1164,7 @@ fn fetch_rules_page(
         }),
         Response::Ack(_) => Err(IpcError::Unexpected("ack on observation socket")),
         Response::Event(_) => Err(IpcError::Unexpected("event instead of rules page")),
-        Response::Status { .. } | Response::StatusV2 { .. } => {
+        Response::Status { .. } | Response::StatusV2 { .. } | Response::StatusV3 { .. } => {
             Err(IpcError::Unexpected("status instead of rules page"))
         }
     }
@@ -1131,7 +1218,7 @@ fn subscribe_once(
                 });
             }
             Response::Ack(_) => return Err(IpcError::Unexpected("ack on event subscription")),
-            Response::Status { .. } | Response::StatusV2 { .. } => {
+            Response::Status { .. } | Response::StatusV2 { .. } | Response::StatusV3 { .. } => {
                 return Err(IpcError::Unexpected("status on event subscription"));
             }
             Response::RulesPage { .. } => {
@@ -1424,48 +1511,214 @@ mod tests {
     }
 
     #[test]
-    fn legacy_status_v2_probe_is_cached_then_retried_on_deadline() {
+    fn legacy_status_v3_probe_is_cached_then_retried_on_deadline() {
         let started = std::time::Instant::now();
         let mut cursor = RevisionEpoch {
             status_protocol: StatusProtocol::Legacy,
-            next_status_v2_probe_at: started.checked_add(STATUS_V2_REPROBE_INTERVAL),
+            next_status_probe_at: started.checked_add(STATUS_REPROBE_INTERVAL),
             ..RevisionEpoch::default()
         };
 
         assert_eq!(
             status_protocol_for_connection(
                 &cursor,
-                started + STATUS_V2_REPROBE_INTERVAL.saturating_sub(Duration::from_millis(1)),
+                started + STATUS_REPROBE_INTERVAL.saturating_sub(Duration::from_millis(1)),
             ),
             StatusProtocol::Legacy
         );
         assert_eq!(
-            status_protocol_for_connection(&cursor, started + STATUS_V2_REPROBE_INTERVAL,),
-            StatusProtocol::V2
+            status_protocol_for_connection(&cursor, started + STATUS_REPROBE_INTERVAL,),
+            StatusProtocol::V3
         );
 
         // A successful legacy status read must not postpone the fixed retry
         // deadline on every two-second snapshot connection.
         cursor.status_protocol = StatusProtocol::Legacy;
         assert_eq!(
-            status_protocol_for_connection(&cursor, started + STATUS_V2_REPROBE_INTERVAL,),
-            StatusProtocol::V2
+            status_protocol_for_connection(&cursor, started + STATUS_REPROBE_INTERVAL,),
+            StatusProtocol::V3
         );
     }
 
     #[test]
-    fn status_v2_downgrade_requires_an_explicit_invalid_request() {
-        assert!(status_v2_is_unsupported(&IpcError::Rejected {
+    fn status_downgrade_requires_an_explicit_invalid_request() {
+        assert!(status_is_unsupported(&IpcError::Rejected {
             code: ErrorCode::InvalidRequest,
             message: "unknown request".to_owned(),
         }));
-        assert!(!status_v2_is_unsupported(&IpcError::Rejected {
+        assert!(!status_is_unsupported(&IpcError::Rejected {
             code: ErrorCode::Unauthorized,
             message: "denied".to_owned(),
         }));
-        assert!(!status_v2_is_unsupported(&IpcError::Unexpected(
+        assert!(!status_is_unsupported(&IpcError::Unexpected(
             "malformed status response",
         )));
+    }
+
+    fn test_learning_status() -> LearningStatus {
+        LearningStatus {
+            per_uid_limit: 2_048,
+            per_application_limit: 1_024,
+            automatic_rule_limit: 4_000,
+            total_rule_limit: 4_096,
+            automatic_rules: 1,
+            saturated_uids: 0,
+            saturated_applications: 0,
+            quota_skipped_observations: 7,
+        }
+    }
+
+    fn test_status_response(protocol: StatusProtocol) -> Response {
+        match protocol {
+            StatusProtocol::Legacy => Response::Status {
+                revision: 7,
+                mode: Mode::BlockAll,
+                rule_count: 1,
+                backend: FirewallBackendKind::Unknown,
+                nfqueue: openshield_protocol::NfqueueCounters::default(),
+            },
+            StatusProtocol::V2 => Response::StatusV2 {
+                revision: 7,
+                mode: Mode::BlockAll,
+                rule_count: 1,
+                backend: FirewallBackendKind::Unknown,
+                nfqueue: openshield_protocol::NfqueueCounters::default(),
+                runtime_compatibility: RuntimeCompatibility::default(),
+            },
+            StatusProtocol::ProbeV3 | StatusProtocol::V3 => Response::StatusV3 {
+                revision: 7,
+                mode: Mode::BlockAll,
+                rule_count: 1,
+                backend: FirewallBackendKind::Unknown,
+                nfqueue: openshield_protocol::NfqueueCounters::default(),
+                runtime_compatibility: RuntimeCompatibility::default(),
+                learning: test_learning_status(),
+            },
+        }
+    }
+
+    fn prepared_status_stream(response: &Response) -> Result<(UnixStream, UnixStream), IpcError> {
+        let (client, mut server) = UnixStream::pair().map_err(IpcError::Timeout)?;
+        set_request_timeouts(&client)?;
+        set_request_timeouts(&server)?;
+        openshield_protocol::write_response(&mut server, response)?;
+        Ok((client, server))
+    }
+
+    #[test]
+    fn status_negotiation_is_v3_first_and_caches_explicit_downgrades()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for supported in [
+            StatusProtocol::V3,
+            StatusProtocol::V2,
+            StatusProtocol::Legacy,
+        ] {
+            let rejected = Response::Error(openshield_protocol::ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unknown request",
+            ));
+            let expected = match supported {
+                StatusProtocol::V3 | StatusProtocol::ProbeV3 => vec![ReadRequest::StatusV3],
+                StatusProtocol::V2 => vec![ReadRequest::StatusV3, ReadRequest::StatusV2],
+                StatusProtocol::Legacy => vec![
+                    ReadRequest::StatusV3,
+                    ReadRequest::StatusV2,
+                    ReadRequest::Status,
+                ],
+            };
+            let mut clients = std::collections::VecDeque::new();
+            let mut servers = Vec::new();
+            for index in 0..expected.len() {
+                let response = if index + 1 == expected.len() {
+                    test_status_response(supported)
+                } else {
+                    rejected.clone()
+                };
+                let (client, server) = prepared_status_stream(&response)?;
+                clients.push_back(client);
+                servers.push(server);
+            }
+            let revision = Mutex::new(RevisionEpoch::default());
+            let (_stream, status, actual) = open_status_session_with(&revision, || {
+                clients
+                    .pop_front()
+                    .ok_or(IpcError::Unexpected("excess fallback connection"))
+            })?;
+            assert_eq!(actual, supported);
+            assert_eq!(status.learning.is_some(), supported == StatusProtocol::V3);
+            assert!(clients.is_empty());
+            for (server, expected) in servers.iter_mut().zip(expected) {
+                assert_eq!(
+                    openshield_protocol::read_request(server)?,
+                    Request::Read(expected)
+                );
+            }
+            let cursor = lock_revision_epoch(&revision)?;
+            assert_eq!(
+                status_protocol_for_connection(&cursor, std::time::Instant::now()),
+                supported
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn status_v3_does_not_downgrade_on_denial_invalid_data_or_wrong_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut invalid = test_status_response(StatusProtocol::V3);
+        if let Response::StatusV3 { learning, .. } = &mut invalid {
+            learning.per_uid_limit = 0;
+        }
+        for response in [
+            Response::Error(openshield_protocol::ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "denied",
+            )),
+            invalid,
+            test_status_response(StatusProtocol::V2),
+        ] {
+            let (client, _server) = prepared_status_stream(&response)?;
+            let mut client = Some(client);
+            let mut connections = 0;
+            assert!(
+                open_status_session_with(&Mutex::new(RevisionEpoch::default()), || {
+                    connections += 1;
+                    client
+                        .take()
+                        .ok_or(IpcError::Unexpected("unexpected downgrade"))
+                })
+                .is_err()
+            );
+            assert_eq!(connections, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quota_observation_updates_are_bounded_without_rule_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let dropped = DroppedCounter::new();
+        let status = PolicyStatus {
+            revision: 7,
+            mode: Mode::BlockAll,
+            rule_count: 1,
+            backend: FirewallBackendKind::Unknown,
+            runtime_compatibility: RuntimeCompatibility::default(),
+            learning: Some(test_learning_status()),
+        };
+        assert_eq!(
+            offer_learning_status(&sender, &dropped, status),
+            OfferOutcome::Delivered
+        );
+        assert_eq!(
+            offer_learning_status(&sender, &dropped, status),
+            OfferOutcome::Dropped
+        );
+        assert!(matches!(receiver.recv()?, ObserverUpdate::LearningStatus {
+            revision: 7, learning: Some(learning)
+        } if learning.quota_skipped_observations == 7));
+        Ok(())
     }
 
     #[test]
@@ -1588,6 +1841,7 @@ mod tests {
             rule_count: 0,
             backend: FirewallBackendKind::Nftables,
             runtime_compatibility: emergency,
+            learning: None,
         };
         validate_snapshot_runtime_compatibility(&snapshot, status, StatusProtocol::V2)?;
 
@@ -1836,6 +2090,7 @@ mod tests {
             rule_count: 0,
             backend: FirewallBackendKind::Unknown,
             runtime_compatibility: RuntimeCompatibility::default(),
+            learning: None,
         };
         assert!(shared_status_is_unchanged(&revision, unchanged)?);
         assert!(!shared_status_is_unchanged(
@@ -1944,6 +2199,7 @@ mod tests {
             rule_count: 1,
             backend: FirewallBackendKind::Nftables,
             runtime_compatibility: attested,
+            learning: None,
         };
         assert!(!shared_status_is_unchanged(&revision, current)?);
 
@@ -2001,6 +2257,7 @@ mod tests {
             rule_count: 0,
             backend: FirewallBackendKind::Nftables,
             runtime_compatibility: RuntimeCompatibility::default(),
+            learning: None,
         };
         assert!(!shared_status_is_unchanged(&revision, changed)?);
         assert_eq!(
@@ -2054,7 +2311,7 @@ mod tests {
             backend: Some(FirewallBackendKind::Unknown),
             runtime_compatibility: Some(RuntimeCompatibility::default()),
             status_protocol: StatusProtocol::V2,
-            next_status_v2_probe_at: None,
+            next_status_probe_at: None,
             resync_required: false,
             restart_update_pending: false,
         });
@@ -2064,6 +2321,7 @@ mod tests {
             rule_count: 0,
             backend: FirewallBackendKind::Unknown,
             runtime_compatibility: RuntimeCompatibility::default(),
+            learning: None,
         };
         assert!(shared_status_is_unchanged(&revision, unchanged)?);
         mark_resync_required(&revision)?;
@@ -2124,6 +2382,7 @@ mod tests {
                 level: openshield_protocol::CompatibilityLevel::KernelNative,
                 reason: openshield_protocol::CompatibilityReason::NetworkOnly,
             },
+            learning: None,
         };
         assert!(matches!(
             validate_snapshot_runtime_compatibility(

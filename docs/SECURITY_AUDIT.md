@@ -268,8 +268,9 @@ The normative boundary is defined by the
   specification and pin. A bounded learning queue, batch-size limit, and
   deduplication cap bound the work. Automatic insertion stops when
   exact learned rules plus templates reach 7,500 globally, or exact learned
-  rules reach 512 per filesystem UID or 256 per pair of filesystem UID and
-  complete executable file version. These are
+  rules reach configured quotas: by default 4,096 per filesystem UID or 1,024
+  per pair of filesystem UID and complete executable file version. Disabled
+  learned rules and older executable versions remain charged to their UID. These are
   admission budgets, not validation invariants for legacy or root-edited state;
   distinct subordinate UIDs count separately. The total limit remains 10,000
   rules, normally reserving 2,500 count slots for privileged manual rules; the
@@ -603,6 +604,16 @@ Commands and exact interpretation are documented in
   privileged mutation or daemon restart, while the active Learning traffic
   policy remains. The 2,500-slot manual count reserve does not reserve bytes.
   Learned rules require review before Enforcing.
+  Since v0.2.5, root can configure the per-UID and per-UID/file-version quotas
+  in optional `/etc/openshield/learning-limits.json`, within
+  `1 <= per_application <= per_uid <= 7500`. The fixed path and its parents
+  are checked for safe root ownership, permissions, and absence of symlinks
+  after bootstrap `BlockAll`; invalid content or metadata fails startup.
+  Packages do not overwrite this local configuration. `StatusV3` and TUI
+  warnings make quota exhaustion visible without granting traffic or vetoing
+  root's Enforcing request. Existing rules survive upgrades; observations
+  previously missed at a quota must be repeated in Learning. Larger quotas do
+  not remove the resource-exhaustion or incomplete-attribution risks.
 - An authorized root operator can still fill the 10,000-rule total with manual
   mutations. Root is inside the administrative trust boundary, but this remains
   an operational availability limit.
@@ -637,7 +648,9 @@ Commands and exact interpretation are documented in
   and indexes enabled rules by complete executable file version. A lookup scans
   only the policy-ordered bucket for the observed version. Matching within that
   bucket remains linear, and a legacy or root-edited state can concentrate many
-  rules under one pin despite the 256-rule automatic-insertion budget.
+  rules under one pin regardless of the configurable per-UID/file-version
+  automatic-insertion budget (1,024 by default), which is not a bound on a pin
+  shared across UIDs.
   The Learning admission index prevents already-known, saturated, or paused
   observations from filling the persistence queue, but classification follows
   procfs attribution attempt. New eligible candidates can still fill the

@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Үйениг хажыглааштары: UID {uid}; программа {application}; автоматик {automatic}; шупту {total}",
+  "learning.counts": "Автоматик дүрүмнер: {rules}; хажыглаашка четкен UID/программалар: {uids}/{applications}",
+  "learning.skipped": "Демон ажылдап эгелээнден бээр квота чылдагаанныг эрттирген ажыглалдар: {skipped}",
+  "learning.unknown": "Үйениг квоталары: медээ чок азы байдалды манап турар",
+  "learning.warning": "Үйениг долу эвес болуп болур: хажыглаашка четкен азы ажыглалдар эрттирген. Enforcing мурнунда дүрүмнерни хынаңар.",
   "group.title": " Бөлүктүң кыймылдары ",
   "group.scope": "Бөлүк: {group}\nДүрүмнер: {count}",
   "group.delete": "Өжүр",

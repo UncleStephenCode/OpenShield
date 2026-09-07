@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Öğrenme sınırları: UID {uid}; uygulama {application}; otomatik {automatic}; toplam {total}",
+  "learning.counts": "Otomatik kurallar: {rules}; sınırdaki UID/uygulamalar: {uids}/{applications}",
+  "learning.skipped": "Daemon başlangıcından beri kota nedeniyle atlanan gözlemler: {skipped}",
+  "learning.unknown": "Öğrenme kotaları: kullanılamıyor veya durum bekleniyor",
+  "learning.warning": "Öğrenme eksik olabilir: sınıra ulaşıldı veya gözlemler atlandı. Enforcing öncesinde kuralları inceleyin.",
   "group.title": " Grup işlemleri ",
   "group.scope": "Grup: {group}\nKurallar: {count}",
   "group.delete": "Sil",

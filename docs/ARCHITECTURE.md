@@ -2,7 +2,7 @@
 
 # OpenShield architecture
 
-This document describes the OpenShield v0.2.4 policy model.
+This document describes the OpenShield v0.2.5 policy model.
 
 OpenShield is a Linux host firewall composed of two Rust binaries:
 
@@ -51,6 +51,13 @@ serialization. Group membership grants no control-plane authority.
 Authorization applies when the Unix connection is accepted; Unix fd passing can
 delegate an already-connected observation stream, so group access is not a
 non-delegable confidentiality boundary.
+
+`StatusV3` extends the status snapshot with bounded scalar learning-quota
+diagnostics: configured admission limits, current-rule saturation status, and a
+process-lifetime cumulative counter of quota-skipped observations, not unique
+missing rules. It exposes no per-UID or per-executable selector list. The TUI
+shows incomplete-learning warnings, including on a root request for Enforcing;
+diagnostics do not authorize traffic or veto a privileged mode change.
 
 Before loading state or invoking a firewall backend, every privileged daemon action takes
 a nonblocking exclusive `flock` on the verified root-owned regular `0600`
@@ -709,9 +716,11 @@ counting both endpoint rules and group templates. A new attributable endpoint is
 stored as an enabled `Accept` rule. If its exact `(optional cgroup path, executable path)`
 group has no template, the same transaction first creates the disabled,
 network-unconstrained `Accept` template described above. Automatic
-insertion also stops at 512 learned rules per filesystem UID and 256 per pair of
-filesystem UID and full executable file-version identity. These are admission
-budgets, not absolute state invariants. They use the numeric filesystem UID;
+insertion also stops at the configured learned endpoint-rule quotas, defaulting
+to 4,096 per filesystem UID and 1,024 per pair of filesystem UID and full
+executable file-version identity. Disabled learned rules remain counted, and
+rules for older executable versions remain charged to their UID. These are
+admission budgets, not absolute state invariants. They use the numeric filesystem UID;
 distinct subordinate UIDs count independently and can distribute learning until
 the global budget is reached. The engine keeps a second immutable
 `ApplicationLearningAdmissionIndex` and rebuilds it together with the packet
@@ -737,6 +746,20 @@ candidate rather than widening an existing learned selector; a cgroup/path
 change also selects a different template group. Operators must therefore conduct
 Learning in a controlled window and review exact endpoint rules and broad,
 disabled templates before Enforcing.
+
+The optional fixed-path root configuration
+`/etc/openshield/learning-limits.json` has the shape
+`{"per_uid":4096,"per_application":1024}`. Missing configuration uses these
+defaults. Values must satisfy `1 <= per_application <= per_uid <= 7500`;
+the independent 7,500 automatic-rule, 10,000 total-rule, and 8 MiB limits do not
+change. The file and parent directories must be root-owned, safely permissioned,
+and nonsymlinks. Configuration is read at daemon startup only, after bootstrap
+`BlockAll`; invalid content or unsafe metadata fails startup rather than
+falling back silently. Packages do not install or overwrite this optional file.
+Upgrading preserves the rule set, but endpoints previously missed at a quota
+must be observed again in Learning. Quota diagnostics do not establish complete
+learning and increasing the limits does not remove process-attribution CPU or
+latency costs.
 
 Application Learning uses a serialized two-phase persistence transaction.
 Under the `Engine` mutex the worker validates the base state, builds the
@@ -815,7 +838,7 @@ evidence. A production maximum requires three successful steady repetitions.
 
 Relative performance uses those independent adjacent pristine AB/BA pairs.
 Every window delta and threshold crossing is preserved as evidence. The
-v0.2.4 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
+v0.2.5 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
 arithmetic mean of three independent paired steady deltas blocks release for
 throughput and PPS when it exceeds the threshold. The release-smoke setting
 `cpu_latency_relative_regressions_are_advisory: true` records CPU and latency
@@ -900,7 +923,7 @@ authorized non-root observer, all application metadata and identifying rule
 names are redacted by the daemon. UID 0 can read the full rule, including
 bounded command-line selectors. Runtime attribution reads bounded procfs
 identity metadata and a bounded queued-packet prefix, but never the process
-environment; version 0.2.4 does not provide a per-packet capture feed.
+environment; version 0.2.5 does not provide a per-packet capture feed.
 
 ## Failure policy
 

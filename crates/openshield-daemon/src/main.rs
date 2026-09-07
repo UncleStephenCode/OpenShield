@@ -7,6 +7,7 @@ mod backend;
 mod compatibility;
 mod engine;
 mod learning;
+mod learning_config;
 mod nfqueue;
 mod server;
 mod socket;
@@ -174,13 +175,25 @@ fn run() -> Result<()> {
     // it after the authenticated NFQUEUE consumer is ready.
     install_fail_closed_with(&mut backend)
         .context("cannot install the bootstrap BlockAll policy before state inspection")?;
+    let learning_limits = learning_config::load()
+        .context("invalid administrator learning limits; leaving bootstrap BlockAll active")?;
+    info!(
+        per_uid = learning_limits.per_uid(),
+        per_application = learning_limits.per_application(),
+        "configured automatic application learning budgets"
+    );
     ensure_state_storage_or_fail_closed(&mut backend, Path::new(STATE_DIRECTORY), 0)?;
     let queue_verdict_strategy = backend.queue_verdict_strategy();
     let observer = backend.clone();
     let store: Box<dyn StateStore> = Box::new(AtomicStateStore::root_owned(STATE_FILE));
     let events = EventBus::new();
-    let engine = Engine::load(Box::new(backend), store, events.clone())
-        .context("cannot initialize fail-closed policy engine")?;
+    let engine = Engine::load_with_learning_limits(
+        Box::new(backend),
+        store,
+        events.clone(),
+        learning_limits,
+    )
+    .context("cannot initialize fail-closed policy engine")?;
     // Engine loading has already installed the bootstrap BlockAll quarantine.
     // A missing NSS/group prerequisite must therefore fail closed before any
     // desired persisted policy is activated.

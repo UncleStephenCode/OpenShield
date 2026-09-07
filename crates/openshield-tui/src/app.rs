@@ -7,8 +7,8 @@ use openshield_core::{
     Snapshot, TransportProtocol,
 };
 use openshield_protocol::{
-    ControlRequest, FirewallBackendKind, OutboundGroupAction, OutboundGroupSelector,
-    RuntimeCompatibility,
+    ControlRequest, FirewallBackendKind, LearningStatus, OutboundGroupAction,
+    OutboundGroupSelector, RuntimeCompatibility,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -872,6 +872,7 @@ pub struct App {
     rule_ids: HashSet<Uuid>,
     pub backend: Option<FirewallBackendKind>,
     pub runtime_compatibility: RuntimeCompatibility,
+    pub learning_status: Option<LearningStatus>,
     pub counters: Option<FirewallCounters>,
     pub events: VecDeque<Event>,
     selected_outbound_group: usize,
@@ -904,6 +905,7 @@ impl App {
             rule_ids: HashSet::new(),
             backend: None,
             runtime_compatibility: RuntimeCompatibility::default(),
+            learning_status: None,
             counters: None,
             events: VecDeque::with_capacity(MAX_VISIBLE_EVENTS),
             selected_outbound_group: 0,
@@ -952,6 +954,7 @@ impl App {
         self.snapshot = Some(snapshot);
         self.backend = Some(backend);
         self.runtime_compatibility = runtime_compatibility;
+        self.learning_status = None;
         self.clamp_rule_selection();
     }
 
@@ -974,6 +977,7 @@ impl App {
         self.snapshot = Some(snapshot);
         self.backend = Some(backend);
         self.runtime_compatibility = runtime_compatibility;
+        self.learning_status = None;
         self.counters = None;
         self.last_counters_at = None;
         self.events.clear();
@@ -990,6 +994,7 @@ impl App {
         self.rule_ids.clear();
         self.backend = None;
         self.runtime_compatibility = RuntimeCompatibility::default();
+        self.learning_status = None;
         self.counters = None;
         self.last_counters_at = None;
         self.reset_rule_selections();
@@ -998,6 +1003,25 @@ impl App {
             self.overlay = Overlay::None;
             self.notice = Some(self.i18n.tr("notice.connection_lost").to_owned());
         }
+    }
+
+    pub fn set_learning_status(&mut self, revision: u64, learning: Option<LearningStatus>) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.revision == revision)
+        {
+            self.learning_status = learning;
+        }
+    }
+
+    pub fn learning_needs_attention(&self) -> bool {
+        self.learning_status.is_some_and(|learning| {
+            let total = self.snapshot.as_ref().map_or(0, |snapshot| {
+                u32::try_from(snapshot.rules.len()).unwrap_or(u32::MAX)
+            });
+            learning.needs_attention(total)
+        })
     }
 
     #[cfg(test)]
@@ -1079,6 +1103,7 @@ impl App {
                 // invalidates it; delayed or duplicate events must not erase
                 // a newer StatusV2 attestation.
                 self.runtime_compatibility = RuntimeCompatibility::default();
+                self.learning_status = None;
                 match &event.kind {
                     EventKind::ModeChanged { current, .. } => snapshot.mode = *current,
                     EventKind::RuleCreated { rule } => {
@@ -1765,6 +1790,45 @@ mod tests {
     use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 
     use super::*;
+
+    #[test]
+    fn learning_status_is_revision_bound_and_cleared_on_disconnect_or_restart() {
+        let mut app = App::new(false, I18n::test_english());
+        let snapshot = Snapshot {
+            revision: 7,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        };
+        app.set_snapshot(snapshot.clone());
+        let learning = LearningStatus {
+            per_uid_limit: 2_048,
+            per_application_limit: 1_024,
+            automatic_rule_limit: 4_000,
+            total_rule_limit: 4_096,
+            automatic_rules: 0,
+            saturated_uids: 0,
+            saturated_applications: 0,
+            quota_skipped_observations: 3,
+        };
+        app.set_learning_status(6, Some(learning));
+        assert_eq!(app.learning_status, None);
+        app.set_learning_status(7, Some(learning));
+        assert!(app.learning_needs_attention());
+        app.set_learning_status(7, None);
+        assert_eq!(
+            app.learning_status, None,
+            "legacy status must be unknown, not zero"
+        );
+        app.set_learning_status(7, Some(learning));
+        app.set_restarted_snapshot(snapshot.clone());
+        assert_eq!(app.learning_status, None);
+        app.set_learning_status(7, Some(learning));
+        app.set_disconnected("test disconnect".to_owned());
+        assert_eq!(app.learning_status, None);
+        app.set_learning_status(7, Some(learning));
+        assert_eq!(app.learning_status, None);
+    }
 
     #[test]
     fn argument_editor_round_trip_preserves_controls_and_literal_escapes()

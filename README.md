@@ -2,7 +2,7 @@
 
 # OpenShield
 
-Current source release: **v0.2.4**.
+Current source release: **v0.2.5**.
 
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
@@ -70,8 +70,10 @@ destination, DHCPv6 server-to-client replies only from a link-local source, and
 the narrowly enumerated IPv6 NDP, Router Advertisement, MLD-query, and required
 RELATED error traffic. `BlockAll` contains none of these exceptions.
 Automatic insertion stops when exact learned rules plus generated templates
-reach 7,500, when exact learned rules reach 512 for one filesystem UID, or when
-they reach 256 for one filesystem UID and full executable file-version identity.
+reach 7,500, or when an endpoint-rule quota is reached. By default these quotas
+are 4,096 learned rules per filesystem UID and 1,024 per pair of filesystem UID
+and full executable file-version identity. Disabled learned rules still count;
+older executable versions continue to count toward their UID's quota.
 These are admission budgets, not validation
 invariants for a legacy or root-edited state. The 10,000-rule total normally
 leaves 2,500 count slots for root-created rules, although root can still fill the
@@ -87,6 +89,41 @@ packets remain allowed but create no new rules while persistence is paused. An
 immutable current-policy admission index also keeps exact-known and saturated
 observations out of the 512-item persistence queue; only a new candidate consumes
 a queue slot.
+
+### Learning quotas in v0.2.5
+
+Root can set the optional fixed-path `/etc/openshield/learning-limits.json`:
+
+```json
+{"per_uid":4096,"per_application":1024}
+```
+
+The JSON object requires exactly these two fields and must fit within 4 KiB;
+duplicate or unknown fields are rejected. The file and its parent directories must be root-owned, safely permissioned,
+and not symbolic links; use mode `0600` for the file. The package does not
+install or overwrite this local configuration. A missing file uses the defaults
+above. Both values are integers satisfying
+`1 <= per_application <= per_uid <= 7500`. The daemon reads the configuration
+at startup, after installing bootstrap `BlockAll`; malformed or unsafe
+configuration fails startup rather than silently using defaults. Changes take
+effect on daemon restart. The global 7,500 automatic-rule, 10,000 total-rule,
+and 8 MiB state limits remain unchanged.
+
+The `StatusV3` response exposes bounded scalar quota status and skipped
+observations without disclosing per-application selectors. Saturation reflects
+current rules; the skipped-observation counter is cumulative for the current
+daemon process, not a count of unique missing rules or a historical total.
+The TUI warns about
+incomplete learning, including when root requests Enforcing; this warning does
+not veto an authorized mode change. Absence of a quota warning is not proof
+that every connection was learned: attribution, observation queues, and storage
+can also lose observations.
+
+Upgrading preserves existing rules. Traffic missed because an earlier quota
+was exhausted must be observed again in Learning before its missing rules can
+be created. Review the resulting rules before Enforcing. Raising admission
+budgets neither grants broad application access nor fixes attribution CPU cost
+or latency; explicit denies and fail-closed Enforcing remain unchanged.
 
 Application Learning uses a two-phase durable commit. Candidate preparation,
 admission reservation, and a pending-candidate admission index run under the
@@ -447,7 +484,7 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. Under the current v0.2.4 CI policy, relative DUT-cgroup CPU
+confidence bound. Under the current v0.2.5 CI policy, relative DUT-cgroup CPU
 and request/connect-latency crossings are explicitly advisory;
 relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
 p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
@@ -458,7 +495,7 @@ explicit action. The
 retained full v0.1.31 run was structurally valid but failed its performance
 gate. The retained full local v0.1.32 run passed its authenticated performance
 gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
-and report and is not silently promoted to v0.2.4.
+and report and is not silently promoted to v0.2.5.
 
 ## Installation and init systems
 

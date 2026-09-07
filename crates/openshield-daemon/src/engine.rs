@@ -5,7 +5,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
     mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -13,15 +13,16 @@ use chrono::Utc;
 use openshield_core::LearnedEndpoint;
 use openshield_core::{
     ApplicationLearningAdmission, ApplicationLearningAdmissionIndex, CoreError, Event, EventKind,
-    FirewallCounters, LearnedApplicationEndpoint, MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule,
-    RuleAction, RuleOrigin, Snapshot, State, StateStore, TransportProtocol,
+    FirewallCounters, LearnedApplicationEndpoint, LearningLimits, MAX_AUTOMATIC_LEARNED_RULES,
+    MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule, RuleAction, RuleOrigin, Snapshot, State,
+    StateStore, TransportProtocol,
 };
 #[cfg(test)]
 use openshield_protocol::FirewallBackendKind;
 use openshield_protocol::{
-    Ack, CompatibilityLevel, CompatibilityReason, ControlRequest, ErrorCode, NfqueueCounters,
-    OutboundGroupAction, OutboundGroupSelector, ProtocolError, Response, RuntimeCompatibility,
-    clamp_page_limit,
+    Ack, CompatibilityLevel, CompatibilityReason, ControlRequest, ErrorCode, LearningStatus,
+    NfqueueCounters, OutboundGroupAction, OutboundGroupSelector, ProtocolError, Response,
+    RuntimeCompatibility, clamp_page_limit,
 };
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -265,6 +266,9 @@ impl Drop for EventSubscription {
 
 pub struct Engine {
     state: State,
+    learning_limits: LearningLimits,
+    quota_skipped_observations: SaturatingCounter,
+    last_quota_warning: Mutex<Option<Instant>>,
     application_policy: Arc<ApplicationDecisionPolicy>,
     application_learning_admission: Arc<ApplicationLearningAdmissionIndex>,
     pending_application_learning_admission: Option<Arc<ApplicationLearningAdmissionIndex>>,
@@ -575,8 +579,11 @@ fn build_application_decision_policy(state: &State) -> ApplicationDecisionPolicy
     })
 }
 
-fn build_application_learning_admission(state: &State) -> ApplicationLearningAdmissionIndex {
-    state.application_learning_admission_index()
+fn build_application_learning_admission(
+    state: &State,
+    limits: LearningLimits,
+) -> ApplicationLearningAdmissionIndex {
+    state.application_learning_admission_index_with_limits(limits)
 }
 
 fn validate_application_learning_transition(
@@ -635,10 +642,20 @@ fn validate_application_learning_transition(
 }
 
 impl Engine {
+    #[cfg(test)]
     pub fn load(
+        backend: Box<dyn FirewallBackend>,
+        store: Box<dyn StateStore>,
+        events: EventBus,
+    ) -> Result<Self> {
+        Self::load_with_learning_limits(backend, store, events, LearningLimits::default())
+    }
+
+    pub fn load_with_learning_limits(
         mut backend: Box<dyn FirewallBackend>,
         store: Box<dyn StateStore>,
         events: EventBus,
+        learning_limits: LearningLimits,
     ) -> Result<Self> {
         let persistence = Arc::new(PersistenceCoordinator::new(store));
         // Do not leave a policy from an earlier daemon instance active while
@@ -692,9 +709,15 @@ impl Engine {
         };
 
         let application_policy = Arc::new(build_application_decision_policy(&state));
-        let application_learning_admission = Arc::new(build_application_learning_admission(&state));
+        let application_learning_admission = Arc::new(build_application_learning_admission(
+            &state,
+            learning_limits,
+        ));
         Ok(Self {
             state,
+            learning_limits,
+            quota_skipped_observations: SaturatingCounter::default(),
+            last_quota_warning: Mutex::new(None),
             application_policy,
             application_learning_admission,
             pending_application_learning_admission: None,
@@ -852,7 +875,10 @@ impl Engine {
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?
         {
             ApplicationLearningAdmission::AlreadyKnown => Ok(LearningQueueAdmission::AlreadyKnown),
-            ApplicationLearningAdmission::Saturated => Ok(LearningQueueAdmission::Saturated),
+            ApplicationLearningAdmission::Saturated => {
+                self.record_learning_quota_skipped(1);
+                Ok(LearningQueueAdmission::Saturated)
+            }
             ApplicationLearningAdmission::Candidate => Ok(LearningQueueAdmission::Enqueue),
         }
     }
@@ -891,6 +917,64 @@ impl Engine {
             nfqueue: self.nfqueue_counters.snapshot(),
             runtime_compatibility,
         }
+    }
+
+    /// Quota evidence is aggregate-only, including for privileged callers.
+    /// It reports capacity and lost observations, never certifies that all
+    /// applications or endpoints have been learned successfully.
+    pub fn learning_status(&self) -> LearningStatus {
+        let summary = self.application_learning_admission.summary();
+        LearningStatus {
+            per_uid_limit: u32::try_from(self.learning_limits.per_uid()).unwrap_or(u32::MAX),
+            per_application_limit: u32::try_from(self.learning_limits.per_application())
+                .unwrap_or(u32::MAX),
+            automatic_rule_limit: u32::try_from(MAX_AUTOMATIC_LEARNED_RULES).unwrap_or(u32::MAX),
+            total_rule_limit: u32::try_from(MAX_RULES).unwrap_or(u32::MAX),
+            automatic_rules: u32::try_from(summary.automatic_rules).unwrap_or(u32::MAX),
+            saturated_uids: u32::try_from(summary.saturated_uids).unwrap_or(u32::MAX),
+            saturated_applications: u32::try_from(summary.saturated_applications)
+                .unwrap_or(u32::MAX),
+            quota_skipped_observations: self.quota_skipped_observations.load(),
+        }
+    }
+
+    pub fn status_v3_response(&self) -> Response {
+        if self.fatal {
+            return Response::Error(fatal_protocol_error());
+        }
+        Response::StatusV3 {
+            revision: self.state.revision(),
+            mode: self.state.mode(),
+            rule_count: u32::try_from(self.state.rules().len()).unwrap_or(u32::MAX),
+            backend: self.backend.kind(),
+            nfqueue: self.nfqueue_counters.snapshot(),
+            runtime_compatibility: self.runtime_compatibility(),
+            learning: self.learning_status(),
+        }
+    }
+
+    fn record_learning_quota_skipped(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        for _ in 0..count {
+            self.quota_skipped_observations.increment();
+        }
+        // Best effort logging cannot stall the packet decision path. The
+        // lifetime counter remains visible even when a log is suppressed.
+        let Ok(mut last) = self.last_quota_warning.try_lock() else {
+            return;
+        };
+        if last.is_some_and(|previous| previous.elapsed() < Duration::from_secs(30)) {
+            return;
+        }
+        *last = Some(Instant::now());
+        warn!(
+            skipped_observations = self.quota_skipped_observations.load(),
+            per_uid_limit = self.learning_limits.per_uid(),
+            per_application_limit = self.learning_limits.per_application(),
+            "application learning quota reached; traffic may pass in Learning without a saved rule; review learning capacity before Enforcing"
+        );
     }
 
     #[must_use]
@@ -962,6 +1046,14 @@ impl Engine {
             ));
         }
 
+        let entering_enforcing = self.state.mode() == Mode::Learning
+            && matches!(
+                &request,
+                ControlRequest::SetMode {
+                    mode: Mode::Enforcing,
+                    ..
+                }
+            );
         let mut candidate = self.state.clone();
         let (events, affected_rule) = apply_control_to_candidate(&mut candidate, request)?;
 
@@ -970,6 +1062,22 @@ impl Engine {
             .map_err(|error| core_protocol_error(&error))?;
         let revision = candidate.revision();
         self.commit(candidate, &events)?;
+        if entering_enforcing {
+            let status = self.learning_status();
+            if status.saturated_uids > 0
+                || status.saturated_applications > 0
+                || status.automatic_rules >= status.automatic_rule_limit
+                || self.state.rules().len() >= MAX_RULES
+                || status.quota_skipped_observations > 0
+            {
+                warn!(
+                    skipped_observations = status.quota_skipped_observations,
+                    saturated_uids = status.saturated_uids,
+                    saturated_applications = status.saturated_applications,
+                    "Enforcing selected with learning quota warnings; unlearned traffic remains blocked"
+                );
+            }
+        }
         Ok(Ack::new(revision, affected_rule))
     }
 
@@ -1098,24 +1206,46 @@ impl Engine {
             || self.learning_persistence != LearningPersistence::Active
             || self.state.mode() != Mode::Learning
             || self.state.flow_generation() != expected_flow_generation
-            || self.state.rules().len() >= MAX_RULES
         {
             return Ok(None);
         }
 
         let previous = self.state.clone();
         let mut candidate = self.state.clone();
-        let valid_endpoints = endpoints.into_iter().take(MAX_RULES).filter(|endpoint| {
-            if let Err(error) = endpoint.validate() {
-                warn!(%error, "ignoring invalid application endpoint from packet quarantine");
-                false
-            } else {
-                true
-            }
-        });
+        let valid_endpoints: Vec<_> = endpoints
+            .into_iter()
+            .take(MAX_RULES)
+            .filter(|endpoint| {
+                if let Err(error) = endpoint.validate() {
+                    warn!(%error, "ignoring invalid application endpoint from packet quarantine");
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         let outcomes = candidate
-            .learn_new_application_endpoints(valid_endpoints, MAX_LEARNED_RULES_PER_POLL)
+            .learn_new_application_endpoints_with_limits(
+                valid_endpoints.iter().cloned(),
+                MAX_LEARNED_RULES_PER_POLL,
+                self.learning_limits,
+            )
             .map_err(|error| core_protocol_error(&error))?;
+        // Classify against the resulting candidate: this catches capacity
+        // exhausted inside this batch while excluding exact duplicates and
+        // already saved rules. No dropped observation is treated as learned.
+        let resulting_admission =
+            build_application_learning_admission(&candidate, self.learning_limits);
+        let skipped = valid_endpoints
+            .iter()
+            .filter(|endpoint| {
+                matches!(
+                    resulting_admission.classify(endpoint),
+                    Ok(ApplicationLearningAdmission::Saturated)
+                )
+            })
+            .count();
+        self.record_learning_quota_skipped(skipped);
         let events: Vec<Event> = outcomes
             .into_iter()
             .filter_map(|outcome| outcome.event)
@@ -1153,7 +1283,7 @@ impl Engine {
         self.next_learning_transaction = token;
         let candidate = Arc::new(candidate);
         self.pending_application_learning_admission = Some(Arc::new(
-            build_application_learning_admission(candidate.as_ref()),
+            build_application_learning_admission(candidate.as_ref(), self.learning_limits),
         ));
         self.pending_application_learning_candidate = Some(Arc::clone(&candidate));
         self.pending_application_learning_events.clone_from(&events);
@@ -1547,7 +1677,10 @@ impl Engine {
 
     fn replace_state(&mut self, state: State) {
         let application_policy = Arc::new(build_application_decision_policy(&state));
-        let application_learning_admission = Arc::new(build_application_learning_admission(&state));
+        let application_learning_admission = Arc::new(build_application_learning_admission(
+            &state,
+            self.learning_limits,
+        ));
         self.state = state;
         self.application_policy = application_policy;
         self.application_learning_admission = application_learning_admission;
@@ -1997,9 +2130,9 @@ mod tests {
             let mut state = state
                 .lock()
                 .map_err(|_| anyhow!("blocking store poisoned"))?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(5);
             while !state.entered_save {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     bail!("timed out waiting for blocked state save");
                 }
@@ -2119,13 +2252,21 @@ mod tests {
     }
 
     fn engine_with_state(state: State) -> AnyResult<(Engine, BackendProbe, StoreProbe, EventBus)> {
+        engine_with_state_and_limits(state, LearningLimits::default())
+    }
+
+    fn engine_with_state_and_limits(
+        state: State,
+        limits: LearningLimits,
+    ) -> AnyResult<(Engine, BackendProbe, StoreProbe, EventBus)> {
         let backend = BackendProbe::default();
         let store = StoreProbe::new(state);
         let events = EventBus::new();
-        let mut engine = Engine::load(
+        let mut engine = Engine::load_with_learning_limits(
             Box::new(backend.clone()),
             Box::new(store.clone()),
             events.clone(),
+            limits,
         )?;
         engine.activate_startup_policy()?;
         backend
@@ -3063,6 +3204,98 @@ mod tests {
     }
 
     #[test]
+    fn quota_skips_are_visible_and_do_not_block_privileged_enforcing() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let (mut engine, _, store, _) =
+            engine_with_state_and_limits(state, LearningLimits::new(2, 1)?)?;
+        let generation = engine.state.flow_generation();
+        let first = learned_application_endpoint(10, 1_000, 1)?;
+        let second = learned_application_endpoint(11, 1_000, 1)?;
+        assert_eq!(
+            engine
+                .harvest_application_learning(generation, vec![first.clone(), second.clone()])
+                .map_err(|error| anyhow!(error.message))?,
+            2,
+        );
+        let status = engine.learning_status();
+        assert_eq!(status.per_uid_limit, 2);
+        assert_eq!(status.per_application_limit, 1);
+        assert_eq!(status.automatic_rules, 2); // learned endpoint and disabled template
+        assert_eq!(status.saturated_uids, 0);
+        assert_eq!(status.saturated_applications, 1);
+        assert_eq!(status.quota_skipped_observations, 1);
+        // Duplicate evidence is not a quota loss, and never enables a rule.
+        assert_eq!(
+            engine
+                .harvest_application_learning(generation, vec![first])
+                .map_err(|error| anyhow!(error.message))?,
+            0,
+        );
+        assert_eq!(engine.learning_status().quota_skipped_observations, 1);
+        assert_eq!(
+            application_learning_admission(&engine, generation, &second)?,
+            LearningQueueAdmission::Saturated
+        );
+        assert_eq!(engine.learning_status().quota_skipped_observations, 2);
+        assert!(
+            matches!(engine.status_v3_response(), Response::StatusV3 { learning, .. }
+            if learning.quota_skipped_observations == 2)
+        );
+        engine
+            .handle_control(ControlRequest::SetMode {
+                expected_revision: engine.state.revision(),
+                mode: Mode::Enforcing,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(engine.state.mode(), Mode::Enforcing);
+        assert_eq!(engine.learning_status().quota_skipped_observations, 2);
+        assert_eq!(engine.learning_status().per_application_limit, 1);
+        assert_eq!(
+            store.persisted_state()?.map(|state| state.mode()),
+            Some(Mode::Enforcing)
+        );
+        assert_eq!(
+            engine
+                .state
+                .rules()
+                .filter(|rule| rule.spec.origin == RuleOrigin::Learned)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_learning_reservation_uses_custom_limits() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let (mut engine, _, _, _) =
+            engine_with_state_and_limits(state, LearningLimits::new(2, 1)?)?;
+        let generation = engine.state.flow_generation();
+        let first = learned_application_endpoint(10, 1_000, 1)?;
+        let second = learned_application_endpoint(11, 1_000, 1)?;
+        let transaction = engine
+            .prepare_application_learning(generation, vec![first])
+            .map_err(|error| anyhow!(error.message))?
+            .ok_or_else(|| anyhow!("expected a persistence transaction"))?;
+        assert_eq!(
+            application_learning_admission(&engine, generation, &second)?,
+            LearningQueueAdmission::Saturated
+        );
+        assert_eq!(engine.learning_status().quota_skipped_observations, 1);
+        let persisted = transaction.persist();
+        assert_eq!(
+            engine
+                .finalize_application_learning(persisted)
+                .map_err(|error| anyhow!(error.message))?,
+            2
+        );
+        assert_eq!(engine.learning_status().saturated_applications, 1);
+        Ok(())
+    }
+
+    #[test]
     fn learning_admission_cache_skips_known_and_saturated_observations() -> AnyResult<()> {
         let mut state = State::new();
         state.set_mode(Mode::Learning)?;
@@ -3078,7 +3311,8 @@ mod tests {
         );
         let saturated = learned_application_endpoint(300, 1_000, 1)?;
         let candidate = learned_application_endpoint(301, 1_001, 2)?;
-        let (mut engine, _backend, _store, _events) = engine_with_state(state)?;
+        let (mut engine, _backend, _store, _events) =
+            engine_with_state_and_limits(state, LearningLimits::new(512, 256)?)?;
         let generation = engine.state.flow_generation();
 
         assert_eq!(
@@ -3285,7 +3519,7 @@ mod tests {
                 })
         });
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let applied = backend
                 .applied
@@ -3296,7 +3530,7 @@ mod tests {
                 break;
             }
             drop(applied);
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 bail!("operator BlockAll did not reach the kernel before storage was released");
             }
             thread::yield_now();

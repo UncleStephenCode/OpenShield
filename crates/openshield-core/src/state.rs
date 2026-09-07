@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     ApplicationPath, ApplicationSelector, CgroupPath, Direction, FirewallCounters,
-    LearnedApplicationEndpoint, LearnedEndpoint, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec,
-    ValidationError, model::REDACTED_APPLICATION_RULE_NAME,
+    LearnedApplicationEndpoint, LearnedEndpoint, LearningLimits, LearningQuotaSummary, Rule,
+    RuleAction, RuleName, RuleOrigin, RuleSpec, ValidationError,
+    model::REDACTED_APPLICATION_RULE_NAME,
 };
 
 pub const MAX_RULES: usize = 10_000;
@@ -21,11 +22,6 @@ pub const MAX_RULES: usize = 10_000;
 /// untrusted workload cannot consume the complete rule capacity during a
 /// Learning window.
 pub const MAX_AUTOMATIC_LEARNED_RULES: usize = 7_500;
-/// Maximum number of automatically learned rules attributed to one filesystem UID.
-pub const MAX_LEARNED_RULES_PER_UID: usize = 512;
-/// Maximum number of automatically learned rules attributed to one executable
-/// file identity for one filesystem UID.
-pub const MAX_LEARNED_RULES_PER_APPLICATION: usize = 256;
 /// Maximum exact JSON size of persisted policy state.
 pub const MAX_STATE_BYTES: usize = 8 * 1024 * 1024;
 const APPLICATION_GROUP_TEMPLATE_NAME: &str = "application-wide template";
@@ -365,7 +361,16 @@ impl State {
     /// queue.
     #[must_use]
     pub fn application_learning_admission_index(&self) -> ApplicationLearningAdmissionIndex {
-        ApplicationLearningAdmissionIndex::from_state(self)
+        self.application_learning_admission_index_with_limits(LearningLimits::default())
+    }
+
+    /// Builds an admission index using the administrator's validated budgets.
+    #[must_use]
+    pub fn application_learning_admission_index_with_limits(
+        &self,
+        limits: LearningLimits,
+    ) -> ApplicationLearningAdmissionIndex {
+        ApplicationLearningAdmissionIndex::from_state(self, limits)
     }
 
     /// Changes the operating mode and emits a revisioned event.
@@ -702,6 +707,27 @@ impl State {
         endpoints: impl IntoIterator<Item = LearnedApplicationEndpoint>,
         maximum_new: usize,
     ) -> Result<Vec<LearnOutcome>, CoreError> {
+        self.learn_new_application_endpoints_with_limits(
+            endpoints,
+            maximum_new,
+            LearningLimits::default(),
+        )
+    }
+
+    /// Learns application endpoints within administrator-selected count budgets.
+    ///
+    /// Global rule and serialized-state limits remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] for invalid endpoints, exhausted state capacity,
+    /// or an unrepresentable policy revision.
+    pub fn learn_new_application_endpoints_with_limits(
+        &mut self,
+        endpoints: impl IntoIterator<Item = LearnedApplicationEndpoint>,
+        maximum_new: usize,
+        limits: LearningLimits,
+    ) -> Result<Vec<LearnOutcome>, CoreError> {
         let endpoints: Vec<LearnedApplicationEndpoint> =
             endpoints.into_iter().take(MAX_RULES).collect();
         for endpoint in &endpoints {
@@ -767,12 +793,12 @@ impl State {
                 .executable_file
                 .ok_or(crate::ApplicationValidationError::IncompleteLearnedApplicationIdentity)
                 .map_err(ValidationError::from)?;
-            if learned_per_uid.get(&uid).copied().unwrap_or_default() >= MAX_LEARNED_RULES_PER_UID
+            if learned_per_uid.get(&uid).copied().unwrap_or_default() >= limits.per_uid()
                 || learned_per_application
                     .get(&(uid, file))
                     .copied()
                     .unwrap_or_default()
-                    >= MAX_LEARNED_RULES_PER_APPLICATION
+                    >= limits.per_application()
             {
                 continue;
             }
@@ -1096,6 +1122,7 @@ pub enum ApplicationLearningAdmission {
 /// discard.
 #[derive(Clone, Debug)]
 pub struct ApplicationLearningAdmissionIndex {
+    limits: LearningLimits,
     revision: u64,
     flow_generation: u32,
     mode: crate::Mode,
@@ -1108,7 +1135,7 @@ pub struct ApplicationLearningAdmissionIndex {
 }
 
 impl ApplicationLearningAdmissionIndex {
-    fn from_state(state: &State) -> Self {
+    fn from_state(state: &State, limits: LearningLimits) -> Self {
         let mut known = HashSet::new();
         let mut known_templates = HashSet::new();
         let mut learned_rule_count = 0_usize;
@@ -1139,6 +1166,7 @@ impl ApplicationLearningAdmissionIndex {
         }
 
         Self {
+            limits,
             revision: state.revision,
             flow_generation: state.flow_generation,
             mode: state.mode,
@@ -1164,6 +1192,23 @@ impl ApplicationLearningAdmissionIndex {
     #[must_use]
     pub const fn mode(&self) -> crate::Mode {
         self.mode
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> LearningQuotaSummary {
+        LearningQuotaSummary {
+            automatic_rules: self.learned_rule_count,
+            saturated_uids: self
+                .learned_per_uid
+                .values()
+                .filter(|count| **count >= self.limits.per_uid())
+                .count(),
+            saturated_applications: self
+                .learned_per_application
+                .values()
+                .filter(|count| **count >= self.limits.per_application())
+                .count(),
+        }
     }
 
     /// Checks whether an already validated observation can consume another
@@ -1201,13 +1246,13 @@ impl ApplicationLearningAdmissionIndex {
         let Some(file) = endpoint.application.executable_file else {
             return Err(crate::ApplicationValidationError::IncompleteLearnedApplicationIdentity);
         };
-        if self.learned_per_uid.get(&uid).copied().unwrap_or_default() >= MAX_LEARNED_RULES_PER_UID
+        if self.learned_per_uid.get(&uid).copied().unwrap_or_default() >= self.limits.per_uid()
             || self
                 .learned_per_application
                 .get(&(uid, file))
                 .copied()
                 .unwrap_or_default()
-                >= MAX_LEARNED_RULES_PER_APPLICATION
+                >= self.limits.per_application()
         {
             return Ok(ApplicationLearningAdmission::Saturated);
         }
@@ -1803,34 +1848,38 @@ mod tests {
     #[test]
     fn application_learning_enforces_per_application_and_uid_quotas() -> Result<(), Box<dyn Error>>
     {
+        let limits = LearningLimits::new(8, 4)?;
         let mut state = State::new();
         state.set_mode(Mode::Learning)?;
-        let first_application = (0..300)
+        let first_application = (0..6)
             .map(|offset| learned_application_endpoint(offset, 1_000, 1))
             .collect::<Result<Vec<_>, _>>()?;
         let known_endpoint = first_application[0].clone();
         assert_eq!(
             state
-                .learn_new_application_endpoints(first_application, MAX_RULES)?
+                .learn_new_application_endpoints_with_limits(first_application, MAX_RULES, limits)?
                 .len(),
-            MAX_LEARNED_RULES_PER_APPLICATION + 1
+            limits.per_application() + 1
         );
 
-        let second_application = (300..600)
+        let second_application = (6..12)
             .map(|offset| learned_application_endpoint(offset, 1_000, 2))
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(
             state
-                .learn_new_application_endpoints(second_application, MAX_RULES)?
+                .learn_new_application_endpoints_with_limits(second_application, MAX_RULES, limits)?
                 .len(),
-            MAX_LEARNED_RULES_PER_APPLICATION + 1
+            limits.per_application() + 1
         );
-        assert_eq!(state.rules().len(), MAX_LEARNED_RULES_PER_UID + 2);
+        assert_eq!(state.rules().len(), limits.per_uid() + 2);
 
         let saturated_uid = learned_application_endpoint(700, 1_000, 3)?;
         let other_uid = learned_application_endpoint(701, 1_001, 3)?;
-        let mixed =
-            state.learn_new_application_endpoints([saturated_uid.clone(), other_uid], MAX_RULES)?;
+        let mixed = state.learn_new_application_endpoints_with_limits(
+            [saturated_uid.clone(), other_uid],
+            MAX_RULES,
+            limits,
+        )?;
         assert_eq!(mixed.len(), 2);
         assert_eq!(
             mixed[0]
@@ -1851,7 +1900,15 @@ mod tests {
             Some(1_001)
         );
 
-        let admission = state.application_learning_admission_index();
+        let admission = state.application_learning_admission_index_with_limits(limits);
+        assert_eq!(
+            admission.summary(),
+            LearningQuotaSummary {
+                automatic_rules: 12,
+                saturated_uids: 1,
+                saturated_applications: 2,
+            }
+        );
         assert_eq!(admission.revision(), state.revision());
         assert_eq!(admission.flow_generation(), state.flow_generation());
         assert_eq!(admission.mode(), state.mode());
@@ -1866,6 +1923,96 @@ mod tests {
         assert_eq!(
             admission.classify(&learned_application_endpoint(702, 1_002, 3)?)?,
             ApplicationLearningAdmission::Candidate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upgraded_defaults_admit_after_the_historical_512_rule_uid_limit()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        let historical_limits = LearningLimits::new(512, 256)?;
+        let endpoints = (0..512)
+            .map(|offset| learned_application_endpoint(offset, 1_000, u64::from(offset / 128)))
+            .collect::<Result<Vec<_>, _>>()?;
+        state.learn_new_application_endpoints_with_limits(
+            endpoints,
+            MAX_RULES,
+            historical_limits,
+        )?;
+        let next = learned_application_endpoint(512, 1_000, 0)?;
+        assert_eq!(
+            state
+                .application_learning_admission_index_with_limits(historical_limits)
+                .classify(&next)?,
+            ApplicationLearningAdmission::Saturated
+        );
+        assert_eq!(
+            state
+                .application_learning_admission_index()
+                .classify(&next)?,
+            ApplicationLearningAdmission::Candidate
+        );
+        let existing_ids: HashSet<_> = state.rules().map(|rule| rule.id).collect();
+        let learned = state.learn_new_application_endpoints([next.clone()], MAX_RULES)?;
+        assert_eq!(learned.len(), 1);
+        assert!(learned[0].rule.spec.enabled);
+        assert_eq!(learned[0].rule.spec.action, RuleAction::Accept);
+        assert!(existing_ids.iter().all(|id| state.rule(*id).is_some()));
+        let reloaded: State = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
+        reloaded.validate()?;
+        assert_eq!(
+            reloaded
+                .application_learning_admission_index()
+                .classify(&next)?,
+            ApplicationLearningAdmission::AlreadyKnown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_and_old_executable_versions_still_consume_learning_quota()
+    -> Result<(), Box<dyn Error>> {
+        let limits = LearningLimits::new(2, 1)?;
+        let mut state = State::new();
+        let old = learned_application_endpoint(30, 1_000, 1)?;
+        let mut current = learned_application_endpoint(31, 1_000, 2)?;
+        current.application.executable = old.application.executable.clone();
+        state.learn_new_application_endpoints_with_limits(
+            [old.clone(), current.clone()],
+            MAX_RULES,
+            limits,
+        )?;
+        let learned_ids: Vec<_> = state
+            .rules()
+            .filter(|rule| rule.spec.origin == RuleOrigin::Learned)
+            .map(|rule| rule.id)
+            .collect();
+        for id in learned_ids {
+            state.set_rule_enabled(id, false)?;
+        }
+        let index = state.application_learning_admission_index_with_limits(limits);
+        assert_eq!(
+            index.summary(),
+            LearningQuotaSummary {
+                automatic_rules: 3,
+                saturated_uids: 1,
+                saturated_applications: 2,
+            }
+        );
+        assert_eq!(
+            index.classify(&old)?,
+            ApplicationLearningAdmission::AlreadyKnown
+        );
+        let new_endpoint = learned_application_endpoint(32, 1_000, 3)?;
+        assert_eq!(
+            index.classify(&new_endpoint)?,
+            ApplicationLearningAdmission::Saturated
+        );
+        assert!(
+            state
+                .learn_new_application_endpoints_with_limits([new_endpoint], MAX_RULES, limits)?
+                .is_empty()
         );
         Ok(())
     }

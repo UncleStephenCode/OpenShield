@@ -1,4 +1,9 @@
 {
+  "learning.limits": "محدودیت‌های یادگیری: UID {uid}؛ برنامه {application}؛ خودکار {automatic}؛ کل {total}",
+  "learning.counts": "قواعد خودکار: {rules}؛ UID/برنامه‌های رسیده به سقف: {uids}/{applications}",
+  "learning.skipped": "مشاهدات نادیده گرفته‌شده به دلیل سهمیه از شروع دیمن: {skipped}",
+  "learning.unknown": "سهمیه‌های یادگیری: در دسترس نیست یا در انتظار وضعیت",
+  "learning.warning": "یادگیری ممکن است ناقص باشد: سقف سهمیه رسیده یا مشاهداتی نادیده گرفته شده‌اند. پیش از Enforcing قواعد را بررسی کنید.",
   "group.title": " عملیات گروه ",
   "group.scope": "گروه: {group}\nقانون‌ها: {count}",
   "group.delete": "حذف",

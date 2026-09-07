@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Юрениуню чеклери: UID {uid}; приложение {application}; автомат {automatic}; бары {total}",
+  "learning.counts": "Автомат эрежеле: {rules}; чекге жетген UID/приложенияла: {uids}/{applications}",
+  "learning.skipped": "Демон башланнгандан бери квота себепли ётдюрюлген кёзетиуле: {skipped}",
+  "learning.unknown": "Юрениуню квоталары: шартла жокъду неда хал кютюледи",
+  "learning.warning": "Юрениу толу болмагъан болур: чекге жетген неда кёзетиуле ётдюрюлгендиле. Enforcing аллында эрежелени тинтигиз.",
   "group.title": " Къауумну амаллары ",
   "group.scope": "Къауум: {group}\nЭрежеле: {count}",
   "group.delete": "Кетер",

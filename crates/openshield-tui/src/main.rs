@@ -127,6 +127,9 @@ fn drain_observer_updates(observer: &Observer, app: &mut App) -> bool {
             ObserverUpdate::TelemetryDisconnected(reason) => {
                 app.set_telemetry_disconnected(reason);
             }
+            ObserverUpdate::LearningStatus { revision, learning } => {
+                app.set_learning_status(revision, learning);
+            }
             ObserverUpdate::Snapshot {
                 snapshot,
                 backend,
@@ -540,6 +543,39 @@ mod tests {
         );
         assert!(request.is_none());
         assert_eq!(app.overlay, Overlay::ConfirmBlockAll);
+    }
+
+    #[test]
+    fn learning_quota_warning_cannot_prevent_privileged_enforcing() {
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(openshield_core::Snapshot {
+            revision: 4,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        });
+        app.learning_status = Some(openshield_protocol::LearningStatus {
+            per_uid_limit: 2_048,
+            per_application_limit: 1_024,
+            automatic_rule_limit: 4_000,
+            total_rule_limit: 4_096,
+            automatic_rules: 0,
+            saturated_uids: 0,
+            saturated_applications: 0,
+            quota_skipped_observations: u64::MAX,
+        });
+        assert!(app.learning_needs_attention());
+        app.open_mode_picker();
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)
+            ),
+            Some(ControlRequest::SetMode {
+                expected_revision: 4,
+                mode: Mode::Enforcing
+            })
+        );
     }
 
     #[test]

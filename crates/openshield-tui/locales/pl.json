@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Limity uczenia: UID {uid}; aplikacja {application}; automatyczne {automatic}; łącznie {total}",
+  "learning.counts": "Reguły automatyczne: {rules}; UID/aplikacje na limicie: {uids}/{applications}",
+  "learning.skipped": "Obserwacje pominięte przez limity od uruchomienia demona: {skipped}",
+  "learning.unknown": "Limity uczenia: dane niedostępne lub oczekiwanie na stan",
+  "learning.warning": "Uczenie może być niepełne: osiągnięto limit lub pominięto obserwacje. Sprawdź reguły przed Enforcing.",
   "group.title": " Działania na grupie ",
   "group.scope": "Grupa: {group}\nReguły: {count}",
   "group.delete": "Usuń",

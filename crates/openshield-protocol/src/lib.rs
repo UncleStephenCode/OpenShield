@@ -259,6 +259,34 @@ pub struct NfqueueCounters {
     pub denied: u64,
 }
 
+/// Aggregate learning quotas, without process, UID or destination identifiers.
+/// Saturation describes the current rules; skipped observations are a
+/// saturating process-lifetime counter, not a certificate of complete learning.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningStatus {
+    pub per_uid_limit: u32,
+    pub per_application_limit: u32,
+    pub automatic_rule_limit: u32,
+    pub total_rule_limit: u32,
+    pub automatic_rules: u32,
+    pub saturated_uids: u32,
+    pub saturated_applications: u32,
+    pub quota_skipped_observations: u64,
+}
+
+impl LearningStatus {
+    /// A warning only: reaching a quota must never prevent privileged Enforcing.
+    #[must_use]
+    pub const fn needs_attention(self, total_rules: u32) -> bool {
+        self.saturated_uids != 0
+            || self.saturated_applications != 0
+            || self.automatic_rules >= self.automatic_rule_limit
+            || total_rules >= self.total_rule_limit
+            || self.quota_skipped_observations != 0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[allow(
     clippy::large_enum_variant,
@@ -292,6 +320,9 @@ pub enum ReadRequest {
     /// evidence. The separate request keeps the original `Status` wire shape
     /// stable for older clients.
     StatusV2,
+    /// Returns `StatusV2` fields plus aggregate learning quotas. Older status
+    /// response shapes remain unchanged for existing observers.
+    StatusV3,
     /// Returns rules ordered by UUID strictly after `after`.
     ///
     /// `limit` is a bounded client hint. Servers may choose any positive page
@@ -462,6 +493,15 @@ pub enum Response {
         #[serde(default)]
         nfqueue: NfqueueCounters,
         runtime_compatibility: RuntimeCompatibility,
+    },
+    StatusV3 {
+        revision: u64,
+        mode: Mode,
+        rule_count: u32,
+        backend: FirewallBackendKind,
+        nfqueue: NfqueueCounters,
+        runtime_compatibility: RuntimeCompatibility,
+        learning: LearningStatus,
     },
     RulesPage {
         revision: u64,
@@ -1028,6 +1068,95 @@ mod tests {
         write_response(&mut response_bytes, &response)?;
         assert_eq!(read_response(&mut Cursor::new(response_bytes))?, response);
         Ok(())
+    }
+
+    #[test]
+    fn status_v3_round_trip_is_bounded_and_preserves_aggregate_quotas() -> Result<(), Box<dyn Error>>
+    {
+        let request = Request::Read(ReadRequest::StatusV3);
+        let mut request_bytes = Vec::new();
+        write_request(&mut request_bytes, &request)?;
+        assert_eq!(read_request(&mut Cursor::new(request_bytes))?, request);
+        let learning = LearningStatus {
+            per_uid_limit: u32::MAX,
+            per_application_limit: u32::MAX,
+            automatic_rule_limit: u32::MAX,
+            total_rule_limit: u32::MAX,
+            automatic_rules: u32::MAX,
+            saturated_uids: u32::MAX,
+            saturated_applications: u32::MAX,
+            quota_skipped_observations: u64::MAX,
+        };
+        let response = Response::StatusV3 {
+            revision: u64::MAX,
+            mode: Mode::Learning,
+            rule_count: u32::MAX,
+            backend: FirewallBackendKind::Nftables,
+            nfqueue: NfqueueCounters::default(),
+            runtime_compatibility: RuntimeCompatibility::default(),
+            learning,
+        };
+        let mut bytes = Vec::new();
+        write_response(&mut bytes, &response)?;
+        assert!(
+            bytes.len() < 1_024,
+            "aggregate status must stay constant size"
+        );
+        assert_eq!(read_response(&mut Cursor::new(bytes))?, response);
+        let mut value = serde_json::to_value(&response)?;
+        let fields = value["data"]["learning"]
+            .as_object_mut()
+            .ok_or("missing learning object")?;
+        fields.remove("quota_skipped_observations");
+        assert!(serde_json::from_value::<Response>(value).is_err());
+        let mut value = serde_json::to_value(&response)?;
+        value["data"]["learning"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Response>(value).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn learning_attention_covers_current_saturation_and_lifetime_skips() {
+        let status = LearningStatus {
+            per_uid_limit: 512,
+            per_application_limit: 256,
+            automatic_rule_limit: 2_000,
+            total_rule_limit: 4_096,
+            automatic_rules: 512,
+            saturated_uids: 0,
+            saturated_applications: 0,
+            quota_skipped_observations: 0,
+        };
+        assert!(!status.needs_attention(600));
+        assert!(status.needs_attention(4_096));
+        assert!(
+            LearningStatus {
+                saturated_uids: 1,
+                ..status
+            }
+            .needs_attention(600)
+        );
+        assert!(
+            LearningStatus {
+                saturated_applications: 1,
+                ..status
+            }
+            .needs_attention(600)
+        );
+        assert!(
+            LearningStatus {
+                automatic_rules: 2_001,
+                ..status
+            }
+            .needs_attention(2_001)
+        );
+        assert!(
+            LearningStatus {
+                quota_skipped_observations: u64::MAX,
+                ..status
+            }
+            .needs_attention(600)
+        );
     }
 
     #[test]

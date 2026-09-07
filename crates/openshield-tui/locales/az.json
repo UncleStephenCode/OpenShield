@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Öyrənmə limitləri: UID {uid}; tətbiq {application}; avtomatik {automatic}; cəmi {total}",
+  "learning.counts": "Avtomatik qaydalar: {rules}; limitə çatmış UID/tətbiqlər: {uids}/{applications}",
+  "learning.skipped": "Demon başlayandan kvotaya görə buraxılmış müşahidələr: {skipped}",
+  "learning.unknown": "Öyrənmə kvotaları: məlumat yoxdur və ya vəziyyət gözlənilir",
+  "learning.warning": "Öyrənmə natamam ola bilər: limitə çatılıb və ya müşahidələr buraxılıb. Enforcing-dən əvvəl qaydaları yoxlayın.",
   "group.title": " Qrup əməliyyatları ",
   "group.scope": "Qrup: {group}\nQaydalar: {count}",
   "group.delete": "Sil",

@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Limites de aprendizagem: UID {uid}; aplicação {application}; automáticas {automatic}; total {total}",
+  "learning.counts": "Regras automáticas: {rules}; UID/aplicações no limite: {uids}/{applications}",
+  "learning.skipped": "Observações ignoradas por quotas desde o início do daemon: {skipped}",
+  "learning.unknown": "Quotas de aprendizagem: indisponíveis ou a aguardar estado",
+  "learning.warning": "A aprendizagem pode estar incompleta: limite atingido ou observações ignoradas. Reveja as regras antes de Enforcing.",
   "group.title": " Ações de grupo ",
   "group.scope": "Grupo: {group}\nRegras: {count}",
   "group.delete": "Excluir",

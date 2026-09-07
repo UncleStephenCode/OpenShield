@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Өйрәнеү сиктәре: UID {uid}; ҡушымта {application}; автоматик {automatic}; бөтәһе {total}",
+  "learning.counts": "Автоматик ҡағиҙәләр: {rules}; сиккә еткән UID/ҡушымталар: {uids}/{applications}",
+  "learning.skipped": "Демон эшләтелгәндән бирле квота арҡаһында төшөрөп ҡалдырылған күҙәтеүҙәр: {skipped}",
+  "learning.unknown": "Өйрәнеү квоталары: мәғлүмәт юҡ йәки хәл көтөлә",
+  "learning.warning": "Өйрәнеү тулы булмауы мөмкин: сиккә етте йәки күҙәтеүҙәр төшөрөп ҡалдырылды. Enforcing алдынан ҡағиҙәләрҙе тикшерегеҙ.",
   "group.title": " Төркөм ғәмәлдәре ",
   "group.scope": "Төркөм: {group}\nҠағиҙәләр: {count}",
   "group.delete": "Бөтөрөү",

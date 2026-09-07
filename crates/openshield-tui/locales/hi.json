@@ -1,4 +1,9 @@
 {
+  "learning.limits": "सीखने की सीमाएँ: UID {uid}; अनुप्रयोग {application}; स्वचालित {automatic}; कुल {total}",
+  "learning.counts": "स्वचालित नियम: {rules}; सीमा पर पहुँचे UID/अनुप्रयोग: {uids}/{applications}",
+  "learning.skipped": "डेमन शुरू होने के बाद कोटा के कारण छोड़े गए अवलोकन: {skipped}",
+  "learning.unknown": "सीखने का कोटा: अनुपलब्ध या स्थिति की प्रतीक्षा में",
+  "learning.warning": "सीमा पूरी होने या अवलोकन छूटने के कारण सीखना अधूरा हो सकता है। Enforcing से पहले नियम जाँचें।",
   "group.title": " समूह की कार्रवाइयाँ ",
   "group.scope": "समूह: {group}\nनियम: {count}",
   "group.delete": "हटाएँ",

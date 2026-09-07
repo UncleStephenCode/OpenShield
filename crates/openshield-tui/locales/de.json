@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Lernlimits: UID {uid}; Anwendung {application}; automatisch {automatic}; gesamt {total}",
+  "learning.counts": "Automatische Regeln: {rules}; UIDs/Anwendungen am Limit: {uids}/{applications}",
+  "learning.skipped": "Seit Daemon-Start wegen Quoten übersprungene Beobachtungen: {skipped}",
+  "learning.unknown": "Lernquoten: nicht verfügbar oder Status ausstehend",
+  "learning.warning": "Lernen möglicherweise unvollständig: Limit erreicht oder Beobachtungen übersprungen. Regeln vor Enforcing prüfen.",
   "group.title": " Gruppenaktionen ",
   "group.scope": "Gruppe: {group}\nRegeln: {count}",
   "group.delete": "Löschen",

@@ -57,7 +57,7 @@ admission run under the engine mutex, while atomic save and file/directory
 workload without intentionally stalling packet verdicts on that mutex; exact
 observations covered by the in-flight candidate are deduplicated. The harness
 does not relax NFQUEUE-error, drop, validity, or latency gates during a write.
-In OpenShield 0.2.4, the ordinary Learning path intentionally allows unmatched
+In OpenShield 0.2.5, the ordinary Learning path intentionally allows unmatched
 outbound traffic: observational attribution or persistence pressure may lose
 evidence but may not deny that packet. Enabled explicit denies are outside these
 capacity scenarios and remain enforceable. The performance gate still reports and rejects such lost evidence;
@@ -108,7 +108,7 @@ about which OpenShield path was measured. The backend name is recorded
 separately because the nftables-to-iptables startup fallback does not change
 these levels.
 
-These names do not describe an eBPF data plane. Version 0.2.4 exercises the
+These names do not describe an eBPF data plane. Version 0.2.5 exercises the
 existing nftables/iptables, conntrack, NFQUEUE, and procfs paths and introduces
 no `CAP_BPF`, kernel module, boot-parameter, or MOK requirement. The controlled
 NFQUEUE overload case is therefore still the relevant fail-closed saturation

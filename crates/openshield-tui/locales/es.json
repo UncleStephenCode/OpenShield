@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Límites de aprendizaje: UID {uid}; aplicación {application}; automáticas {automatic}; total {total}",
+  "learning.counts": "Reglas automáticas: {rules}; UID/aplicaciones en el límite: {uids}/{applications}",
+  "learning.skipped": "Observaciones omitidas por cuotas desde el inicio del demonio: {skipped}",
+  "learning.unknown": "Cuotas de aprendizaje: no disponibles o pendientes",
+  "learning.warning": "El aprendizaje puede estar incompleto: límite alcanzado u observaciones omitidas. Revise las reglas antes de Enforcing.",
   "group.title": " Acciones de grupo ",
   "group.scope": "Grupo: {group}\nReglas: {count}",
   "group.delete": "Eliminar",

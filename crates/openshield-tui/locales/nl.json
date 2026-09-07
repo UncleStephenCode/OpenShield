@@ -1,4 +1,9 @@
 {
+  "learning.limits": "Leerlimieten: UID {uid}; toepassing {application}; automatisch {automatic}; totaal {total}",
+  "learning.counts": "Automatische regels: {rules}; UID’s/toepassingen op de limiet: {uids}/{applications}",
+  "learning.skipped": "Vanwege quota overgeslagen waarnemingen sinds daemonstart: {skipped}",
+  "learning.unknown": "Leerquota: niet beschikbaar of wacht op status",
+  "learning.warning": "Leren is mogelijk onvolledig: limiet bereikt of waarnemingen overgeslagen. Controleer de regels vóór Enforcing.",
   "group.title": " Groepsacties ",
   "group.scope": "Groep: {group}\nRegels: {count}",
   "group.delete": "Verwijderen",
