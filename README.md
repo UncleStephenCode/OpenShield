@@ -2,7 +2,7 @@
 
 # OpenShield
 
-Current source release: **v0.2.3**.
+Current source release: **v0.2.4**.
 
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
@@ -447,7 +447,7 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. Under the current v0.2.3 CI policy, relative DUT-cgroup CPU
+confidence bound. Under the current v0.2.4 CI policy, relative DUT-cgroup CPU
 and request/connect-latency crossings are explicitly advisory;
 relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
 p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
@@ -458,7 +458,7 @@ explicit action. The
 retained full v0.1.31 run was structurally valid but failed its performance
 gate. The retained full local v0.1.32 run passed its authenticated performance
 gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
-and report and is not silently promoted to v0.2.3.
+and report and is not silently promoted to v0.2.4.
 
 ## Installation and init systems
 

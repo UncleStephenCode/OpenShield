@@ -188,6 +188,7 @@ EXPECTED_NFTABLES_ONLY_PACKAGE_NAMES = frozenset(
     {"libedit0", "libjansson4", "libnftables1", "nftables"}
 )
 HARNESS_COMPONENT_PATHS = (
+    "tests/perf/bounded_output.py",
     "tests/perf/ci-smoke.sh",
     "tests/perf/control.py",
     "tests/perf/environment.py",

@@ -202,6 +202,12 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
+      # jq is available on the Ubuntu runner, not in the pinned Rust image.
+      # Publication is exercised only through deny-by-default offline stubs.
+      - name: Offline release candidate and publication regressions
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests/ci -v
       - name: Fetch locked Rust dependencies in an isolated container
         shell: bash
         env:
@@ -273,6 +279,8 @@ jobs:
               python3 -m json.tool tests/perf/config/ci-smoke.json >/dev/null
               python3 tests/perf/run.py --help >/dev/null
               PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
+                tests/perf/test_ci_output.py \
+                tests/perf/test_control.py \
                 tests/perf/test_harness.py \
                 tests/perf/test_environment.py \
                 tests/perf/test_metrics.py \
@@ -849,15 +857,28 @@ jobs:
           retention-days: 30
 
       - name: Add the bounded report to the job summary
-        if: ${{ success() }}
+        if: ${{ !cancelled() && (steps.performance_smoke.outcome == 'success' || steps.performance_smoke.outcome == 'failure') }}
         shell: bash
         env:
           REPORT: ${{ runner.temp }}/openshield-performance-report/report.md
+          PERFORMANCE_OUTCOME: ${{ steps.performance_smoke.outcome }}
         run: |
           set -euo pipefail
+          readonly maximum_report_bytes=$((512 * 1024))
           {
             printf '%s\n\n' '## OpenShield performance smoke'
-            cat "$REPORT"
+            printf 'Performance smoke result: **%s**.\n\n' "$PERFORMANCE_OUTCOME"
+            if [[ -f "$REPORT" && ! -L "$REPORT" ]] \
+              && report_size=$(stat -c '%s' -- "$REPORT" 2>/dev/null) \
+              && [[ "$report_size" =~ ^[0-9]+$ ]] \
+              && (( report_size > 0 && report_size <= maximum_report_bytes )); then
+              # Bound the read even if the report grows after the size check.
+              if ! head -c "$maximum_report_bytes" -- "$REPORT"; then
+                printf '\nReport could not be read; inspect the performance step log and failure diagnostics.\n'
+              fi
+            else
+              printf '%s\n' 'Report is missing, empty, unsafe, or larger than 512 KiB; inspect the performance step log and failure diagnostics.'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve bounded performance failure diagnostics

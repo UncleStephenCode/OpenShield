@@ -57,7 +57,7 @@ admission run under the engine mutex, while atomic save and file/directory
 workload without intentionally stalling packet verdicts on that mutex; exact
 observations covered by the in-flight candidate are deduplicated. The harness
 does not relax NFQUEUE-error, drop, validity, or latency gates during a write.
-In OpenShield 0.2.3, the ordinary Learning path intentionally allows unmatched
+In OpenShield 0.2.4, the ordinary Learning path intentionally allows unmatched
 outbound traffic: observational attribution or persistence pressure may lose
 evidence but may not deny that packet. Enabled explicit denies are outside these
 capacity scenarios and remain enforceable. The performance gate still reports and rejects such lost evidence;
@@ -68,6 +68,16 @@ framed request/response exchanges. UDP clients use persistent ordinary UDP
 sockets. The harness does not inject handcrafted TCP packets. Consequently the
 kernel exercises TCP state, conntrack, NFQUEUE, socket ownership, and `/proc`
 process attribution in the same shape as the production daemon.
+
+Normal TCP connection closure, including short connections, keep-alive turnover,
+and final phase cleanup, half-closes the write side, drains it, requires peer
+EOF, and then closes the local transport. All steps share one `io_timeout` and
+finish before the client summary and `finished` event, while collectors remain
+active. A timeout, reset, unexpected trailing data, or local close failure
+counts as a workload error. Already-failed exchanges abort without counting a
+second error. Peer EOF confirms receipt of the peer's FIN; it does not prove
+that all kernel TCP state has expired. Retransmission and error thresholds remain
+unchanged.
 
 UDP completion does not rely on an ordering guarantee that UDP does not
 provide. Every flow carries an explicit sequence. The server tracks a bounded
@@ -98,7 +108,7 @@ about which OpenShield path was measured. The backend name is recorded
 separately because the nftables-to-iptables startup fallback does not change
 these levels.
 
-These names do not describe an eBPF data plane. Version 0.2.3 exercises the
+These names do not describe an eBPF data plane. Version 0.2.4 exercises the
 existing nftables/iptables, conntrack, NFQUEUE, and procfs paths and introduces
 no `CAP_BPF`, kernel module, boot-parameter, or MOK requirement. The controlled
 NFQUEUE overload case is therefore still the relevant fail-closed saturation
@@ -234,6 +244,21 @@ The wrapper has an 1800-second hard process-group timeout and validates the
 report schema, file types, permissions, and size bounds. It runs on the single
 openSUSE Tumbleweed `linux/amd64` release stand after all functional firewall
 E2E jobs.
+
+Progress lines are flushed immediately by `bounded_output.py`; the log remains
+limited to 16 MiB, including a single truncation marker. The filter keeps draining
+the runner after truncation so the log limit cannot block a running test. Its
+source is included in the independently verified harness manifest.
+The workflow also shows the bounded Markdown report on a failed smoke step;
+missing or unsafe reports produce a short diagnostic instead. This does not
+change the failed gate's outcome or permit publication.
+
+The benchmark control client retries a mutation only after an explicit
+`Conflict` rejection, using a fresh policy revision. The whole operation is
+bounded by five seconds and each mutation by twenty attempts; timeouts, missing
+ACKs and other errors are not retried. Rule cleanup keeps its original snapshot
+and refuses to delete a rule changed concurrently. This handles asynchronous
+Learning saves without relaxing the daemon's revision checks.
 
 The host orchestrator re-executes as `python3 -I -B -S` before importing any
 workspace-resolvable module. `environment.py` is opened without following

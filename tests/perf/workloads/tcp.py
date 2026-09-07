@@ -665,13 +665,9 @@ class TcpWorkloadClient:
                 raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 raw_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
-            writer.close()
-            try:
-                await asyncio.wait_for(
-                    writer.wait_closed(), timeout=self.config.io_timeout
-                )
-            except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
-                pass
+            await self._finish_connection(
+                writer, time.monotonic() + self.config.io_timeout, abort=True
+            )
             raise
         self.stats.connect_latency_ms.record(
             (time.monotonic_ns() - started) / 1_000_000.0
@@ -680,15 +676,72 @@ class TcpWorkloadClient:
         self.stats.active_change(1)
         return reader, writer
 
+    @staticmethod
+    async def _finish_connection(writer, deadline: float, *, abort: bool = False) -> bool:
+        """Release a transport without extending the caller's close deadline."""
+
+        try:
+            if abort:
+                writer.transport.abort()
+            else:
+                writer.close()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(writer.wait_closed(), timeout=remaining)
+            return True
+        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+            # A timed-out close must not leave a buffering transport alive as
+            # the worker moves on or the phase publishes its finished event.
+            try:
+                writer.transport.abort()
+            except (ConnectionError, OSError, RuntimeError):
+                pass
+            return False
+
     async def _close_connection(self, channel) -> None:
+        """Finish a successful exchange with a bounded peer-EOF handshake.
+
+        Local wait_closed() alone does not establish that the peer finished
+        the connection. Keep the read side alive until its FIN is observed,
+        accounting for this close inside the worker's measured lifetime.
+        """
+
+        if channel is None:
+            return
+        reader, writer = channel
+        deadline = time.monotonic() + self.config.io_timeout
+        peer_finished = False
+        try:
+            writer.write_eof()
+            await asyncio.wait_for(
+                writer.drain(), timeout=max(0.0, deadline - time.monotonic())
+            )
+            trailing = await asyncio.wait_for(
+                reader.read(1), timeout=max(0.0, deadline - time.monotonic())
+            )
+            if trailing:
+                raise ValueError("unexpected TCP data after the complete response")
+            peer_finished = True
+        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError, ValueError):
+            pass
+        finally:
+            try:
+                locally_closed = await self._finish_connection(writer, deadline)
+                if not peer_finished or not locally_closed:
+                    self.stats.add(errors=1)
+            finally:
+                self.stats.active_change(-1)
+
+    async def _abort_connection(self, channel) -> None:
+        """Discard an already failed exchange without counting a second error."""
+
         if channel is None:
             return
         _reader, writer = channel
+        deadline = time.monotonic() + self.config.io_timeout
         try:
-            writer.close()
-            await asyncio.wait_for(writer.wait_closed(), timeout=self.config.io_timeout)
-        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
-            pass
+            await self._finish_connection(writer, deadline, abort=True)
         finally:
             self.stats.active_change(-1)
 
@@ -1079,7 +1132,11 @@ class TcpWorkloadClient:
                         persistent = None
                         persistent_expiry = None
                         channel = None
-                        await self._close_connection(closing)
+                        await self._abort_connection(closing)
+                    elif channel is not None:
+                        closing = channel
+                        channel = None
+                        await self._abort_connection(closing)
                     await asyncio.sleep(ERROR_BACKOFF_SECONDS)
                 finally:
                     if channel is not None and not use_keepalive:

@@ -41,6 +41,8 @@ jobs:
           sh -n tests/e2e/systemd-sandbox-init.sh
           python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("tests/e2e/systemd-sandbox.py").read_text())'
           python3 -m unittest -v \
+            tests/perf/test_ci_output.py \
+            tests/perf/test_control.py \
             tests/perf/test_harness.py \
             tests/perf/test_environment.py \
             tests/perf/test_metrics.py \
@@ -63,6 +65,11 @@ jobs:
 
       - name: Validate release matrix
         run: python3 scripts/release-matrix.py validate
+
+      - name: Offline release candidate and publication regressions
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests/ci -v
 
       - name: Validate init layouts
         run: scripts/test-init-matrix.sh validate

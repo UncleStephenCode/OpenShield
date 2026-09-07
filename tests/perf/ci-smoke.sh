@@ -137,6 +137,7 @@ repository_root=$(CDPATH='' cd -- "$script_directory/../.." && pwd -P)
 runner="$repository_root/tests/perf/run.py"
 config="$repository_root/tests/perf/config/ci-smoke.json"
 release_validator="$script_directory/validate_report.py"
+output_filter="$script_directory/bounded_output.py"
 
 for required_command in awk docker grep install jq python3 sha256sum stat tee timeout; do
     command -v "$required_command" >/dev/null 2>&1 \
@@ -147,6 +148,7 @@ for source_file in \
     "$runner" \
     "$script_directory/environment.py" \
     "$release_validator" \
+    "$output_filter" \
     "$config"; do
     [[ -f "$source_file" && ! -L "$source_file" && -r "$source_file" ]] \
         || fail "required input is not a readable regular non-symlink file: $source_file"
@@ -381,25 +383,7 @@ set +e
     fi
     exit "$runner_status"
 } 2>&1 \
-    | LC_ALL=C awk -v limit="$MAX_LOG_BYTES" '
-        BEGIN {
-            marker = "[performance CI smoke: output truncated]"
-            content_limit = limit - length(marker) - 1
-            written = 0
-            truncated = 0
-        }
-        {
-            bytes = length($0) + 1
-            if (written + bytes <= content_limit) {
-                print
-                written += bytes
-            } else if (!truncated) {
-                print marker
-                written += length(marker) + 1
-                truncated = 1
-            }
-        }
-    ' \
+    | python3 -I -B -S "$output_filter" --limit-bytes "$MAX_LOG_BYTES" \
     | tee "$run_log"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
@@ -555,7 +539,7 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and .harness.schema == "openshield.perf.harness-evidence.v1"
     and (.harness.manifest_sha256
         | type == "string" and test("^[0-9a-f]{64}$"))
-    and (.harness.components | type == "array" and length == 11)
+    and (.harness.components | type == "array" and length == 12)
     and all(.harness.components[];
         (.path | type == "string" and length > 0)
         and (.size | type == "number" and . > 0 and . <= 4194304)
@@ -1381,6 +1365,7 @@ status_by_backend = {
 }
 
 harness_paths = (
+    "tests/perf/bounded_output.py",
     "tests/perf/ci-smoke.sh",
     "tests/perf/control.py",
     "tests/perf/environment.py",
