@@ -23,6 +23,10 @@ Q = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(Q)
 EVIDENCE = Path("/tmp/enforcement-strategy")
 WARM_ROUNDS = 3
+# A normal desktop browser can exceed the historical 4,096-descriptor scan
+# bound. Keep this below the daemon's new fixed ceiling while making the old
+# regression deterministic in the otherwise minimal CI container.
+DESKTOP_FD_COUNT = 5_000
 
 
 def status():
@@ -164,6 +168,19 @@ def worker(peer):
             held.close()
 
 
+def fd_holder(count):
+    descriptors = []
+    try:
+        for _ in range(int(count)):
+            descriptors.append(os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC))
+        Q.emit(ready=True, descriptors=len(descriptors))
+        for _line in sys.stdin:
+            break
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
 def repeat(process, protocol, token, expected):
     response = Q.ask(process, {"operation": "repeat", "protocol": protocol, "token": token})
     Q.require(response["success"] is expected, f"unexpected retained-socket result: {response}")
@@ -176,7 +193,7 @@ def fresh(process, protocol, token, expected):
 
 def allowed_tokens():
     tokens = {"learning-tcp", "learning-udp", "learning-fast-tcp", "learning-fast-udp",
-              "strict-tcp", "strict-udp",
+              "learning-churn-tcp", "learning-churn-udp", "strict-tcp", "strict-udp",
               "fast-held-tcp", "fast-restored-tcp", "fast-held-udp", "strict-restored-tcp"}
     for i in range(WARM_ROUNDS):
         for protocol in Q.PORTS:
@@ -199,10 +216,21 @@ def run(peer, backend):
               and current["enforcement_strategy"] == "strict", f"incorrect fresh runtime: {current}")
     processes = []
     try:
+        holder = subprocess.Popen(
+            [Q.ALLOWED, __file__, "fd-holder", str(DESKTOP_FD_COUNT)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        holder_ready = json.loads(holder.stdout.readline(8192))
+        Q.require(holder_ready == {"ready": True, "descriptors": DESKTOP_FD_COUNT},
+                  f"large-fd fixture did not initialize: {holder_ready}")
+        processes.append(holder)
         for executable in (Q.ALLOWED, Q.DENIED):
             processes.append(subprocess.Popen([executable, __file__, "worker", peer],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1))
-        allowed, denied = processes
+        allowed, denied = processes[1:]
         rule_ids = {}
         for protocol in Q.PORTS:
             Q.probe(allowed, protocol, f"learning-{protocol}", True)
@@ -211,6 +239,21 @@ def run(peer, backend):
             Q.require(len(matches) == 1, f"unexpected duplicate {protocol} allow")
             rule_ids[protocol] = matches[0]["id"]
             Q.release(allowed)
+        # Seed a second recent process hint, then let that process disappear.
+        # Fast must omit this stale candidate without flushing the live owner
+        # and falling back to a UID-wide scan. The unrelated large-fd process
+        # makes such an accidental fallback observable and deterministic.
+        transient = subprocess.Popen(
+            [Q.ALLOWED, __file__, "worker", peer],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        for protocol in Q.PORTS:
+            fresh(transient, protocol, f"learning-churn-{protocol}", True)
+        transient.stdin.close()
+        Q.require(transient.wait(timeout=5) == 0, "transient learning worker did not exit")
         initial_rules = state()["rules"]
         Q.require(all(not rule["spec"]["enabled"] for rule in initial_rules.values()
                       if rule["spec"]["origin"] == "template"), "auto-template unexpectedly enabled")
@@ -268,10 +311,19 @@ def run(peer, backend):
 def main():
     Q.require(os.environ.get("OPENSHIELD_STRATEGY_E2E") == "1", "run only through enforcement-strategy.sh")
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=["seed", "serve", "worker", "run", "audit"])
+    parser.add_argument(
+        "operation", choices=["seed", "serve", "worker", "fd-holder", "run", "audit"]
+    )
     parser.add_argument("arguments", nargs="*")
     arguments = parser.parse_args()
-    operations = {"seed": seed, "serve": Q.serve, "worker": worker, "run": run, "audit": audit}
+    operations = {
+        "seed": seed,
+        "serve": Q.serve,
+        "worker": worker,
+        "fd-holder": fd_holder,
+        "run": run,
+        "audit": audit,
+    }
     operations[arguments.operation](*arguments.arguments)
 
 

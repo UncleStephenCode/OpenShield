@@ -3,8 +3,10 @@
 //! No identities, socket inodes or verdicts survive a batch. A successful
 //! exhaustive Strict lookup seeds only a recent (UID, TGID, anchor TID,
 //! start-time) search hint. Fast still reads the current socket and process
-//! metadata. Unlike Strict, a hit cannot exclude a second owner in an uncached
-//! process (for example after `SCM_RIGHTS`); this is the documented tradeoff.
+//! metadata. A dead or replaced hint is omitted from the reduced search rather
+//! than invalidating unrelated live hints. Unlike Strict, a hit cannot exclude
+//! a second owner in an omitted or uncached process (for example after
+//! `SCM_RIGHTS`); this is the documented tradeoff.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,14 +26,14 @@ use super::{
 };
 
 const MAX_OWNER_HINTS: usize = 256;
-const OWNER_HINT_TTL: Duration = Duration::from_secs(30);
+const OWNER_HINT_TTL: Duration = Duration::from_mins(3);
 
 #[derive(Clone, Copy, Debug)]
 struct OwnerHint {
     process_id: u32,
     anchor_tid: u32,
     anchor_start: u64,
-    strictly_verified_at: Instant,
+    last_verified_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -71,7 +73,7 @@ impl OwnerCache {
         self.generation = Some(generation);
         self.learning_warm = false;
         self.entries.retain(|_, hint| {
-            now.saturating_duration_since(hint.strictly_verified_at) < OWNER_HINT_TTL
+            now.saturating_duration_since(hint.last_verified_at) < OWNER_HINT_TTL
         });
     }
 
@@ -82,7 +84,7 @@ impl OwnerCache {
         self.generation = Some(generation);
         self.learning_warm = true;
         self.entries.retain(|_, hint| {
-            now.saturating_duration_since(hint.strictly_verified_at) < OWNER_HINT_TTL
+            now.saturating_duration_since(hint.last_verified_at) < OWNER_HINT_TTL
         });
     }
 
@@ -93,12 +95,42 @@ impl OwnerCache {
             && let Some(oldest) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, hint)| hint.strictly_verified_at)
+                .min_by_key(|(_, hint)| hint.last_verified_at)
                 .map(|(key, _)| *key)
         {
             self.entries.remove(&oldest);
         }
         self.entries.insert(key, hint);
+    }
+
+    fn touch(&mut self, verified_processes: &BTreeSet<(u32, u32)>, now: Instant) {
+        for key in verified_processes {
+            if let Some(hint) = self.entries.get_mut(key) {
+                // This only retains a process search hint. The current socket,
+                // descriptor, UID, start time, executable and requested
+                // metadata were checked on both sides of this Fast capture;
+                // no identity or allow verdict is retained here.
+                hint.last_verified_at = now;
+            }
+        }
+    }
+
+    fn clear_after_detected_ambiguity(&mut self, results: &[Result<ApplicationIdentity>]) {
+        let detected_ambiguity = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .any(|error| {
+                let message = format!("{error:#}");
+                message.contains("socket is shared by multiple processes")
+                    || message.contains("socket-owning tasks have ambiguous application identities")
+                    || message.contains("mandatory process identity changed between captures")
+            });
+        if detected_ambiguity {
+            // A reduced lookup may have seen just one of the now-known
+            // holders. Do not let an older positive hint hide the ambiguity
+            // on the next Fast request.
+            self.entries.clear();
+        }
     }
 
     pub(super) fn seed(
@@ -141,7 +173,7 @@ impl OwnerCache {
                         process_id: owner.process_id,
                         anchor_tid: owner.tid,
                         anchor_start: identity.process_start_time_ticks,
-                        strictly_verified_at: now,
+                        last_verified_at: now,
                     },
                 );
             }
@@ -195,16 +227,18 @@ impl ProcfsResolver {
                 })
                 .collect();
         }
-        if let Ok(mut cache) = self.fast_owners.try_lock() {
-            // Invalidate even partially successful hints before exhaustive
-            // fallback: a newly detected shared owner must not be forgotten
-            // when the next batch asks for less identity metadata.
-            cache.entries.clear();
-        }
         // Do not mix partial Fast success with Strict fallback: exhaustive
         // discovery for a failed request could find a shared owner for the
         // same socket that another request tentatively accepted as a hit.
-        self.resolve_batch_strict_until(requests, deadline, true)
+        // Retain unrelated live hints across ordinary misses and process churn;
+        // otherwise one short-lived UDP sender forces every desktop flow back
+        // into a full UID-wide scan. A Strict fallback which actually detects
+        // shared ownership still invalidates the reduced search scope.
+        let results = self.resolve_batch_strict_until(requests, deadline, true);
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
+            cache.clear_after_detected_ambiguity(&results);
+        }
+        results
     }
 
     fn fast_hint_groups(
@@ -222,31 +256,42 @@ impl ProcfsResolver {
                 continue;
             }
             ensure_within_deadline(deadline)?;
-            ensure!(
-                Instant::now().saturating_duration_since(hint.strictly_verified_at)
-                    < OWNER_HINT_TTL,
-                "cached owner hint expired during attribution"
-            );
+            // `prepare` removes expired entries. Recheck the copied timestamp
+            // without turning a concurrent boundary crossing into permission.
+            if Instant::now().saturating_duration_since(hint.last_verified_at) >= OWNER_HINT_TTL {
+                continue;
+            }
             let process = self.root.join(hint.process_id.to_string());
             let task_root = process.join("task");
             let anchor = task_root.join(hint.anchor_tid.to_string());
-            ensure!(
-                read_start_time(&anchor, deadline)? == hint.anchor_start,
-                "cached owner PID/TID was reused or replaced"
-            );
-            ensure!(
-                read_process_fs_uid(&anchor, deadline)? == *uid,
-                "cached owner filesystem UID changed"
-            );
+            let start = match read_start_time(&anchor, deadline) {
+                Ok(start) => start,
+                Err(error) if super::is_attribution_timeout(&error) => return Err(error),
+                Err(_) => continue,
+            };
+            if start != hint.anchor_start {
+                continue;
+            }
+            let observed_uid = match read_process_fs_uid(&anchor, deadline) {
+                Ok(observed_uid) => observed_uid,
+                Err(error) if super::is_attribution_timeout(&error) => return Err(error),
+                Err(_) => continue,
+            };
+            if observed_uid != *uid {
+                continue;
+            }
             if processes.insert(hint.process_id) {
-                let task_ids = enumerate_task_ids(
+                let task_ids = match enumerate_task_ids(
                     &process,
                     &task_root,
                     hint.process_id,
                     deadline,
                     &mut task_count,
-                )?
-                .ok_or_else(|| anyhow!("cached owner disappeared"))?;
+                ) {
+                    Ok(Some(task_ids)) => task_ids,
+                    Err(error) if super::is_attribution_timeout(&error) => return Err(error),
+                    Ok(None) | Err(_) => continue,
+                };
                 groups.push(OwnerTaskGroup {
                     process_id: hint.process_id,
                     task_ids,
@@ -337,6 +382,23 @@ impl ProcfsResolver {
         }
         reject_inconsistent_batch_identities(&keys, &mut errors, &mut identities);
         ensure_within_deadline(deadline)?;
+        let verified_processes = keys
+            .iter()
+            .zip(&identities)
+            .filter(|(_, identity)| identity.is_some())
+            .filter_map(|(key, _)| *key)
+            .flat_map(|key| {
+                before
+                    .unique
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .map(move |owner| (key.uid, owner.process_id))
+            })
+            .collect::<BTreeSet<_>>();
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
+            cache.touch(&verified_processes, Instant::now());
+        }
         timing.finish(
             identities
                 .iter()
@@ -436,7 +498,8 @@ mod tests {
     }
 
     #[test]
-    fn hints_have_global_capacity_absolute_ttl_and_generation_invalidation() {
+    fn hints_have_global_capacity_inactivity_ttl_and_generation_invalidation()
+    -> Result<(), Box<dyn Error>> {
         let now = Instant::now();
         let mut cache = OwnerCache::default();
         cache.prepare(1, now);
@@ -447,12 +510,17 @@ mod tests {
                     process_id,
                     anchor_tid: process_id,
                     anchor_start: 5,
-                    strictly_verified_at: now,
+                    last_verified_at: now,
                 },
             );
         }
         assert_eq!(cache.entries.len(), MAX_OWNER_HINTS);
-        cache.prepare(1, now + Duration::from_millis(29_999));
+        cache.prepare(
+            1,
+            (now + OWNER_HINT_TTL)
+                .checked_sub(Duration::from_millis(1))
+                .ok_or("cannot represent a live hint instant")?,
+        );
         assert_eq!(cache.entries.len(), MAX_OWNER_HINTS);
         cache.prepare(1, now + OWNER_HINT_TTL);
         assert!(cache.entries.is_empty());
@@ -462,11 +530,12 @@ mod tests {
                 process_id: 1,
                 anchor_tid: 1,
                 anchor_start: 5,
-                strictly_verified_at: now,
+                last_verified_at: now,
             },
         );
         cache.prepare(2, now);
         assert!(cache.entries.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -475,7 +544,17 @@ mod tests {
         for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
             let fixture = Fixture::new(protocol)?;
             fixture.resolve(EnforcementStrategy::Fast, 1)?;
-            let seeded_at = fixture.hints()[0].1.strictly_verified_at;
+            let seeded_at = Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .ok_or("cannot represent an old Fast hint")?;
+            fixture
+                .resolver
+                .fast_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .values_mut()
+                .for_each(|hint| hint.last_verified_at = seeded_at);
             fixture.table(88)?;
             fs::remove_file(fixture.owner.join("fd/3"))?;
             symlink("socket:[88]", fixture.owner.join("fd/9"))?;
@@ -487,7 +566,7 @@ mod tests {
             )?;
             assert_eq!(hits[0].as_ref().map(|identity| identity.pid), Some(100));
             fixture.resolve(EnforcementStrategy::Fast, 1)?;
-            assert_eq!(fixture.hints()[0].1.strictly_verified_at, seeded_at);
+            assert!(fixture.hints()[0].1.last_verified_at > seeded_at);
         }
         Ok(())
     }
@@ -516,22 +595,81 @@ mod tests {
         let old = fixture.resolve(EnforcementStrategy::Fast, 1)?;
         let stat = fs::read_to_string(fixture.owner.join("stat"))?.replace("987654", "987655");
         fs::write(fixture.owner.join("stat"), stat)?;
-        assert!(
-            fixture
-                .resolver
-                .resolve_fast_candidates(
-                    &[(&fixture.connection, IdentityCaptureRequirements::full())],
-                    Instant::now() + PROC_SCAN_DEADLINE,
-                    &fixture.hints()
-                )
-                .is_err()
-        );
+        let candidates = fixture.resolver.resolve_fast_candidates(
+            &[(&fixture.connection, IdentityCaptureRequirements::full())],
+            Instant::now() + PROC_SCAN_DEADLINE,
+            &fixture.hints(),
+        )?;
+        assert!(candidates.iter().all(Option::is_none));
         let fresh = fixture.resolve(EnforcementStrategy::Fast, 1)?;
         assert_ne!(fresh.process_start_time_ticks, old.process_start_time_ticks);
         assert_eq!(
             fixture.hints()[0].1.anchor_start,
             fresh.process_start_time_ticks
         );
+        Ok(())
+    }
+
+    #[test]
+    fn one_disappeared_hint_does_not_poison_an_unrelated_live_fast_owner()
+    -> Result<(), Box<dyn Error>> {
+        for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
+            let fixture = Fixture::new(protocol)?;
+            fixture.resolve(EnforcementStrategy::Fast, 1)?;
+            fixture
+                .resolver
+                .fast_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    1_000,
+                    OwnerHint {
+                        process_id: 200,
+                        anchor_tid: 200,
+                        anchor_start: 123,
+                        last_verified_at: Instant::now(),
+                    },
+                );
+
+            let candidates = fixture.resolver.resolve_fast_candidates(
+                &[(&fixture.connection, IdentityCaptureRequirements::full())],
+                Instant::now() + PROC_SCAN_DEADLINE,
+                &fixture.hints(),
+            )?;
+
+            assert_eq!(
+                candidates[0].as_ref().map(|identity| identity.pid),
+                Some(100)
+            );
+            assert_eq!(fixture.hints().len(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_fast_miss_retains_unrelated_live_hints() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new(TransportProtocol::Udp)?;
+        fixture.resolve(EnforcementStrategy::Fast, 1)?;
+        let missing = OutboundConnection {
+            source_port: Some(12_346),
+            ..fixture.connection.clone()
+        };
+        write_udp_socket_table(
+            fixture.root.path(),
+            &[(12_345, 54_321, 1_000, 77), (12_346, 54_321, 1_000, 88)],
+        )?;
+
+        assert!(
+            fixture.resolver.resolve_batch_with_strategy_until(
+                &[(&missing, IdentityCaptureRequirements::full())],
+                Instant::now() + PROC_SCAN_DEADLINE,
+                EnforcementStrategy::Fast,
+                1,
+            )[0]
+            .is_err()
+        );
+        assert_eq!(fixture.hints().len(), 1);
+        assert!(fixture.resolve(EnforcementStrategy::Fast, 1).is_ok());
         Ok(())
     }
 
@@ -611,7 +749,7 @@ mod tests {
                     process_id: 200,
                     anchor_tid: 200,
                     anchor_start: 987_654,
-                    strictly_verified_at: Instant::now(),
+                    last_verified_at: Instant::now(),
                 },
             );
         assert!(fixture.resolve(EnforcementStrategy::Fast, 1).is_err());
@@ -734,7 +872,7 @@ mod tests {
                     .entries
                     .values_mut()
                 {
-                    hint.strictly_verified_at = Instant::now()
+                    hint.last_verified_at = Instant::now()
                         .checked_sub(OWNER_HINT_TTL)
                         .ok_or("cannot represent an expired hint")?;
                 }

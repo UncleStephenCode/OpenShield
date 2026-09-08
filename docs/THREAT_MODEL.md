@@ -38,20 +38,21 @@
 ## Explicit Fast-strategy exception
 
 Strict is the default. Root can explicitly select Fast in the Enforcing submenu
-after acknowledging a weaker socket-owner discovery guarantee. Fast caches at
-most 256 positive UID/TGID/TID/start-time hints per resolver for 30 seconds since
-a fully successful Strict attribution batch; hits never renew their lifetime.
-Each queued attribution request retains fresh
-socket resolution (`SOCK_DIAG` for TCP/UDP, procfs for ICMP/ICMPv6),
-fd/UID/start-time/executable checks, required argv/cgroup capture,
-and current rule/action/generation checks remain. Both owner passes are limited
-to hinted TGIDs; misses, expiry, errors, or detected ambiguity clear the hints
-before falling back to Strict. Only a fully successful Strict batch reseeds them.
+after acknowledging a weaker socket-owner discovery guarantee. Fast keeps one
+process-wide cache of at most 256 positive UID/TGID/TID/start-time hints for
+three minutes of inactivity. A successful exhaustive Strict attribution creates
+a hint; a successful Fast capture renews only its freshly revalidated owner.
+Each queued attribution request retains fresh socket resolution (`SOCK_DIAG`
+for TCP/UDP, procfs for ICMP/ICMPv6), fd/UID/start-time/executable checks,
+required argv/cgroup capture, and current rule/action/generation checks. Both
+owner passes are limited to hinted TGIDs. Dead, replaced, expired, or unusable candidates are omitted;
+ordinary misses retain unrelated live hints across the Strict fallback. A
+fallback which actually detects ambiguous ownership clears the reduced scope.
 There is no verdict cache, new queue bypass, or relaxation of kernel rules.
 
 A previously uncached process sharing the same socket through inheritance,
 `fork`, or `SCM_RIGHTS` can remain invisible to Fast, even for the same UID.
-The 30-second TTL limits hint retention, not a guaranteed detection window;
+The three-minute inactivity TTL limits hint retention, not a guaranteed detection window;
 a successful Strict lookup of another socket can seed the same process again.
 Thus Fast does not offer Strict's global matching-UID
 ambiguity detection. In the goals above, rejection of ambiguous identity means
@@ -479,7 +480,7 @@ are broader than firewall administration alone.
 - The active mode-specific bounded NFQUEUE consumer performs procfs work that is worst-case
   proportional to process/task enumeration plus the descriptor tables of tasks
   whose filesystem UID matches the socket UID. One directory walk inspects at
-  most 4,096 fd entries per matching-UID task and fails if proof requires a later
+  most 16,384 fd entries per matching-UID task and fails if proof requires a later
   entry. Since v0.1.32, a batch performs two owner snapshots, each admitting at most
   131,072 owner records globally across all of its targets. A single 2-second
   deadline bounds both scans and every intervening lookup and capture for queue

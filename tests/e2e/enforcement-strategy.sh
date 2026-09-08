@@ -76,6 +76,7 @@ peer_id=$(docker create --platform linux/amd64 --label "$label" --network "$netw
 client_id=$(docker create --platform linux/amd64 --label "$label" --network "$network_id" \
     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH \
     --security-opt no-new-privileges --security-opt label=disable --pids-limit 256 --memory 1g \
+    --ulimit nofile=20000:20000 \
     --env PYTHONDONTWRITEBYTECODE=1 --env OPENSHIELD_STRATEGY_E2E=1 \
     --mount "type=bind,src=$daemon_binary,dst=/opt/openshield-daemon,readonly" \
     --mount "type=bind,src=$script_directory,dst=/opt/e2e,readonly" "$client_image" sleep infinity)

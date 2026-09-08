@@ -147,18 +147,22 @@ strict attribution path where attribution is needed; a remembered Fast choice
 is effective only in Enforcing. A legacy `SetMode(Enforcing)` selects Strict.
 
 Fast keeps one process-wide cache of up to 256 positive process-owner hints for
-30 seconds after each owner was established by the exhaustive, race-checked
-path; cache hits do not extend that lifetime. Successful Learning attribution
-warms this cache, and a direct Learning-to-Fast transition preserves those
-hints instead of starting Fast cold. Fast's exhaustive fallback can seed the
-same cache, while Strict Enforcing and unrelated generation changes clear it.
+three minutes since each owner's last successful bounded verification. Initial
+hints come only from the exhaustive, race-checked path; a Fast hit renews only
+the process which was freshly checked around the current capture. Successful
+Learning attribution warms this cache, and a direct Learning-to-Fast transition
+preserves those hints instead of starting Fast cold. Fast's exhaustive fallback
+can seed the same cache, while Strict Enforcing and unrelated generation changes
+clear it.
 Each queued attribution request still gets fresh socket resolution: `SOCK_DIAG` for TCP/UDP and
 the existing procfs lookup for ICMP/ICMPv6. The hinted owner is checked
 again using its socket fd, UID, TGID/TID, process start time, executable path and
 file version, plus argv/cgroup when the policy requires them. Two owner passes
 and race-checked metadata capture remain, but those owner passes inspect only
-cached TGIDs. A miss, expiry, ambiguity, or failed validation clears the hints
-before falling back to Strict. Independently successful exhaustive results can
+cached TGIDs. A dead, replaced, expired, or otherwise unusable candidate is
+omitted; an ordinary miss retains unrelated live hints before falling back to
+Strict. An ambiguity actually detected by the fallback clears the reduced
+scope. Independently successful exhaustive results can
 reseed their owners, but no owner is seeded when another failed target in the
 same process made that result unsafe.
 Packet verdicts are never cached: current rules, actions, and policy
@@ -167,8 +171,8 @@ generation still determine the decision.
 This is a deliberate security/performance tradeoff, not an equivalent
 optimization of Strict. A new uncached owner of a shared socket—for example
 after `fork` or `SCM_RIGHTS` transfer—can remain outside Fast's owner search.
-The 30-second lifetime bounds a hint, not the time until all owners are found:
-a Strict lookup of another socket can seed that process again.
+The three-minute inactivity lifetime bounds a hint, not the time until all
+owners are found: a Strict lookup of another socket can seed that process again.
 Even a same-UID extra owner that Strict would detect
 may then be missed. Use Strict when exhaustive matching-UID owner discovery
 is required. Neither strategy proves which holder actually sent a shared socket's

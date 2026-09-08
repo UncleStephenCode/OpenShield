@@ -157,18 +157,19 @@ The normative boundary is defined by the
 Strict remains the default. Root may choose Fast through `m` → `3. Enforcing`
 → `3.1 Fast` / `3.2 Strict`; Fast has an explicit risk confirmation, not an
 `S` shortcut. The implementation retains one process-wide cache of up to 256
-positive owner UID/TGID/TID/start-time hints with a fixed 30-second lifetime
-since each owner was established by the exhaustive, race-checked path, without
-renewing it on hits. Successful Learning attribution warms this cache and a
+positive owner UID/TGID/TID/start-time hints with a three-minute inactivity
+lifetime. The exhaustive, race-checked path creates each hint; a Fast hit renews
+only an owner freshly checked on both sides of the current capture. Successful Learning attribution warms this cache and a
 direct Learning-to-Fast generation transition preserves it. Fast's exhaustive
 fallback can also seed it; Strict Enforcing and unrelated generation changes
 clear it.
 Socket resolution for each queued attribution request
 (`SOCK_DIAG` for TCP/UDP, procfs for ICMP/ICMPv6),
 fd/UID/process-start/executable-version checks and required
-argv/cgroup capture stay fresh. Both owner passes search only hinted TGIDs;
-misses, expiry, errors, or detected ambiguity clear the hints before the Strict
-fallback. Independently successful exhaustive results may reseed an owner, but
+argv/cgroup capture stay fresh. Both owner passes search only hinted TGIDs.
+Dead, replaced, expired, or unusable candidates are omitted, and ordinary misses
+retain unrelated live hints across the Strict fallback. A fallback which actually
+detects ambiguous ownership clears the reduced scope. Independently successful exhaustive results may reseed an owner, but
 not when a failed target observed the same TGID.
 Rule matching, actions, revocation, and current generation remain mandatory.
 There is no cached authorization verdict or change to NFQUEUE bypass flags,
@@ -663,7 +664,7 @@ Commands and exact interpretation are documented in
   `Learning`, the same pressure can lose observations and therefore leave the
   later `Enforcing` rule set incomplete, but unmatched traffic continues under
   the declared default allow. In particular, the
-  one bounded directory walk inspects at most 4,096 fd entries for a task whose
+  one bounded directory walk inspects at most 16,384 fd entries for a task whose
   filesystem UID matches the socket UID and denies attribution if proof would
   require a later entry; global enumeration admits at most 131,072 proc/task
   entries.

@@ -138,8 +138,9 @@ confirmation of its weaker guarantee. There is no `S` shortcut. Learning and
 BlockAll use the unchanged strict path regardless of the remembered choice.
 
 Fast retains only positive UID/TGID/TID/start-time owner hints: one process-wide
-cache of at most 256 TGIDs, with a fixed 30-second lifetime since each owner was
-established by the exhaustive, race-checked path. Hits do not renew it.
+cache of at most 256 TGIDs, with a three-minute inactivity lifetime. The
+exhaustive, race-checked path creates a hint; a Fast hit renews only its owner
+after fresh checks around the current capture.
 Successful Learning attribution warms the cache; the following direct
 Learning-to-Fast generation transition preserves it. Fast's exhaustive fallback
 can also seed it, while Strict Enforcing and unrelated generation changes clear
@@ -147,9 +148,10 @@ it. Every queued attribution request has fresh socket resolution (`SOCK_DIAG`
 for TCP/UDP, the existing procfs lookup for ICMP/ICMPv6), and
 fresh fd ownership, UID, PID/start-time, executable path/file-version and
 policy-required argv/cgroup checks. Identity metadata is captured twice with
-the existing race checks; both owner passes cover only hinted TGIDs. Misses,
-expiry, validation errors, and detected ambiguity clear the hints before using
-the Strict path. Independently successful exhaustive results may reseed their
+the existing race checks; both owner passes cover only hinted TGIDs. Dead,
+replaced, expired, or unusable candidates are omitted; ordinary misses preserve
+unrelated live hints before using the Strict path. A fallback which actually
+detects ambiguity clears the reduced scope. Independently successful exhaustive results may reseed their
 owners, except when another failed target observed the same TGID and makes that
 owner unsafe.
 No packet verdict or authorization result is cached. Current rule matching,
@@ -160,7 +162,7 @@ not change; this is not a new L1/L2/L3 level, kernel extension, or queue bypass.
 The narrower search is a real assurance reduction: a newly shared socket owner
 outside the hinted TGIDs can be missed, including after `fork` or
 `SCM_RIGHTS` transfer to another same-UID process. A successful local recheck
-need not reveal global ambiguity that Strict would reject. The 30-second TTL
+need not reveal global ambiguity that Strict would reject. The three-minute inactivity TTL
 bounds hint retention, not an owner-discovery deadline: a Strict lookup of a
 different socket can seed the same process again. Fast is opt-in, not security-equivalent to Strict or a faithful copy of
 OpenSnitch's procmon caches. No measured performance gain is asserted here.

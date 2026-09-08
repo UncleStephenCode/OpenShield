@@ -33,7 +33,13 @@ use crate::application_timing::{TimingScope, TimingStage, record_enumeration};
 mod fast;
 
 const MAX_PROC_ENTRIES: usize = 131_072;
-const MAX_FDS_PER_TASK: usize = 4_096;
+// Contemporary browsers, desktop portals and proxy processes can legitimately
+// keep more than 4,096 descriptors open. The old limit made one such process
+// poison an otherwise complete UID-wide owner snapshot, so every application
+// packet in that batch was denied. Keep a fixed anti-exhaustion bound, but put
+// it above normal desktop workloads; the wall-clock attribution deadline still
+// caps the cost of walking a hostile descriptor table and failures stay closed.
+const MAX_FDS_PER_TASK: usize = 16_384;
 const FD_DIRECTORY_BUFFER_BYTES: usize = 4_096;
 // "socket:[" + a decimal u64 + "]" occupies at most 29 bytes. One reusable
 // larger buffer distinguishes every valid inode link from truncated text.

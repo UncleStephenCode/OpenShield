@@ -46,7 +46,11 @@ The stages have the following responsibilities:
 7. **Firewall E2E** runs the complete Learning-to-Enforcing policy scenario
    twice for each of the 37 runtime-tested distribution/platform rows: once with
    nftables preferred and once in an iptables-only fallback environment (74
-   jobs in total).
+   jobs in total). The two openSUSE Tumbleweed `linux/amd64` jobs additionally
+   run a real-socket Learning-to-Fast-Enforcing regression with TCP and UDP,
+   process churn, and a same-UID process holding 5,000 descriptors. This catches
+   cache-wide invalidation and desktop descriptor-limit regressions before the
+   performance gate.
 8. **Performance Smoke** starts only after all 74 functional E2E jobs succeed.
    One openSUSE Tumbleweed `linux/amd64` stand runs a bounded nftables/iptables
    profile against the exact release `binary-tumbleweed-amd64` daemon in
