@@ -175,7 +175,8 @@ def fresh(process, protocol, token, expected):
 
 
 def allowed_tokens():
-    tokens = {"learning-tcp", "learning-udp", "strict-tcp", "strict-udp",
+    tokens = {"learning-tcp", "learning-udp", "learning-fast-tcp", "learning-fast-udp",
+              "strict-tcp", "strict-udp",
               "fast-held-tcp", "fast-restored-tcp", "fast-held-udp", "strict-restored-tcp"}
     for i in range(WARM_ROUNDS):
         for protocol in Q.PORTS:
@@ -213,6 +214,12 @@ def run(peer, backend):
         initial_rules = state()["rules"]
         Q.require(all(not rule["spec"]["enabled"] for rule in initial_rules.values()
                       if rule["spec"]["origin"] == "template"), "auto-template unexpectedly enabled")
+        # A busy production host cannot afford a cold exhaustive owner scan
+        # under the shorter Enforcing deadline. Exercise the direct handoff of
+        # positive, twice-checked Learning owner hints to Fast.
+        enforce("fast")
+        for protocol in Q.PORTS:
+            fresh(allowed, protocol, f"learning-fast-{protocol}", True)
         enforce("strict")
         for protocol in Q.PORTS:
             fresh(allowed, protocol, f"strict-{protocol}", True)

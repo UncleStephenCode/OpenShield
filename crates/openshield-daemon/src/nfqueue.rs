@@ -1286,7 +1286,7 @@ fn learning_attribution_loop(
             .iter()
             .map(|work| (&work.packet.connection, IdentityCaptureRequirements::full()))
             .collect::<Vec<_>>();
-        let identities = resolver.resolve_batch_for_learning(&requests);
+        let identities = resolver.resolve_batch_for_learning(&requests, flow_generation);
         let completed_at = Instant::now();
         for (work, identity) in batch.into_iter().zip(identities) {
             recent_attempts.completed(&work.packet.connection, completed_at);

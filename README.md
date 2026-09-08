@@ -2,7 +2,7 @@
 
 # OpenShield
 
-Current source release: **v0.2.6**.
+Current source release: **v0.2.7**.
 
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
@@ -146,15 +146,21 @@ the default. Learning and BlockAll keep their existing behavior and use the
 strict attribution path where attribution is needed; a remembered Fast choice
 is effective only in Enforcing. A legacy `SetMode(Enforcing)` selects Strict.
 
-Fast keeps up to 256 positive process-owner hints per resolver for 30 seconds
-after a fully successful Strict attribution batch; cache hits do not extend that lifetime.
+Fast keeps one process-wide cache of up to 256 positive process-owner hints for
+30 seconds after each owner was established by the exhaustive, race-checked
+path; cache hits do not extend that lifetime. Successful Learning attribution
+warms this cache, and a direct Learning-to-Fast transition preserves those
+hints instead of starting Fast cold. Fast's exhaustive fallback can seed the
+same cache, while Strict Enforcing and unrelated generation changes clear it.
 Each queued attribution request still gets fresh socket resolution: `SOCK_DIAG` for TCP/UDP and
 the existing procfs lookup for ICMP/ICMPv6. The hinted owner is checked
 again using its socket fd, UID, TGID/TID, process start time, executable path and
 file version, plus argv/cgroup when the policy requires them. Two owner passes
 and race-checked metadata capture remain, but those owner passes inspect only
 cached TGIDs. A miss, expiry, ambiguity, or failed validation clears the hints
-before falling back to Strict; only a fully successful Strict batch reseeds them.
+before falling back to Strict. Independently successful exhaustive results can
+reseed their owners, but no owner is seeded when another failed target in the
+same process made that result unsafe.
 Packet verdicts are never cached: current rules, actions, and policy
 generation still determine the decision.
 
@@ -532,7 +538,7 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. Under the current v0.2.6 CI policy, relative DUT-cgroup CPU
+confidence bound. Under the current v0.2.7 CI policy, relative DUT-cgroup CPU
 and request/connect-latency crossings are explicitly advisory; relative
 throughput and PPS regressions remain blocking only when the one-sided 95%
 lower confidence bound confirms them. A mean-only crossing stays visible
@@ -545,7 +551,7 @@ and safety checks remain blocking. The
 retained full v0.1.31 run was structurally valid but failed its performance
 gate. The retained full local v0.1.32 run passed its authenticated performance
 gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
-and report and is not silently promoted to v0.2.6.
+and report and is not silently promoted to v0.2.7.
 
 ## Installation and init systems
 

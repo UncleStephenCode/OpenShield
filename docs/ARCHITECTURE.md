@@ -2,7 +2,7 @@
 
 # OpenShield architecture
 
-This document describes the OpenShield v0.2.6 policy model.
+This document describes the OpenShield v0.2.7 policy model.
 
 OpenShield is a Linux host firewall composed of two Rust binaries:
 
@@ -137,15 +137,21 @@ exhaustive-owner discovery described below. Root selects them through
 confirmation of its weaker guarantee. There is no `S` shortcut. Learning and
 BlockAll use the unchanged strict path regardless of the remembered choice.
 
-Fast retains only positive UID/TGID/TID/start-time owner hints: at most 256 TGIDs
-per resolver, with a fixed 30-second lifetime since a fully successful Strict attribution batch.
-Hits do not renew it. Every queued attribution request has fresh socket resolution (`SOCK_DIAG`
+Fast retains only positive UID/TGID/TID/start-time owner hints: one process-wide
+cache of at most 256 TGIDs, with a fixed 30-second lifetime since each owner was
+established by the exhaustive, race-checked path. Hits do not renew it.
+Successful Learning attribution warms the cache; the following direct
+Learning-to-Fast generation transition preserves it. Fast's exhaustive fallback
+can also seed it, while Strict Enforcing and unrelated generation changes clear
+it. Every queued attribution request has fresh socket resolution (`SOCK_DIAG`
 for TCP/UDP, the existing procfs lookup for ICMP/ICMPv6), and
 fresh fd ownership, UID, PID/start-time, executable path/file-version and
 policy-required argv/cgroup checks. Identity metadata is captured twice with
 the existing race checks; both owner passes cover only hinted TGIDs. Misses,
 expiry, validation errors, and detected ambiguity clear the hints before using
-the Strict path; only a fully successful Strict batch reseeds them.
+the Strict path. Independently successful exhaustive results may reseed their
+owners, except when another failed target observed the same TGID and makes that
+owner unsafe.
 No packet verdict or authorization result is cached. Current rule matching,
 action precedence, revocation, deadlines, and flow generation remain mandatory.
 Backend compilation, NFQUEUE flags, and established-TCP conntrack fast paths do
@@ -884,7 +890,7 @@ evidence. A production maximum requires three successful steady repetitions.
 
 Relative performance uses those independent adjacent pristine AB/BA pairs.
 Every window delta and threshold crossing is preserved as evidence. The
-v0.2.6 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
+v0.2.7 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
 one-sided 95% Student-t lower confidence bound over three independent paired
 steady deltas blocks release for throughput and PPS when it exceeds the
 threshold. A mean-only crossing remains visible without turning shared-runner
@@ -970,7 +976,7 @@ authorized non-root observer, all application metadata and identifying rule
 names are redacted by the daemon. UID 0 can read the full rule, including
 bounded command-line selectors. Runtime attribution reads bounded procfs
 identity metadata and a bounded queued-packet prefix, but never the process
-environment; version 0.2.6 does not provide a per-packet capture feed.
+environment; version 0.2.7 does not provide a per-packet capture feed.
 
 ## Failure policy
 

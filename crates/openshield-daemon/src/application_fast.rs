@@ -7,6 +7,7 @@
 //! process (for example after `SCM_RIGHTS`); this is the documented tradeoff.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
@@ -36,20 +37,50 @@ struct OwnerHint {
 #[derive(Debug, Default)]
 pub(super) struct OwnerCache {
     generation: Option<u32>,
+    learning_warm: bool,
     entries: BTreeMap<(u32, u32), OwnerHint>,
+}
+
+pub(super) type SharedOwnerCache = Arc<Mutex<OwnerCache>>;
+
+pub(super) fn production_owner_cache() -> SharedOwnerCache {
+    static CACHE: OnceLock<SharedOwnerCache> = OnceLock::new();
+    Arc::clone(CACHE.get_or_init(|| Arc::new(Mutex::new(OwnerCache::default()))))
+}
+
+#[cfg(test)]
+pub(super) fn private_owner_cache() -> SharedOwnerCache {
+    Arc::new(Mutex::new(OwnerCache::default()))
 }
 
 impl OwnerCache {
     pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.generation = None;
+        self.learning_warm = false;
     }
 
-    fn prepare(&mut self, generation: u32, now: Instant) {
-        if self.generation != Some(generation) {
-            self.clear();
-            self.generation = Some(generation);
+    pub(super) fn prepare(&mut self, generation: u32, now: Instant) {
+        let direct_learning_transition = self.learning_warm
+            && self
+                .generation
+                .is_some_and(|previous| previous.wrapping_add(1) == generation);
+        if self.generation != Some(generation) && !direct_learning_transition {
+            self.entries.clear();
         }
+        self.generation = Some(generation);
+        self.learning_warm = false;
+        self.entries.retain(|_, hint| {
+            now.saturating_duration_since(hint.strictly_verified_at) < OWNER_HINT_TTL
+        });
+    }
+
+    pub(super) fn prepare_learning(&mut self, generation: u32, now: Instant) {
+        if self.generation != Some(generation) {
+            self.entries.clear();
+        }
+        self.generation = Some(generation);
+        self.learning_warm = true;
         self.entries.retain(|_, hint| {
             now.saturating_duration_since(hint.strictly_verified_at) < OWNER_HINT_TTL
         });
@@ -77,23 +108,33 @@ impl OwnerCache {
         results: &[Result<ApplicationIdentity>],
         now: Instant,
     ) {
-        // A successful request must not reintroduce a TGID hint while another
-        // request in the same exhaustive batch found an unsafe/shared socket
-        // owned by that TGID. Seed only a wholly successful Strict batch.
-        if keys.len() != results.len() || results.iter().any(Result::is_err) {
+        if keys.len() != results.len() {
             return;
         }
+        // Never seed a process when another target owned by that same process
+        // failed the exhaustive batch. Other failures cannot invalidate an
+        // independently successful, twice-checked owner.
+        let unsafe_processes = keys
+            .iter()
+            .zip(results)
+            .filter(|(_, result)| result.is_err())
+            .filter_map(|(key, _)| *key)
+            .flat_map(|key| {
+                before
+                    .observed_processes
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
         for (key, result) in keys.iter().zip(results) {
             let (Some(key), Ok(identity)) = (key, result) else {
                 continue;
             };
-            if let Some(owner) = before
-                .unique
-                .get(key)
-                .into_iter()
-                .flatten()
-                .find(|owner| owner.tid == identity.pid)
-            {
+            if let Some(owner) = before.unique.get(key).into_iter().flatten().find(|owner| {
+                owner.tid == identity.pid && !unsafe_processes.contains(&owner.process_id)
+            }) {
                 self.insert(
                     key.uid,
                     OwnerHint {
@@ -123,14 +164,14 @@ impl ProcfsResolver {
             return self.resolve_batch_for_enforcement_until(requests, deadline);
         }
         if requests.is_empty() {
-            if let Ok(mut cache) = self.fast_owners.try_borrow_mut() {
+            if let Ok(mut cache) = self.fast_owners.try_lock() {
                 cache.prepare(generation, Instant::now());
             }
             return Vec::new();
         }
         let hints = self
             .fast_owners
-            .try_borrow_mut()
+            .try_lock()
             .ok()
             .map(|mut cache| {
                 cache.prepare(generation, Instant::now());
@@ -154,7 +195,7 @@ impl ProcfsResolver {
                 })
                 .collect();
         }
-        if let Ok(mut cache) = self.fast_owners.try_borrow_mut() {
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
             // Invalidate even partially successful hints before exhaustive
             // fallback: a newly detected shared owner must not be forgotten
             // when the next batch asks for less identity metadata.
@@ -249,6 +290,7 @@ impl ProcfsResolver {
             &daemon_owned,
             &accumulated.ambiguous_targets,
             accumulated.owners,
+            accumulated.observed_processes,
         )
     }
 
@@ -384,7 +426,8 @@ mod tests {
         fn hints(&self) -> Vec<((u32, u32), OwnerHint)> {
             self.resolver
                 .fast_owners
-                .borrow()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entries
                 .iter()
                 .map(|(key, hint)| (*key, *hint))
@@ -513,22 +556,36 @@ mod tests {
     }
 
     #[test]
-    fn strict_and_learning_clear_fast_hints() -> Result<(), Box<dyn Error>> {
+    fn strict_clears_hints_and_learning_warms_the_next_fast_generation()
+    -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new(TransportProtocol::Udp)?;
         fixture.resolve(EnforcementStrategy::Fast, 1)?;
         assert_eq!(fixture.hints().len(), 1);
         fixture.resolve(EnforcementStrategy::Strict, 1)?;
         assert!(fixture.hints().is_empty());
-        fixture.resolve(EnforcementStrategy::Fast, 1)?;
         fixture
             .resolver
-            .resolve_batch_for_learning(&[(
-                &fixture.connection,
-                IdentityCaptureRequirements::full(),
-            )])
+            .resolve_batch_for_learning(
+                &[(&fixture.connection, IdentityCaptureRequirements::full())],
+                1,
+            )
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        assert!(fixture.hints().is_empty());
+        assert_eq!(fixture.hints().len(), 1);
+        let enforcing_resolver = ProcfsResolver::at_with_fast_owners(
+            fixture.root.path(),
+            Arc::clone(&fixture.resolver.fast_owners),
+        );
+        enforcing_resolver
+            .resolve_batch_with_strategy_until(
+                &[(&fixture.connection, IdentityCaptureRequirements::full())],
+                Instant::now() + PROC_SCAN_DEADLINE,
+                EnforcementStrategy::Fast,
+                2,
+            )
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(fixture.hints().len(), 1);
         Ok(())
     }
 
@@ -543,15 +600,20 @@ mod tests {
         // This is intentionally NOT the Strict guarantee: the uncached holder
         // cannot be discovered by a hinted-only scan. Keep the tradeoff tested.
         assert!(fixture.resolve(EnforcementStrategy::Fast, 1).is_ok());
-        fixture.resolver.fast_owners.borrow_mut().insert(
-            1_000,
-            OwnerHint {
-                process_id: 200,
-                anchor_tid: 200,
-                anchor_start: 987_654,
-                strictly_verified_at: Instant::now(),
-            },
-        );
+        fixture
+            .resolver
+            .fast_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                1_000,
+                OwnerHint {
+                    process_id: 200,
+                    anchor_tid: 200,
+                    anchor_start: 987_654,
+                    strictly_verified_at: Instant::now(),
+                },
+            );
         assert!(fixture.resolve(EnforcementStrategy::Fast, 1).is_err());
         assert!(fixture.resolve(EnforcementStrategy::Strict, 1).is_err());
         assert!(fixture.hints().is_empty());
@@ -667,7 +729,8 @@ mod tests {
                 for hint in fixture
                     .resolver
                     .fast_owners
-                    .borrow_mut()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entries
                     .values_mut()
                 {

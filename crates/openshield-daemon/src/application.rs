@@ -501,7 +501,7 @@ fn outbound_network_selectors_match(rule: &Rule, connection: &OutboundConnection
 #[derive(Debug)]
 pub struct ProcfsResolver {
     root: PathBuf,
-    fast_owners: RefCell<fast::OwnerCache>,
+    fast_owners: fast::SharedOwnerCache,
     sock_diag: RefCell<Option<SockDiagSocket>>,
     /// Synthetic procfs roots cannot answer netlink queries. Keeping this
     /// switch test-only makes a production TCP/UDP downgrade unrepresentable.
@@ -537,6 +537,7 @@ struct SocketOwnerKey {
 struct OwnerSnapshot {
     unique: BTreeMap<SocketOwnerKey, Vec<OwnerTask>>,
     failures: BTreeMap<SocketOwnerKey, String>,
+    observed_processes: BTreeMap<SocketOwnerKey, BTreeSet<u32>>,
 }
 
 // Borrow only positive descriptor names from this batch's first snapshot.
@@ -606,6 +607,7 @@ struct OwnerTaskGroup {
 #[derive(Debug, Default)]
 struct OwnerScanAccumulator {
     owners: BTreeMap<SocketOwnerKey, BTreeMap<u32, Vec<OwnerTask>>>,
+    observed_processes: BTreeMap<SocketOwnerKey, BTreeSet<u32>>,
     ambiguous_targets: BTreeSet<SocketOwnerKey>,
     owner_records: usize,
 }
@@ -693,7 +695,7 @@ impl ProcfsResolver {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("/proc"),
-            fast_owners: RefCell::new(fast::OwnerCache::default()),
+            fast_owners: fast::production_owner_cache(),
             sock_diag: RefCell::new(None),
             #[cfg(test)]
             use_procfs_socket_lookup: false,
@@ -706,7 +708,19 @@ impl ProcfsResolver {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            fast_owners: RefCell::new(fast::OwnerCache::default()),
+            fast_owners: fast::private_owner_cache(),
+            sock_diag: RefCell::new(None),
+            use_procfs_socket_lookup: true,
+            daemon_process_id: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn at_with_fast_owners(root: impl Into<PathBuf>, fast_owners: fast::SharedOwnerCache) -> Self {
+        Self {
+            root: root.into(),
+            fast_owners,
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: true,
             daemon_process_id: None,
@@ -718,7 +732,7 @@ impl ProcfsResolver {
     pub(crate) fn at_with_daemon_process(root: impl Into<PathBuf>, daemon_process_id: u32) -> Self {
         Self {
             root: root.into(),
-            fast_owners: RefCell::new(fast::OwnerCache::default()),
+            fast_owners: fast::private_owner_cache(),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: true,
             daemon_process_id: Some(daemon_process_id),
@@ -771,10 +785,15 @@ impl ProcfsResolver {
     pub(crate) fn resolve_batch_for_learning(
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        generation: u32,
     ) -> Vec<Result<ApplicationIdentity>> {
-        self.resolve_batch_for_enforcement_until(
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
+            cache.prepare_learning(generation, Instant::now());
+        }
+        self.resolve_batch_strict_until(
             requests,
             Instant::now() + LEARNING_PROC_SCAN_DEADLINE,
+            true,
         )
     }
 
@@ -783,7 +802,7 @@ impl ProcfsResolver {
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
         deadline: Instant,
     ) -> Vec<Result<ApplicationIdentity>> {
-        if let Ok(mut cache) = self.fast_owners.try_borrow_mut() {
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
             cache.clear();
         }
         self.resolve_batch_strict_until(requests, deadline, false)
@@ -880,7 +899,7 @@ impl ProcfsResolver {
         self.revalidate_batch_owners(&keys, &before, deadline, &mut errors, &mut identities);
 
         let results = batch_resolution_results(errors, identities);
-        if seed_fast_hints && let Ok(mut cache) = self.fast_owners.try_borrow_mut() {
+        if seed_fast_hints && let Ok(mut cache) = self.fast_owners.try_lock() {
             cache.seed(&before, &keys, &results, Instant::now());
         }
         batch_timing.finish(results.iter().filter(|result| result.is_err()).count());
@@ -1424,6 +1443,7 @@ impl ProcfsResolver {
             &daemon_owned,
             &accumulated.ambiguous_targets,
             accumulated.owners,
+            accumulated.observed_processes,
         )
     }
 
@@ -1449,8 +1469,12 @@ impl ProcfsResolver {
         daemon_owned: &BTreeSet<SocketOwnerKey>,
         ambiguous_targets: &BTreeSet<SocketOwnerKey>,
         mut owners: BTreeMap<SocketOwnerKey, BTreeMap<u32, Vec<OwnerTask>>>,
+        observed_processes: BTreeMap<SocketOwnerKey, BTreeSet<u32>>,
     ) -> Result<OwnerSnapshot> {
-        let mut snapshot = OwnerSnapshot::default();
+        let mut snapshot = OwnerSnapshot {
+            observed_processes,
+            ..OwnerSnapshot::default()
+        };
         for target in targets {
             if daemon_owned.contains(target) {
                 snapshot.failures.insert(
@@ -1906,6 +1930,10 @@ impl OwnerScanAccumulator {
         owner: OwnerTask,
         maximum_records: usize,
     ) -> Result<()> {
+        self.observed_processes
+            .entry(key)
+            .or_default()
+            .insert(owner.process_id);
         if self.ambiguous_targets.contains(&key) {
             return Ok(());
         }
@@ -4277,7 +4305,7 @@ mod tests {
         )?;
         let resolver = ProcfsResolver {
             root: PathBuf::from("/proc"),
-            fast_owners: RefCell::new(fast::OwnerCache::default()),
+            fast_owners: fast::private_owner_cache(),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: false,
             daemon_process_id: None,
@@ -6566,7 +6594,7 @@ mod tests {
         let requests = [(&connection, IdentityCaptureRequirements::full()); 2];
         let resolver = ProcfsResolver::at(directory.path());
         let initial = resolver
-            .resolve_batch_for_learning(&requests)
+            .resolve_batch_for_learning(&requests, 1)
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         assert!(initial.iter().all(|identity| identity.pid == 100));
@@ -6575,7 +6603,7 @@ mod tests {
         symlink("socket:[77]", second_owner.join("fd/9"))?;
         assert!(
             resolver
-                .resolve_batch_for_learning(&requests)
+                .resolve_batch_for_learning(&requests, 1)
                 .into_iter()
                 .all(|result| result
                     .err()
@@ -6584,7 +6612,7 @@ mod tests {
         let oversized = vec![requests[0]; MAX_ATTRIBUTION_BATCH_SIZE + 1];
         assert!(
             resolver
-                .resolve_batch_for_learning(&oversized)
+                .resolve_batch_for_learning(&oversized, 1)
                 .into_iter()
                 .all(|result| result
                     .err()

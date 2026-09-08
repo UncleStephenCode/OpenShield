@@ -56,7 +56,9 @@ wait_file() {
 begin_stage 'extract candidate without host installation'
 mkdir "$temporary_directory/extracted"
 rpm2cpio "$rpm_path" >"$temporary_directory/package.cpio"
-(cd "$temporary_directory/extracted"; cpio -idm --quiet ./usr/bin/openshield-daemon <"$temporary_directory/package.cpio")
+(cd "$temporary_directory/extracted"; cpio -idm --quiet --no-absolute-filenames \
+    ./usr/bin/openshield-daemon usr/bin/openshield-daemon \
+    <"$temporary_directory/package.cpio")
 daemon_binary="$temporary_directory/extracted/usr/bin/openshield-daemon"
 [ -x "$daemon_binary" ] && [ ! -L "$daemon_binary" ] || exit 1
 sha256sum "$daemon_binary" >"$evidence_directory/daemon.sha256"

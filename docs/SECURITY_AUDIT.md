@@ -156,15 +156,20 @@ The normative boundary is defined by the
 
 Strict remains the default. Root may choose Fast through `m` → `3. Enforcing`
 → `3.1 Fast` / `3.2 Strict`; Fast has an explicit risk confirmation, not an
-`S` shortcut. The implementation retains up to 256 positive owner
-UID/TGID/TID/start-time hints per resolver with a fixed 30-second lifetime since
-a fully successful Strict attribution batch, without renewing it on hits.
+`S` shortcut. The implementation retains one process-wide cache of up to 256
+positive owner UID/TGID/TID/start-time hints with a fixed 30-second lifetime
+since each owner was established by the exhaustive, race-checked path, without
+renewing it on hits. Successful Learning attribution warms this cache and a
+direct Learning-to-Fast generation transition preserves it. Fast's exhaustive
+fallback can also seed it; Strict Enforcing and unrelated generation changes
+clear it.
 Socket resolution for each queued attribution request
 (`SOCK_DIAG` for TCP/UDP, procfs for ICMP/ICMPv6),
 fd/UID/process-start/executable-version checks and required
 argv/cgroup capture stay fresh. Both owner passes search only hinted TGIDs;
 misses, expiry, errors, or detected ambiguity clear the hints before the Strict
-fallback. Only a fully successful Strict batch reseeds them.
+fallback. Independently successful exhaustive results may reseed an owner, but
+not when a failed target observed the same TGID.
 Rule matching, actions, revocation, and current generation remain mandatory.
 There is no cached authorization verdict or change to NFQUEUE bypass flags,
 backend rules, or conntrack acceleration.
@@ -544,7 +549,7 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The CI observation thresholds remain 10%. Under the current v0.2.6
+  The CI observation thresholds remain 10%. Under the current v0.2.7
   field-evaluation policy, the authenticated criterion
   `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
   means to `observe`; throughput and PPS retain the blocking `fail` action when
