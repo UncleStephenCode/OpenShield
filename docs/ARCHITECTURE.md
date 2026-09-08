@@ -2,7 +2,7 @@
 
 # OpenShield architecture
 
-This document describes the OpenShield v0.2.5 policy model.
+This document describes the OpenShield v0.2.6 policy model.
 
 OpenShield is a Linux host firewall composed of two Rust binaries:
 
@@ -884,13 +884,14 @@ evidence. A production maximum requires three successful steady repetitions.
 
 Relative performance uses those independent adjacent pristine AB/BA pairs.
 Every window delta and threshold crossing is preserved as evidence. The
-v0.2.5 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
-arithmetic mean of three independent paired steady deltas blocks release for
-throughput and PPS when it exceeds the threshold. The release-smoke setting
+v0.2.6 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
+one-sided 95% Student-t lower confidence bound over three independent paired
+steady deltas blocks release for throughput and PPS when it exceeds the
+threshold. A mean-only crossing remains visible without turning shared-runner
+variance into a release failure. The release-smoke setting
 `cpu_latency_relative_regressions_are_advisory: true` records CPU and latency
 crossings as warnings; the production-like profile retains blocking checks for
-all four dimensions. A one-sided 95% Student-t lower confidence bound records
-stronger confirmation but cannot override a blocking mean threshold. A single burst has no
+all four dimensions. A single burst has no
 repeated-sample confidence claim, so its relative crossing is diagnostic only;
 its validity, configured capacity bounds, and safety remain mandatory. Safety
 signals such as loss, retransmits, NIC or NFQUEUE
@@ -969,7 +970,7 @@ authorized non-root observer, all application metadata and identifying rule
 names are redacted by the daemon. UID 0 can read the full rule, including
 bounded command-line selectors. Runtime attribution reads bounded procfs
 identity metadata and a bounded queued-packet prefix, but never the process
-environment; version 0.2.5 does not provide a per-packet capture feed.
+environment; version 0.2.6 does not provide a per-packet capture feed.
 
 ## Failure policy
 

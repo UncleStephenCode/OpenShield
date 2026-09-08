@@ -544,15 +544,15 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The CI observation thresholds remain 10%. Under the current v0.2.1
+  The CI observation thresholds remain 10%. Under the current v0.2.6
   field-evaluation policy, the authenticated criterion
   `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
-  means to `observe`; throughput and PPS means retain the blocking `fail`
-  action. The production-like profile sets the criterion to `false` and keeps
-  all relative means blocking. A one-sided 95% Student-t lower confidence bound
-  records stronger confirmation without changing that action. A single
-  burst has no confidence claim, but throughput/PPS threshold crossings block
-  directly and CPU/latency follows the profile action; absolute CPU/RSS and p99
+  means to `observe`; throughput and PPS retain the blocking `fail` action when
+  a one-sided 95% Student-t lower confidence bound confirms the regression.
+  The production-like profile sets the criterion to `false` and applies that
+  confirmation decision to every relative metric. Mean-only crossings remain
+  authenticated observations. A single burst has no repeated-sample confidence
+  claim, so its relative crossings are also observations; absolute CPU/RSS and p99
   latency, burst validity, configured
   capacity bounds, and safety remain mandatory. Loss, retransmits, NIC or
   NFQUEUE drops/errors, and fail-open behavior are immediate failures rather

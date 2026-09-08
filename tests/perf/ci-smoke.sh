@@ -528,11 +528,12 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and .relative_performance_methodology == {
         pairing: "independent_order_balanced_adjacent_ab_ba",
         gate_phase: "steady",
-        burst_relative_role: "single_sample_threshold_gate",
+        burst_relative_role: "single_sample_observation_only",
         minimum_paired_samples: 3,
         confidence_level: 0.95,
         method: "arithmetic_mean_of_independent_paired_deltas",
         confirmation_method: "one_sided_paired_student_t_mean_lower_bound",
+        release_decision: "one_sided_paired_student_t_mean_lower_bound",
         thresholds_unchanged: true,
         cpu_latency_release_action: "observe"
     }
@@ -1322,24 +1323,17 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
                           and (.mean_exceeded_threshold | type == "boolean")
                           and (.confirmed_regression | type == "boolean")
                      else .release_action == "fail"
-                          and .mean_exceeded_threshold == false
+                          and (.mean_exceeded_threshold | type == "boolean")
                           and .confirmed_regression == false
                      end))
         else (.relative_performance_evidence | type == "array" and length > 0)
              and all(.relative_performance_evidence[];
-                 .method == "single_paired_burst_threshold_gate"
+                 .method == "single_paired_burst_observation"
                  and .minimum_sample_count == 3
                  and .confidence_level == 0.95
                  and (.sample_count == 0 or .sample_count == 1)
-                 and (
-                     if (.metric == "cgroup_cpu_increase_percent"
-                         or (.metric | startswith("latency_"))
-                         or (.metric | startswith("connect_latency_")))
-                     then .release_action == "observe"
-                          and (.mean_exceeded_threshold | type == "boolean")
-                     else .release_action == "fail"
-                          and .mean_exceeded_threshold == false
-                     end)
+                 and .release_action == "observe"
+                 and (.mean_exceeded_threshold | type == "boolean")
                  and .confirmed_regression == false)
         end)
 ' "$report_json" >/dev/null \

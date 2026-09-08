@@ -272,25 +272,26 @@ mislabeling environmental drift as a performance regression.
   steady/burst window, a missing backend, or a missing/malformed report fails
   the job;
 - all per-window relative deltas and threshold crossings are retained. For
-  throughput and DUT PPS, the release profile blocks when the arithmetic mean
-  of at least three valid, independent, adjacent pristine AB/BA pairs exceeds
-  the unchanged 10% reduction limit. With
+  throughput and DUT PPS, the release profile blocks when the one-sided 95%
+  Student-t lower confidence bound over at least three valid, independent,
+  adjacent pristine AB/BA pairs exceeds the unchanged 10% reduction limit. A
+  mean-only crossing remains visible but does not turn shared-runner variance
+  into a release failure. With
   `cpu_latency_relative_regressions_are_advisory: true`, the same calculation
   and one-sided 95% Student-t bound for relative DUT-cgroup CPU and
   request/TCP-connect latency are evidence only on the shared release runner;
   exceeding 10% does not by itself block publication. Absolute daemon CPU/RSS
   and p99-latency ceilings remain blocking. The longer production-like profile
   sets `cpu_latency_relative_regressions_are_advisory: false`, so every
-  relative mean over its 5% limits remains blocking;
+  statistically confirmed relative regression over its 5% limits remains blocking;
 - a separate source-manifested validator recomputes the canonical configuration
   SHA-256 and workload-time estimate from the checked-in JSON, then derives all
   steady paired deltas, means, strict threshold comparisons, advisory/blocking
-  disposition, Student-t bounds, and observation/failure linkage from primary
+  disposition, Student-t lower-bound decisions, and observation/failure linkage from primary
   measurements; report-provided aggregate decisions are not trusted;
-- a single burst relative observation is a direct gate for throughput/PPS;
-  relative CPU and latency follow the profile's explicit advisory/blocking
-  setting, while burst validity, configured capacity ceilings, and safety
-  remain mandatory;
+- a single burst relative comparison remains an authenticated observation
+  because it has no repeated-sample confidence claim, while burst validity,
+  configured absolute capacity ceilings, and safety remain mandatory;
 - application errors/loss, TCP retransmits, NIC drops/errors, NFQUEUE
   drops/errors, or fail-open behavior block immediately and are never deferred
   to the repeated-sample relative decision;

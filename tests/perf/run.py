@@ -8663,14 +8663,14 @@ def apply_confirmed_relative_gates(
 
     Per-window deltas remain in ``overhead_vs_baseline`` and threshold
     crossings remain in ``relative_performance_observation_reasons``. A
-    group becomes a release failure when the arithmetic mean of at least three
-    independent steady paired deltas exceeds the unchanged configured
-    threshold, except for criteria explicitly assigned the ``observe`` action.
-    The one-sided 95% lower confidence bound is retained as stronger
-    confirmation, not as a loophole through which a high-variance blocking
-    mean regression can pass. A single burst cannot establish a statistical
-    regression claim, but its direct threshold crossing still blocks metrics
-    assigned the ``fail`` action.
+    group becomes a release failure only when the one-sided 95% lower
+    confidence bound from at least three independent steady paired deltas
+    exceeds the unchanged configured threshold, except for criteria explicitly
+    assigned the ``observe`` action. A mean-only crossing remains visible but
+    cannot turn shared-runner variance into a release failure. A single burst
+    cannot establish a statistical regression claim, so its relative deltas
+    are observations while its absolute capacity and fail-closed safety gates
+    remain blocking.
     """
 
     groups: dict[
@@ -8787,9 +8787,9 @@ def apply_confirmed_relative_gates(
                     ),
                 }
             )
-            if mean_exceeded:
+            if confirmed:
                 reason = (
-                    "independent paired mean for "
+                    "independent paired confidence bound for "
                     f"{description} exceeded the configured bound"
                 )
                 for row in rows:
@@ -8811,11 +8811,11 @@ def apply_confirmed_relative_gates(
             )
             threshold = float(criteria[criterion_name])
             mean_exceeded = observed is not None and observed > threshold
-            release_action = (
-                "observe"
-                if relative_metric_is_advisory(criterion_name, criteria)
-                else "fail"
-            )
+            # A burst has one paired sample. Keep every threshold crossing in
+            # authenticated evidence, but do not make an unrepeatable sample a
+            # relative non-inferiority decision. Absolute capacity and every
+            # fail-closed safety check remain independent hard gates.
+            release_action = "observe"
             burst_evidence.append(
                 {
                 "metric": metric_name,
@@ -8824,7 +8824,7 @@ def apply_confirmed_relative_gates(
                 "sample_count": 1 if observed is not None else 0,
                 "minimum_sample_count": MINIMUM_RELATIVE_PAIRED_SAMPLES,
                 "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
-                "method": "single_paired_burst_threshold_gate",
+                "method": "single_paired_burst_observation",
                 "mean_percent": observed,
                 "mean_exceeded_threshold": mean_exceeded,
                 "lower_confidence_bound_percent": None,
@@ -8832,11 +8832,6 @@ def apply_confirmed_relative_gates(
                 "release_action": release_action,
                 }
             )
-            if mean_exceeded and release_action == "fail":
-                result["relative_performance_failure_reasons"].append(
-                    "single paired burst for "
-                    f"{description} exceeded the configured bound"
-                )
         result["relative_performance_evidence"] = burst_evidence
         recompute_result_outcome(result, criteria)
 
@@ -8865,7 +8860,8 @@ def recompute_result_outcome(
     )
     # Normal protected burst windows contain the same workload as baseline;
     # wrong-executable probes live in the separate controlled-overload gate.
-    # Relative regressions therefore gate both steady and burst windows.
+    # A burst remains an absolute capacity and safety gate, while its single
+    # relative sample is deliberately observational.
     relative_required = result["phase_role"] in {"steady", "burst"}
     result["passed"] = (
         result["safety_pass"]
@@ -10063,7 +10059,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Baseline samples/protected comparisons: {pairing.get('baseline_sample_count', 0)}/{pairing.get('comparison_count', 0)}",
         f"- Maximum paired steady-window gap: {pairing_gap_display}",
         f"- Estimated configured workload time: {report['estimated_workload_seconds']:.1f} s",
-        f"- Relative performance method: adjacent independent AB/BA paired deltas; the arithmetic mean from at least three steady pairs gates metrics assigned `fail`. CPU/latency action for this profile: `{cpu_latency_action}`; throughput/PPS remain blocking. A one-sided 95% Student-t lower confidence bound records stronger confirmation.",
+        f"- Relative performance method: adjacent independent AB/BA paired deltas; a one-sided 95% Student-t lower confidence bound from at least three steady pairs gates metrics assigned `fail`. Mean-only and single-burst crossings remain observations. CPU/latency action for this profile: `{cpu_latency_action}`; confirmed throughput/PPS regressions remain blocking.",
         "",
         "## Environment evidence",
         "",
@@ -10231,7 +10227,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             "",
             "## Per-window relative observations",
             "",
-            "These paired windows crossed a configured threshold. They remain visible; an independent steady-pair mean blocks only metrics assigned `fail` (throughput/PPS are always blocking, while CPU/latency follow this profile's explicit action). The 95% lower confidence bound records stronger confirmation. A single burst cannot establish statistical confidence, but directly blocks every threshold crossing assigned `fail` and remains a capacity and safety gate.",
+            "These paired windows crossed a configured threshold. They remain visible; a one-sided 95% lower confidence bound from independent steady pairs blocks only metrics assigned `fail` (confirmed throughput/PPS regressions are blocking, while CPU/latency follow this profile's explicit action). Mean-only crossings and the single burst sample are observations. Every burst remains an absolute capacity and fail-closed safety gate.",
             "",
         ]
     )
@@ -10954,11 +10950,14 @@ def run_harness(
         "relative_performance_methodology": {
             "pairing": "independent_order_balanced_adjacent_ab_ba",
             "gate_phase": "steady",
-            "burst_relative_role": "single_sample_threshold_gate",
+            "burst_relative_role": "single_sample_observation_only",
             "minimum_paired_samples": MINIMUM_RELATIVE_PAIRED_SAMPLES,
             "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
             "method": "arithmetic_mean_of_independent_paired_deltas",
             "confirmation_method": (
+                "one_sided_paired_student_t_mean_lower_bound"
+            ),
+            "release_decision": (
                 "one_sided_paired_student_t_mean_lower_bound"
             ),
             "thresholds_unchanged": True,

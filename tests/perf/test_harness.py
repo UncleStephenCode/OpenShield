@@ -1290,10 +1290,14 @@ class ConfigTests(unittest.TestCase):
             'confirmation_method: "one_sided_paired_student_t_mean_lower_bound"',
             source,
         )
+        self.assertIn(
+            'release_decision: "one_sided_paired_student_t_mean_lower_bound"',
+            source,
+        )
         self.assertIn('cpu_latency_release_action: "observe"', source)
-        self.assertIn('burst_relative_role: "single_sample_threshold_gate"', source)
-        self.assertIn('.method == "single_paired_burst_threshold_gate"', source)
-        self.assertIn(".mean_exceeded_threshold == false", source)
+        self.assertIn('burst_relative_role: "single_sample_observation_only"', source)
+        self.assertIn('.method == "single_paired_burst_observation"', source)
+        self.assertIn('.release_action == "observe"', source)
         self.assertIn(".confirmed_regression == false", source)
         for absolute_gate in (
             ".derived.target_attainment_ratio",
@@ -2055,29 +2059,29 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                 ):
                     release_validator.validate_documents(config, report)
 
-    def test_burst_throughput_gate_is_independently_recomputed(self) -> None:
+    def test_burst_throughput_observation_is_independently_recomputed(self) -> None:
         config, report = independent_validation_fixture((0.0, 0.0, 20.0))
         summary = release_validator.validate_documents(
             config, report, require_passing=False
         )
         self.assertEqual(summary["regressed_group_count"], 0)
-        self.assertEqual(summary["regressed_burst_count"], 2)
+        self.assertEqual(summary["regressed_burst_count"], 0)
         candidate = json.loads(json.dumps(report, allow_nan=False))
         burst = next(
             row
             for row in candidate["results"]
             if row["policy"] != "baseline" and row["phase_role"] == "burst"
         )
-        burst.update(
-            {
-                "relative_performance_failure_reasons": [],
-                "relative_performance_pass": True,
-                "passed": True,
-            }
+        next(
+            item
+            for item in burst["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        ).update(
+            {"method": "single_paired_burst_threshold_gate"}
         )
         with self.assertRaisesRegex(
             release_validator.ValidationError,
-            "burst relative failure reasons",
+            "burst relative-performance evidence",
         ):
             release_validator.validate_documents(
                 config, candidate, require_passing=False
@@ -2182,13 +2186,13 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                     hardlink, maximum_bytes=1024, context="fixture"
                 )
 
-    def test_regressed_mean_and_failure_linkage_are_recomputed(self) -> None:
+    def test_high_variance_mean_is_observed_without_release_failure(self) -> None:
         config, report = independent_validation_fixture((0.0, 0.0, 31.0))
         summary = release_validator.validate_documents(
             config, report, require_passing=False
         )
-        self.assertEqual(summary["regressed_group_count"], 2)
-        self.assertEqual(summary["regressed_burst_count"], 2)
+        self.assertEqual(summary["regressed_group_count"], 0)
+        self.assertEqual(summary["regressed_burst_count"], 0)
         protected = [
             row for row in report["results"] if row["policy"] != "baseline"
         ]
@@ -2224,9 +2228,9 @@ class IndependentReleaseValidationTests(unittest.TestCase):
             ).update({"release_action": "observe"}),
             "failure linkage": lambda row: row.update(
                 {
-                    "relative_performance_failure_reasons": [],
-                    "relative_performance_pass": True,
-                    "passed": True,
+                    "relative_performance_failure_reasons": ["invented failure"],
+                    "relative_performance_pass": False,
+                    "passed": False,
                 }
             ),
         }
@@ -2243,6 +2247,25 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                     release_validator.validate_documents(
                         config, candidate, require_passing=False
                     )
+
+    def test_confirmed_regression_and_failure_linkage_are_recomputed(self) -> None:
+        config, report = independent_validation_fixture((20.0, 20.0, 20.0))
+        summary = release_validator.validate_documents(
+            config, report, require_passing=False
+        )
+        self.assertEqual(summary["regressed_group_count"], 2)
+        self.assertEqual(summary["regressed_burst_count"], 0)
+        protected = next(
+            row for row in report["results"] if row["policy"] != "baseline"
+        )
+        evidence = next(
+            item
+            for item in protected["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        )
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertTrue(evidence["confirmed_regression"])
+        self.assertFalse(protected["relative_performance_pass"])
 
 
 class EvaluationTests(unittest.TestCase):
@@ -3223,6 +3246,32 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(evidence["release_action"], "observe")
         self.assertTrue(all(row["relative_performance_pass"] for row in measured_rows))
 
+    def test_high_variance_throughput_mean_requires_confidence(self) -> None:
+        results = []
+        measured_rows = []
+        for repetition, reduction in enumerate((0.0, 0.0, 31.0), start=1):
+            baseline = synthetic_result("baseline")
+            measured = synthetic_result("network_only")
+            identify_independent_pair(baseline, measured, repetition)
+            measured["workload"]["metrics"]["application_mbps"] = 12.0 * (
+                1.0 - reduction / 100.0
+            )
+            runner.evaluate_result(baseline, self.criteria)
+            runner.evaluate_result(measured, self.criteria)
+            results.extend((baseline, measured))
+            measured_rows.append(measured)
+        runner.add_baseline_comparisons(results, self.criteria)
+        evidence = next(
+            item
+            for item in measured_rows[0]["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        )
+        self.assertGreater(evidence["mean_percent"], 10.0)
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertFalse(evidence["confirmed_regression"])
+        self.assertEqual(evidence["release_action"], "fail")
+        self.assertTrue(all(row["relative_performance_pass"] for row in measured_rows))
+
     def test_production_cpu_mean_still_blocks_when_not_advisory(self) -> None:
         criteria = dict(self.criteria)
         criteria["cpu_latency_relative_regressions_are_advisory"] = False
@@ -3382,7 +3431,7 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertFalse(measured["valid"])
 
-    def test_single_burst_throughput_crossing_is_a_direct_gate(self) -> None:
+    def test_single_burst_throughput_crossing_is_observational(self) -> None:
         criteria = dict(self.criteria)
         criteria["require_burst_capacity"] = True
         baseline_steady = synthetic_result("baseline")
@@ -3398,14 +3447,14 @@ class EvaluationTests(unittest.TestCase):
         runner.add_baseline_comparisons(
             [baseline_steady, baseline, measured_steady, measured], criteria
         )
-        self.assertFalse(measured["relative_performance_pass"])
+        self.assertTrue(measured["relative_performance_pass"])
         self.assertTrue(measured["capacity_pass"])
         self.assertTrue(measured["safety_pass"])
-        self.assertFalse(measured["passed"])
+        self.assertTrue(measured["passed"])
         self.assertTrue(measured["relative_performance_observation_reasons"])
         self.assertTrue(
             all(
-                item["method"] == "single_paired_burst_threshold_gate"
+                item["method"] == "single_paired_burst_observation"
                 and item["confirmed_regression"] is False
                 for item in measured["relative_performance_evidence"]
             )
@@ -3415,7 +3464,7 @@ class EvaluationTests(unittest.TestCase):
             for item in measured["relative_performance_evidence"]
             if item["metric"] == "throughput_reduction_percent"
         )
-        self.assertEqual(throughput["release_action"], "fail")
+        self.assertEqual(throughput["release_action"], "observe")
         self.assertTrue(throughput["mean_exceeded_threshold"])
 
     def test_single_burst_cpu_crossing_remains_advisory_in_ci_smoke(self) -> None:

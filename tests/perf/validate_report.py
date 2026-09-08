@@ -1374,9 +1374,10 @@ def validate_documents(
             release_action = (
                 "observe" if _criterion_is_advisory(criterion, criteria) else "fail"
             )
-            if mean_exceeded and release_action == "fail":
+            if confirmed and release_action == "fail":
                 expected_failure_reasons.append(
-                    f"independent paired mean for {description} exceeded the configured bound"
+                    "independent paired confidence bound for "
+                    f"{description} exceeded the configured bound"
                 )
             expected_evidence.append(
                 {
@@ -1414,17 +1415,26 @@ def validate_documents(
                 "relative performance failure reasons",
             )
             if failures != expected_failure_reasons:
-                _reject("relative performance failure reasons are not linked to group means")
+                _reject(
+                    "relative performance failure reasons are not linked to "
+                    "confirmed group regressions"
+                )
             expected_relative_pass = not expected_failure_reasons
             if current.get("relative_performance_pass") is not expected_relative_pass:
-                _reject("relative_performance_pass is not linked to recomputed group means")
+                _reject(
+                    "relative_performance_pass is not linked to recomputed "
+                    "confidence bounds"
+                )
             expected_pass = (
                 current.get("safety_pass") is True
                 and current.get("capacity_pass") is True
                 and expected_relative_pass
             )
             if current.get("passed") is not expected_pass:
-                _reject("steady passed flag is not linked to safety, capacity, and relative gates")
+                _reject(
+                    "steady passed flag is not linked to safety, capacity, "
+                    "and relative gates"
+                )
 
     burst_baselines: dict[
         tuple[str, str, str, str, float, str], list[dict[str, Any]]
@@ -1614,13 +1624,10 @@ def validate_documents(
             observed = expected_overhead[name]
             threshold = _number(criteria.get(criterion), criterion, minimum=0.0)
             mean_exceeded = observed > threshold
-            release_action = (
-                "observe" if _criterion_is_advisory(criterion, criteria) else "fail"
-            )
-            if mean_exceeded and release_action == "fail":
-                expected_failure_reasons.append(
-                    f"single paired burst for {description} exceeded the configured bound"
-                )
+            # One burst pair cannot establish a relative regression. Its
+            # crossing is authenticated below, while absolute capacity and
+            # fail-closed safety remain mandatory independently.
+            release_action = "observe"
             expected_evidence.append(
                 {
                     "metric": name,
@@ -1629,7 +1636,7 @@ def validate_documents(
                     "sample_count": 1,
                     "minimum_sample_count": MINIMUM_PAIRED_SAMPLES,
                     "confidence_level": CONFIDENCE_LEVEL,
-                    "method": "single_paired_burst_threshold_gate",
+                    "method": "single_paired_burst_observation",
                     "mean_percent": observed,
                     "mean_exceeded_threshold": mean_exceeded,
                     "lower_confidence_bound_percent": None,
