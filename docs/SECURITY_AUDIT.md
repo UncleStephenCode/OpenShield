@@ -175,6 +175,13 @@ Rule matching, actions, revocation, and current generation remain mandatory.
 There is no cached authorization verdict or change to NFQUEUE bypass flags,
 backend rules, or conntrack acceleration.
 
+Fast deliberately treats argv/cgroup captured on an automatic learned
+`Accept` as volatile process-instance metadata. Such an allow still requires
+the exact endpoint, canonical executable path, complete executable-file
+identity, and UID. Strict, manual rules, and all `Drop`/`Reject` selectors keep
+full-field matching. Unit and real-socket E2E regressions verify both the
+relaxed learned allow and the non-relaxation of explicit denies and revocation.
+
 Fast deliberately weakens exhaustive-owner guarantees. A new same-UID holder
 of a shared, inherited, or `SCM_RIGHTS`-transferred socket outside the hints
 can be missed; checking the known process again does not detect every competing

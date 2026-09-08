@@ -132,7 +132,7 @@ def exchange(stream, protocol, peer, token, connect):
     Q.require(response == payload, "incorrect peer echo")
 
 
-def worker(peer):
+def worker(peer, *_identity_variant):
     held = None
     held_protocol = None
     try:
@@ -194,7 +194,8 @@ def fresh(process, protocol, token, expected):
 def allowed_tokens():
     tokens = {"learning-tcp", "learning-udp", "learning-fast-tcp", "learning-fast-udp",
               "learning-churn-tcp", "learning-churn-udp", "strict-tcp", "strict-udp",
-              "fast-held-tcp", "fast-restored-tcp", "fast-held-udp", "strict-restored-tcp"}
+              "learning-variant-tcp", "fast-variant-udp", "fast-held-tcp",
+              "fast-restored-tcp", "fast-held-udp", "strict-restored-tcp"}
     for i in range(WARM_ROUNDS):
         for protocol in Q.PORTS:
             tokens.add(f"fast-warm-{i}-{protocol}")
@@ -239,6 +240,26 @@ def run(peer, backend):
             Q.require(len(matches) == 1, f"unexpected duplicate {protocol} allow")
             rule_ids[protocol] = matches[0]["id"]
             Q.release(allowed)
+        # A multi-process browser commonly starts another instance of the
+        # same executable with volatile argv/cgroup identity. Teach only its
+        # TCP endpoint so UDP below can prove that Fast reuses an automatic
+        # learned endpoint by stable executable identity, while Strict still
+        # requires the complete original selector.
+        variant = subprocess.Popen(
+            [Q.ALLOWED, __file__, "worker", peer, "runtime-variant"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        processes.append(variant)
+        original_tcp_ids = {rule["id"] for rule in Q.learned(peer, "tcp")}
+        fresh(variant, "tcp", "learning-variant-tcp", True)
+        Q.wait(lambda: len(Q.learned(peer, "tcp")) >= 2,
+               "no distinct learned selector for the argv variant")
+        variant_tcp_ids = [rule["id"] for rule in Q.learned(peer, "tcp")
+                           if rule["id"] not in original_tcp_ids]
+        Q.require(len(variant_tcp_ids) == 1, "variant TCP rule is not uniquely identifiable")
         # Seed a second recent process hint, then let that process disappear.
         # Fast must omit this stale candidate without flushing the live owner
         # and falling back to a UID-wide scan. The unrelated large-fd process
@@ -261,9 +282,12 @@ def run(peer, backend):
         # under the shorter Enforcing deadline. Exercise the direct handoff of
         # positive, twice-checked Learning owner hints to Fast.
         enforce("fast")
+        fresh(variant, "udp", "fast-variant-udp", True)
         for protocol in Q.PORTS:
             fresh(allowed, protocol, f"learning-fast-{protocol}", True)
         enforce("strict")
+        fresh(variant, "udp", "strict-forbidden-variant-udp", False)
+        mutation("delete_rule", id=variant_tcp_ids[0])
         for protocol in Q.PORTS:
             fresh(allowed, protocol, f"strict-{protocol}", True)
             fresh(denied, protocol, f"strict-forbidden-{protocol}", False)

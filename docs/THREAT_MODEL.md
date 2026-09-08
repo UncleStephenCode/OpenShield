@@ -50,6 +50,13 @@ ordinary misses retain unrelated live hints across the Strict fallback. A
 fallback which actually detects ambiguous ownership clears the reduced scope.
 There is no verdict cache, new queue bypass, or relaxation of kernel rules.
 
+Fast has one additional, explicit policy exception: an automatic learned
+`Accept` ignores its captured argv/cgroup when a later process has the same
+canonical executable path, full executable-file identity, UID, and endpoint.
+An attacker running that exact executable as that UID can therefore share its
+learned endpoints across process instances. Strict avoids this exception.
+Manual rules and all `Drop`/`Reject` rules never use it.
+
 A previously uncached process sharing the same socket through inheritance,
 `fork`, or `SCM_RIGHTS` can remain invisible to Fast, even for the same UID.
 The three-minute inactivity TTL limits hint retention, not a guaranteed detection window;

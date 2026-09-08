@@ -159,6 +159,13 @@ action precedence, revocation, deadlines, and flow generation remain mandatory.
 Backend compilation, NFQUEUE flags, and established-TCP conntrack fast paths do
 not change; this is not a new L1/L2/L3 level, kernel extension, or queue bypass.
 
+Only in Fast, an automatic learned `Accept` may match a later process instance
+by the same canonical executable path, complete file identity, and UID without
+requiring its captured argv/cgroup to be identical. Endpoint selectors remain
+exact. Strict, manual rules, and every `Drop`/`Reject` retain full selector
+matching. This avoids treating volatile browser child arguments as a different
+application while preserving file-version pinning and administrator intent.
+
 The narrower search is a real assurance reduction: a newly shared socket owner
 outside the hinted TGIDs can be missed, including after `fork` or
 `SCM_RIGHTS` transfer to another same-UID process. A successful local recheck

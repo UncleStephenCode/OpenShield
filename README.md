@@ -168,6 +168,15 @@ same process made that result unsafe.
 Packet verdicts are never cached: current rules, actions, and policy
 generation still determine the decision.
 
+Fast also gives automatically learned `Accept` endpoints OpenSnitch-like
+process-instance stability: the current process must match the learned
+canonical executable path, complete executable-file identity, and UID, but
+volatile learned argv/cgroup values do not have to equal the values of the
+original browser or service subprocess. Network address, port, protocol, and
+interface constraints remain exact. Strict continues to require every stored
+field. Manual rules and all `Drop`/`Reject` rules remain exact in both
+strategies, so Fast cannot relax an administrator-authored selector or a deny.
+
 This is a deliberate security/performance tradeoff, not an equivalent
 optimization of Strict. A new uncached owner of a shared socket—for example
 after `fork` or `SCM_RIGHTS` transfer—can remain outside Fast's owner search.
@@ -179,7 +188,8 @@ is required. Neither strategy proves which holder actually sent a shared socket'
 packet. No measured CPU or latency improvement is claimed for this new path.
 
 Both strategies use the same nftables/iptables, NFQUEUE, and conntrack-generation
-policy; Fast adds no queue bypass, kernel module, or new kernel requirement.
+data plane; the learned-`Accept` distinction above is confined to the
+userspace match. Fast adds no queue bypass, kernel module, or new kernel requirement.
 `StatusV4` and the TUI expose the remembered strategy separately from backend,
 mode, and L1/L2/L3 classification. State omits `enforcement_strategy` for Strict
 and stores `"fast"` for Fast. Older daemons reject that new field: before
