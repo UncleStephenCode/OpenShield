@@ -79,6 +79,7 @@ client=$(docker create --platform linux/amd64 --name "openshield-systemd-client-
     --tmpfs /run:rw,nosuid,nodev,size=64m --tmpfs /tmp:rw,nosuid,nodev,size=64m \
     --mount "type=bind,src=$package,dst=/packages/openshield.rpm,readonly" \
     --mount "type=bind,src=$directory/systemd-sandbox-init.sh,dst=/opt/systemd-sandbox-init.sh,readonly" \
+    --mount "type=bind,src=$directory/zypper-refresh.sh,dst=/opt/zypper-refresh.sh,readonly" \
     --mount "type=bind,src=$directory/systemd-sandbox.py,dst=/opt/systemd-sandbox.py,readonly" \
     --mount "type=bind,src=$directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
     "$image" /bin/sh /opt/systemd-sandbox-init.sh "$backend" /packages/openshield.rpm)
