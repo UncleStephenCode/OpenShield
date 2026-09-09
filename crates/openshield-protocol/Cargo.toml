@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ipnet.workspace = true
-openshield-core = { version = "=0.2.7", path = "../openshield-core" }
+openshield-core = { version = "=0.2.8", path = "../openshield-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

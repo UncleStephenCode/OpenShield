@@ -2,7 +2,7 @@
 
 # OpenShield architecture
 
-This document describes the OpenShield v0.2.7 policy model.
+This document describes the OpenShield v0.2.8 policy model.
 
 OpenShield is a Linux host firewall composed of two Rust binaries:
 
@@ -899,7 +899,7 @@ evidence. A production maximum requires three successful steady repetitions.
 
 Relative performance uses those independent adjacent pristine AB/BA pairs.
 Every window delta and threshold crossing is preserved as evidence. The
-v0.2.7 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
+v0.2.8 CI relative thresholds remain 10% for throughput, PPS, CPU, and latency. The
 one-sided 95% Student-t lower confidence bound over three independent paired
 steady deltas blocks release for throughput and PPS when it exceeds the
 threshold. A mean-only crossing remains visible without turning shared-runner
@@ -908,7 +908,11 @@ variance into a release failure. The release-smoke setting
 crossings as warnings; the production-like profile retains blocking checks for
 all four dimensions. A single burst has no
 repeated-sample confidence claim, so its relative crossing is diagnostic only;
-its validity, configured capacity bounds, and safety remain mandatory. Safety
+its validity, configured capacity bounds, and safety remain mandatory. The
+absolute daemon CPU bounds are phase-specific: CI permits 95% of one core
+outside bursts and 150% during bursts; the production-like profile uses 90%
+for both. The runner and independent report validator enforce these configured
+bounds. RSS, latency, throughput/PPS, and safety checks are unchanged. Safety
 signals such as loss, retransmits, NIC or NFQUEUE
 drops/errors, and fail-open behavior fail immediately and are not subject to
 the statistical relative decision. Host `/proc/softirqs` counters are not
@@ -985,7 +989,7 @@ authorized non-root observer, all application metadata and identifying rule
 names are redacted by the daemon. UID 0 can read the full rule, including
 bounded command-line selectors. Runtime attribution reads bounded procfs
 identity metadata and a bounded queued-packet prefix, but never the process
-environment; version 0.2.7 does not provide a per-packet capture feed.
+environment; version 0.2.8 does not provide a per-packet capture feed.
 
 ## Failure policy
 

@@ -631,6 +631,7 @@ CRITERIA_KEYS = {
     "maximum_tcp_retransmits_per_tx_packet",
     "maximum_latency_p99_ms",
     "maximum_daemon_cpu_percent_one_core",
+    "maximum_burst_daemon_cpu_percent_one_core",
     "maximum_daemon_rss_bytes",
     "maximum_generator_wall_cpu_ratio",
     "maximum_peer_wall_cpu_ratio",
@@ -827,6 +828,7 @@ def validate_config(document: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "maximum_latency_p99_ms",
         "maximum_daemon_cpu_percent_one_core",
+        "maximum_burst_daemon_cpu_percent_one_core",
         "maximum_scheduler_lag_p99_ms",
         "application_tcp_minimum_queue_hits_per_connection",
         "application_tcp_maximum_queue_hits_per_connection",
@@ -7769,8 +7771,22 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
                 )
         daemon_cpu = numeric(nested(result, "dut_metrics", "daemon", "cpu_percent_one_core"))
         daemon_rss = numeric(nested(result, "dut_metrics", "daemon", "rss_bytes_peak"))
-        if daemon_cpu is None or daemon_cpu > criteria["maximum_daemon_cpu_percent_one_core"]:
-            failures.append("daemon CPU exceeded the configured sustainable bound")
+        # Burst load has its own finite CPU budget. A multithreaded daemon may
+        # briefly use more than one core without exceeding its steady budget
+        # or losing traffic. Never infer the budget from the measured load.
+        burst_cpu = result["phase_role"] == "burst"
+        cpu_limit = criteria[
+            "maximum_burst_daemon_cpu_percent_one_core"
+            if burst_cpu else "maximum_daemon_cpu_percent_one_core"
+        ]
+        if daemon_cpu is None or daemon_cpu < 0:
+            unreliable.append("daemon CPU metric is unavailable or invalid")
+            failures.append("daemon CPU metric is unavailable or invalid")
+        elif daemon_cpu > cpu_limit:
+            failures.append(
+                "daemon CPU exceeded the configured burst bound"
+                if burst_cpu else "daemon CPU exceeded the configured sustainable bound"
+            )
         if daemon_rss is None or daemon_rss > criteria["maximum_daemon_rss_bytes"]:
             failures.append("daemon RSS is missing or exceeded the bound")
 
@@ -10059,6 +10075,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Baseline samples/protected comparisons: {pairing.get('baseline_sample_count', 0)}/{pairing.get('comparison_count', 0)}",
         f"- Maximum paired steady-window gap: {pairing_gap_display}",
         f"- Estimated configured workload time: {report['estimated_workload_seconds']:.1f} s",
+        f"- Daemon CPU limits (% of one core): steady {nested(report, 'criteria', 'maximum_daemon_cpu_percent_one_core', default='unavailable')}; burst {nested(report, 'criteria', 'maximum_burst_daemon_cpu_percent_one_core', default='unavailable')}. Both limits are blocking in their respective capacity windows.",
         f"- Relative performance method: adjacent independent AB/BA paired deltas; a one-sided 95% Student-t lower confidence bound from at least three steady pairs gates metrics assigned `fail`. Mean-only and single-burst crossings remain observations. CPU/latency action for this profile: `{cpu_latency_action}`; confirmed throughput/PPS regressions remain blocking.",
         "",
         "## Environment evidence",

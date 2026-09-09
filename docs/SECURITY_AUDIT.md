@@ -557,7 +557,7 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The CI observation thresholds remain 10%. Under the current v0.2.7
+  The CI observation thresholds remain 10%. Under the current v0.2.8
   field-evaluation policy, the authenticated criterion
   `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
   means to `observe`; throughput and PPS retain the blocking `fail` action when
@@ -567,7 +567,11 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   authenticated observations. A single burst has no repeated-sample confidence
   claim, so its relative crossings are also observations; absolute CPU/RSS and p99
   latency, burst validity, configured
-  capacity bounds, and safety remain mandatory. Loss, retransmits, NIC or
+  capacity bounds, and safety remain mandatory. The CI daemon CPU ceiling is
+  95% of one core outside bursts and 150% during bursts; the production-like
+  profile uses 90% for both. Both phase-specific ceilings are checked against
+  primary measurements by the independent validator. RSS, latency,
+  throughput/PPS, and safety limits are unchanged. Loss, retransmits, NIC or
   NFQUEUE drops/errors, and fail-open behavior are immediate failures rather
   than statistically aggregated relative decisions. The CI smoke has three short steady repetitions
   and is path/safety evidence, not a maximum-capacity result; the production

@@ -42,6 +42,12 @@ CPU/RSS and p99-latency ceilings, target attainment, validity, and burst
 capacity remain mandatory. A single burst has no repeated-sample confidence
 claim, so its relative crossings are observations; its absolute capacity,
 validity, and safety checks remain blocking.
+The absolute daemon CPU budget is 95% of one core outside bursts
+(`maximum_daemon_cpu_percent_one_core`) and 150% during bursts
+(`maximum_burst_daemon_cpu_percent_one_core`). The burst allowance is bounded,
+and the independent validator checks the applicable limit from raw
+measurements. The production-like profile uses 90% for both phases.
+Throughput/PPS, latency, RSS, and safety limits are unchanged.
 Drops, retransmits, NFQUEUE errors, and fail-open behavior are immediate
 failures rather than statistical decisions. The independent controlled-overload
 canary proves the absence of fail-open behavior: application-bound Enforcing

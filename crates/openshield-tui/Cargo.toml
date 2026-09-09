@@ -12,8 +12,8 @@ clap.workspace = true
 crossterm.workspace = true
 ipnet.workspace = true
 nix.workspace = true
-openshield-core = { version = "=0.2.7", path = "../openshield-core" }
-openshield-protocol = { version = "=0.2.7", path = "../openshield-protocol" }
+openshield-core = { version = "=0.2.8", path = "../openshield-core" }
+openshield-protocol = { version = "=0.2.8", path = "../openshield-protocol" }
 ratatui.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

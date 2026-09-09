@@ -162,10 +162,12 @@ jq -e '
     and .criteria.maximum_cgroup_cpu_increase_vs_baseline_percent == 10
     and .criteria.cpu_latency_relative_regressions_are_advisory == true
     and .criteria.maximum_comparison_gap_seconds == 15
+    and .criteria.maximum_daemon_cpu_percent_one_core == 95
+    and .criteria.maximum_burst_daemon_cpu_percent_one_core == 150
     and .criteria.require_burst_capacity == true
     and .capacity_certification == false
 ' "$config" >/dev/null \
-    || fail 'ci-smoke must retain 10-percent observations, advisory CPU/latency, and required burst capacity'
+    || fail 'ci-smoke must retain 10-percent observations, advisory CPU/latency, 95/150-percent steady/burst CPU limits, and required burst capacity'
 
 daemon=${OPENSHIELD_DAEMON:-}
 [[ "$daemon" == /* ]] || fail 'OPENSHIELD_DAEMON must be an absolute path'
@@ -1189,9 +1191,13 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
                          and . <= $report.criteria.maximum_latency_p99_ms)
                   and (if .policy == "baseline"
                        then true
-                       else (.dut_metrics.daemon.cpu_percent_one_core
+                       else (if .phase_role == "burst"
+                             then $report.criteria.maximum_burst_daemon_cpu_percent_one_core
+                             else $report.criteria.maximum_daemon_cpu_percent_one_core
+                             end) as $cpu_limit
+                            | (.dut_metrics.daemon.cpu_percent_one_core
                              | type == "number" and . >= 0
-                               and . <= $report.criteria.maximum_daemon_cpu_percent_one_core)
+                               and . <= $cpu_limit)
                             and (.dut_metrics.daemon.rss_bytes_peak
                                  | type == "number" and . >= 0
                                    and . <= $report.criteria.maximum_daemon_rss_bytes)

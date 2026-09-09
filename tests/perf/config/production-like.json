@@ -28,6 +28,7 @@
     "maximum_tcp_retransmits_per_tx_packet": 0.0,
     "maximum_latency_p99_ms": 100.0,
     "maximum_daemon_cpu_percent_one_core": 90.0,
+    "maximum_burst_daemon_cpu_percent_one_core": 90.0,
     "maximum_daemon_rss_bytes": 268435456,
     "maximum_generator_wall_cpu_ratio": 0.85,
     "maximum_peer_wall_cpu_ratio": 0.85,

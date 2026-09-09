@@ -662,6 +662,34 @@ class KernelBlockAllObservationTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_daemon_cpu_limits_are_explicit_finite_phase_budgets(self) -> None:
+        for name, steady_limit, burst_limit in (
+            ("ci-smoke.json", 95.0, 150.0),
+            ("production-like.json", 90.0, 90.0),
+        ):
+            with self.subTest(config=name):
+                document = runner.load_json_object(PERF_ROOT / "config" / name)
+                criteria = runner.validate_config(document)["criteria"]
+                self.assertEqual(
+                    criteria["maximum_daemon_cpu_percent_one_core"], steady_limit
+                )
+                self.assertEqual(
+                    criteria["maximum_burst_daemon_cpu_percent_one_core"], burst_limit
+                )
+            for value in (
+                mock.sentinel.missing, None, True, False, -1.0,
+                float("nan"), float("inf"), "150",
+            ):
+                with self.subTest(config=name, invalid_burst_limit=value):
+                    candidate = runner.load_json_object(PERF_ROOT / "config" / name)
+                    key = "maximum_burst_daemon_cpu_percent_one_core"
+                    if value is mock.sentinel.missing:
+                        candidate["criteria"].pop(key)
+                    else:
+                        candidate["criteria"][key] = value
+                    with self.assertRaises(runner.HarnessError):
+                        runner.validate_config(candidate)
+
     def test_checked_in_configs_use_v2_and_bound_measured_steady_pair_gap(self) -> None:
         expected_gaps = {"ci-smoke.json": 15.0, "production-like.json": 90.0}
         for name, expected_gap in expected_gaps.items():
@@ -1277,6 +1305,8 @@ class ConfigTests(unittest.TestCase):
             source,
         )
         self.assertIn(".criteria.require_burst_capacity == true", source)
+        self.assertIn(".criteria.maximum_daemon_cpu_percent_one_core == 95", source)
+        self.assertIn(".criteria.maximum_burst_daemon_cpu_percent_one_core == 150", source)
         self.assertIn(".criteria == .configuration.criteria", source)
         self.assertIn(
             ".configuration.criteria.require_burst_capacity == true", source
@@ -1306,6 +1336,7 @@ class ConfigTests(unittest.TestCase):
             ".criteria.maximum_latency_p99_ms",
             ".dut_metrics.daemon.cpu_percent_one_core",
             ".criteria.maximum_daemon_cpu_percent_one_core",
+            ".criteria.maximum_burst_daemon_cpu_percent_one_core",
             ".dut_metrics.daemon.rss_bytes_peak",
             ".criteria.maximum_daemon_rss_bytes",
         ):
@@ -2059,6 +2090,55 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                 ):
                     release_validator.validate_documents(config, report)
 
+    def test_independent_validator_uses_explicit_burst_cpu_budget(self) -> None:
+        for phase_role, cpu, passes in (
+            ("steady", 95.0, True),
+            ("steady", 100.0, False),
+            ("burst", 100.0, True),
+            ("burst", 150.0, True),
+            ("burst", 150.01, False),
+        ):
+            with self.subTest(phase_role=phase_role, cpu=cpu):
+                config, report = independent_validation_fixture()
+                measured = next(
+                    row for row in report["results"]
+                    if row["policy"] != "baseline" and row["phase_role"] == phase_role
+                )
+                measured["dut_metrics"]["daemon"]["cpu_percent_one_core"] = cpu
+                # Preserve a claimed passing capacity result: the release
+                # validator must independently reject out-of-budget evidence.
+                self.assertTrue(measured["capacity_pass"])
+                if passes:
+                    summary = release_validator.validate_documents(config, report)
+                    self.assertTrue(summary["valid"])
+                else:
+                    with self.assertRaisesRegex(
+                        release_validator.ValidationError,
+                        "capacity_pass ignored independently recomputed absolute gate",
+                    ):
+                        release_validator.validate_documents(config, report)
+
+    def test_independent_validator_rejects_missing_or_malformed_burst_cpu(self) -> None:
+        for phase_role in ("steady", "burst"):
+            for value in (
+                mock.sentinel.missing, None, True, -1.0,
+                float("nan"), float("inf"), "100",
+            ):
+                with self.subTest(phase_role=phase_role, cpu=value):
+                    config, report = independent_validation_fixture()
+                    measured = next(
+                        row for row in report["results"]
+                        if row["policy"] != "baseline" and row["phase_role"] == phase_role
+                    )
+                    daemon = measured["dut_metrics"]["daemon"]
+                    if value is mock.sentinel.missing:
+                        daemon.pop("cpu_percent_one_core")
+                    else:
+                        daemon["cpu_percent_one_core"] = value
+                    self.assertTrue(measured["capacity_pass"])
+                    with self.assertRaises(release_validator.ValidationError):
+                        release_validator.validate_documents(config, report)
+
     def test_burst_throughput_observation_is_independently_recomputed(self) -> None:
         config, report = independent_validation_fixture((0.0, 0.0, 20.0))
         summary = release_validator.validate_documents(
@@ -2274,6 +2354,88 @@ class EvaluationTests(unittest.TestCase):
         cls.criteria = runner.validate_config(
             runner.load_json_object(PERF_ROOT / "config" / "ci-smoke.json")
         )["criteria"]
+
+    def test_ci_daemon_cpu_budget_is_phase_specific_and_inclusive(self) -> None:
+        for phase_role in ("warmup", "ramp", "steady", "burst"):
+            for cpu in (95.0, 95.799, 100.440, 150.0, 150.01):
+                with self.subTest(phase_role=phase_role, cpu=cpu):
+                    result = synthetic_result("network_only")
+                    result["phase_role"] = phase_role
+                    # The phase role, not this display label or measured CPU,
+                    # must determine which budget applies.
+                    result["phase"] = "burst" if phase_role != "burst" else "steady_1"
+                    result["dut_metrics"]["daemon"]["cpu_percent_one_core"] = cpu
+                    runner.evaluate_result(result, self.criteria)
+                    within_budget = cpu <= (150.0 if phase_role == "burst" else 95.0)
+                    self.assertTrue(result["valid"])
+                    self.assertTrue(result["safety_pass"])
+                    self.assertEqual(result["capacity_pass"], within_budget)
+                    if phase_role in {"steady", "burst"}:
+                        self.assertEqual(result["passed"], within_budget)
+
+    def test_production_daemon_cpu_budget_remains_strict_during_burst(self) -> None:
+        criteria = runner.validate_config(
+            runner.load_json_object(PERF_ROOT / "config" / "production-like.json")
+        )["criteria"]
+        for cpu, passes in ((90.0, True), (90.01, False), (100.0, False)):
+            with self.subTest(cpu=cpu):
+                result = synthetic_result("network_only")
+                result["phase_role"] = "burst"
+                result["workload"]["config"]["target_application_ops_per_second"] = 90.0
+                result["dut_metrics"]["daemon"]["cpu_percent_one_core"] = cpu
+                runner.evaluate_result(result, criteria)
+                self.assertEqual(result["capacity_pass"], passes)
+                self.assertEqual(result["passed"], passes)
+
+    def test_missing_or_malformed_daemon_cpu_invalidates_every_phase(self) -> None:
+        for phase_role in ("warmup", "ramp", "steady", "burst"):
+            for value in (
+                mock.sentinel.missing, None, True, False, -1.0,
+                float("nan"), float("inf"), "100",
+            ):
+                with self.subTest(phase_role=phase_role, cpu=value):
+                    result = synthetic_result("network_only")
+                    result["phase_role"] = phase_role
+                    daemon = result["dut_metrics"]["daemon"]
+                    if value is mock.sentinel.missing:
+                        daemon.pop("cpu_percent_one_core")
+                    else:
+                        daemon["cpu_percent_one_core"] = value
+                    runner.evaluate_result(result, self.criteria)
+                    self.assertFalse(result["valid"])
+                    self.assertFalse(result["capacity_pass"])
+                    self.assertIn("daemon CPU", " ".join(result["unreliable_reasons"]))
+                    if phase_role in {"steady", "burst"}:
+                        self.assertFalse(result["passed"])
+
+    def test_burst_cpu_headroom_preserves_other_blocking_gates(self) -> None:
+        mutations = {
+            "NFQUEUE drop": lambda row: row["dut_metrics"]["nfqueue"].update({"kernel_dropped": 1}),
+            "NFQUEUE error": lambda row: row["status_after"]["nfqueue"].update({"terminal_queue_error": 1}),
+            "NIC drop": lambda row: row["dut_metrics"]["network"].update({"rx_dropped": 1}),
+            "fail-open": lambda row: row.update({"identity_probe": {"fail_open": True, "attempts_completed": 1}}),
+            "latency": lambda row: row["workload"]["metrics"]["latency_ms"].update({
+                "p99": self.criteria["maximum_latency_p99_ms"] + 1,
+            }),
+            "RSS": lambda row: row["dut_metrics"]["daemon"].update({
+                "rss_bytes_peak": self.criteria["maximum_daemon_rss_bytes"] + 1,
+            }),
+            "target": lambda row: row["workload"]["metrics"].update({
+                "application_ops_per_second": 1.0,
+            }),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                result = synthetic_result("network_only")
+                result["phase_role"] = "burst"
+                result["dut_metrics"]["daemon"]["cpu_percent_one_core"] = 100.440
+                mutate(result)
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["passed"])
+                if defect in {"NFQUEUE drop", "NFQUEUE error", "NIC drop", "fail-open"}:
+                    self.assertFalse(result["safety_pass"])
+                else:
+                    self.assertFalse(result["capacity_pass"])
 
     def test_kernel_and_application_path_shapes_pass(self) -> None:
         for policy, transport in (

@@ -71,7 +71,7 @@ reviewed state backup, and a distribution-tested procedure.
 
 The daemon optionally reads `/etc/openshield/learning-limits.json` at startup.
 It is an administrator-managed file, not a package payload: installation and
-upgrades must not create or overwrite it. Without it, v0.2.7 uses
+upgrades must not create or overwrite it. Without it, v0.2.8 uses
 `{"per_uid":4096,"per_application":1024}`. Root may supply both integer fields
 with `1 <= per_application <= per_uid <= 7500`. Use root-owned nonsymlink
 parent directories with no group/other write permissions and a root-owned

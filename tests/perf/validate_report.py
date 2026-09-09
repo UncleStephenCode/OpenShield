@@ -767,9 +767,14 @@ def _absolute_capacity_violations(
             f"{label} daemon RSS",
             minimum=0.0,
         )
+        cpu_criterion = (
+            "maximum_burst_daemon_cpu_percent_one_core"
+            if row.get("phase_role") == "burst"
+            else "maximum_daemon_cpu_percent_one_core"
+        )
         if daemon_cpu > _number(
-            criteria.get("maximum_daemon_cpu_percent_one_core"),
-            "maximum_daemon_cpu_percent_one_core",
+            criteria.get(cpu_criterion),
+            cpu_criterion,
             minimum=0.0,
         ):
             violations.append("absolute daemon CPU exceeds the configured maximum")

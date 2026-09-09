@@ -297,6 +297,12 @@ mislabeling environmental drift as a performance regression.
 - a single burst relative comparison remains an authenticated observation
   because it has no repeated-sample confidence claim, while burst validity,
   configured absolute capacity ceilings, and safety remain mandatory;
+- the CI absolute daemon CPU ceiling is 95% of one core outside bursts
+  (`maximum_daemon_cpu_percent_one_core`) and 150% during bursts
+  (`maximum_burst_daemon_cpu_percent_one_core`). Both are blocking capacity
+  limits, independently recomputed from primary measurements. The
+  production-like profile sets both to 90%. Throughput/PPS, latency, RSS,
+  validity, and safety limits are unchanged;
 - application errors/loss, TCP retransmits, NIC drops/errors, NFQUEUE
   drops/errors, or fail-open behavior block immediately and are never deferred
   to the repeated-sample relative decision;
