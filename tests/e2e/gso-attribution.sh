@@ -76,7 +76,9 @@ wait_path() {
 stage=extract
 mkdir "$evidence/extracted"
 rpm2cpio "$rpm_path" > "$evidence/package.cpio"
-(cd "$evidence/extracted" && cpio -idm --quiet ./usr/bin/openshield-daemon < "$evidence/package.cpio")
+(cd "$evidence/extracted" && cpio -idm --quiet --no-absolute-filenames \
+    ./usr/bin/openshield-daemon usr/bin/openshield-daemon \
+    < "$evidence/package.cpio")
 daemon="$evidence/extracted/usr/bin/openshield-daemon"
 [ -x "$daemon" ] && [ ! -L "$daemon" ] || exit 1
 sha256sum "$rpm_path" "$daemon" > "$evidence/sha256.txt"

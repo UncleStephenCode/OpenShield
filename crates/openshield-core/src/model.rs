@@ -21,6 +21,25 @@ pub enum Mode {
     Enforcing,
 }
 
+/// Userspace application-attribution strategy; kernel policy is unchanged.
+///
+/// Strict is the compatibility default for persisted state and legacy mode
+/// controls. Selecting Fast never creates a rule or relaxes a kernel verdict.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum EnforcementStrategy {
+    #[default]
+    Strict,
+    Fast,
+}
+
+impl EnforcementStrategy {
+    #[must_use]
+    pub const fn is_strict(&self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Direction {

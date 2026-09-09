@@ -61,6 +61,8 @@ render_repository() {
                     https://cdn.opensuse.org/*) origin=cdn.opensuse.org; suffix=${value#https://cdn.opensuse.org} ;;
                     http://download.opensuse.org/*) origin=download.opensuse.org; suffix=${value#http://download.opensuse.org} ;;
                     https://download.opensuse.org/*) origin=download.opensuse.org; suffix=${value#https://download.opensuse.org} ;;
+                    http://downloadcontent.opensuse.org/*) origin=downloadcontent.opensuse.org; suffix=${value#http://downloadcontent.opensuse.org} ;;
+                    https://downloadcontent.opensuse.org/*) origin=downloadcontent.opensuse.org; suffix=${value#https://downloadcontent.opensuse.org} ;;
                     *) fail 'repository URL must use the official download.opensuse.org or cdn.opensuse.org origin' ;;
                 esac
                 if [ "$setting" = baseurl ]; then
@@ -94,21 +96,25 @@ rewrite_repository() {
 
 rewrite_repository ''
 attempt=1
+maximum_attempts=5
 while :; do
     if [ "$attempt" -eq 1 ]; then
         if zypper --non-interactive refresh "$repository"; then exit 0; else status=$?; fi
     else
-        # Fetch a fresh signed metadata index after switching official origins.
+        # Before fetching from the alternate official origin, discard both
+        # parsed and raw metadata. libzypp's --force refresh alone can retain a
+        # repomd.xml whose referenced files disappeared during mirror rotation.
+        zypper --non-interactive clean --all "$repository"
         if zypper --non-interactive refresh --force "$repository"; then exit 0; else status=$?; fi
     fi
-    if [ "$status" -ne 4 ] || [ "$attempt" -ge 3 ]; then
+    if [ "$status" -ne 4 ] || [ "$attempt" -ge "$maximum_attempts" ]; then
         printf 'zypper refresh for %s failed after %s attempt(s) (status %s)\n' \
             "$repository" "$attempt" "$status" >&2
         exit "$status"
     fi
     case "$base_origin" in
-        cdn.opensuse.org) next_origin=download.opensuse.org ;;
-        download.opensuse.org) next_origin=cdn.opensuse.org ;;
+        cdn.opensuse.org|download.opensuse.org) next_origin=downloadcontent.opensuse.org ;;
+        downloadcontent.opensuse.org) next_origin=cdn.opensuse.org ;;
     esac
     delay=$((attempt * 5))
     printf 'zypper refresh for %s failed (status %s); retrying via %s in %s seconds\n' \

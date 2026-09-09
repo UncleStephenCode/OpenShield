@@ -8,7 +8,7 @@ use thiserror::Error;
 
 const MAX_LOCALE_INPUT_BYTES: usize = 64;
 const MAX_RESOURCE_BYTES: usize = 128 * 1024;
-const MAX_MESSAGES: usize = 256;
+const MAX_MESSAGES: usize = 272;
 const MAX_MESSAGE_CHARS: usize = 8_192;
 const MAX_FORMATTED_MESSAGE_BYTES: usize = 64 * 1024;
 

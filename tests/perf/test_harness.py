@@ -662,6 +662,34 @@ class KernelBlockAllObservationTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_daemon_cpu_limits_are_explicit_finite_phase_budgets(self) -> None:
+        for name, steady_limit, burst_limit in (
+            ("ci-smoke.json", 95.0, 150.0),
+            ("production-like.json", 90.0, 90.0),
+        ):
+            with self.subTest(config=name):
+                document = runner.load_json_object(PERF_ROOT / "config" / name)
+                criteria = runner.validate_config(document)["criteria"]
+                self.assertEqual(
+                    criteria["maximum_daemon_cpu_percent_one_core"], steady_limit
+                )
+                self.assertEqual(
+                    criteria["maximum_burst_daemon_cpu_percent_one_core"], burst_limit
+                )
+            for value in (
+                mock.sentinel.missing, None, True, False, -1.0,
+                float("nan"), float("inf"), "150",
+            ):
+                with self.subTest(config=name, invalid_burst_limit=value):
+                    candidate = runner.load_json_object(PERF_ROOT / "config" / name)
+                    key = "maximum_burst_daemon_cpu_percent_one_core"
+                    if value is mock.sentinel.missing:
+                        candidate["criteria"].pop(key)
+                    else:
+                        candidate["criteria"][key] = value
+                    with self.assertRaises(runner.HarnessError):
+                        runner.validate_config(candidate)
+
     def test_checked_in_configs_use_v2_and_bound_measured_steady_pair_gap(self) -> None:
         expected_gaps = {"ci-smoke.json": 15.0, "production-like.json": 90.0}
         for name, expected_gap in expected_gaps.items():
@@ -1277,6 +1305,8 @@ class ConfigTests(unittest.TestCase):
             source,
         )
         self.assertIn(".criteria.require_burst_capacity == true", source)
+        self.assertIn(".criteria.maximum_daemon_cpu_percent_one_core == 95", source)
+        self.assertIn(".criteria.maximum_burst_daemon_cpu_percent_one_core == 150", source)
         self.assertIn(".criteria == .configuration.criteria", source)
         self.assertIn(
             ".configuration.criteria.require_burst_capacity == true", source
@@ -1290,10 +1320,14 @@ class ConfigTests(unittest.TestCase):
             'confirmation_method: "one_sided_paired_student_t_mean_lower_bound"',
             source,
         )
+        self.assertIn(
+            'release_decision: "one_sided_paired_student_t_mean_lower_bound"',
+            source,
+        )
         self.assertIn('cpu_latency_release_action: "observe"', source)
-        self.assertIn('burst_relative_role: "single_sample_threshold_gate"', source)
-        self.assertIn('.method == "single_paired_burst_threshold_gate"', source)
-        self.assertIn(".mean_exceeded_threshold == false", source)
+        self.assertIn('burst_relative_role: "single_sample_observation_only"', source)
+        self.assertIn('.method == "single_paired_burst_observation"', source)
+        self.assertIn('.release_action == "observe"', source)
         self.assertIn(".confirmed_regression == false", source)
         for absolute_gate in (
             ".derived.target_attainment_ratio",
@@ -1302,6 +1336,7 @@ class ConfigTests(unittest.TestCase):
             ".criteria.maximum_latency_p99_ms",
             ".dut_metrics.daemon.cpu_percent_one_core",
             ".criteria.maximum_daemon_cpu_percent_one_core",
+            ".criteria.maximum_burst_daemon_cpu_percent_one_core",
             ".dut_metrics.daemon.rss_bytes_peak",
             ".criteria.maximum_daemon_rss_bytes",
         ):
@@ -2055,29 +2090,78 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                 ):
                     release_validator.validate_documents(config, report)
 
-    def test_burst_throughput_gate_is_independently_recomputed(self) -> None:
+    def test_independent_validator_uses_explicit_burst_cpu_budget(self) -> None:
+        for phase_role, cpu, passes in (
+            ("steady", 95.0, True),
+            ("steady", 100.0, False),
+            ("burst", 100.0, True),
+            ("burst", 150.0, True),
+            ("burst", 150.01, False),
+        ):
+            with self.subTest(phase_role=phase_role, cpu=cpu):
+                config, report = independent_validation_fixture()
+                measured = next(
+                    row for row in report["results"]
+                    if row["policy"] != "baseline" and row["phase_role"] == phase_role
+                )
+                measured["dut_metrics"]["daemon"]["cpu_percent_one_core"] = cpu
+                # Preserve a claimed passing capacity result: the release
+                # validator must independently reject out-of-budget evidence.
+                self.assertTrue(measured["capacity_pass"])
+                if passes:
+                    summary = release_validator.validate_documents(config, report)
+                    self.assertTrue(summary["valid"])
+                else:
+                    with self.assertRaisesRegex(
+                        release_validator.ValidationError,
+                        "capacity_pass ignored independently recomputed absolute gate",
+                    ):
+                        release_validator.validate_documents(config, report)
+
+    def test_independent_validator_rejects_missing_or_malformed_burst_cpu(self) -> None:
+        for phase_role in ("steady", "burst"):
+            for value in (
+                mock.sentinel.missing, None, True, -1.0,
+                float("nan"), float("inf"), "100",
+            ):
+                with self.subTest(phase_role=phase_role, cpu=value):
+                    config, report = independent_validation_fixture()
+                    measured = next(
+                        row for row in report["results"]
+                        if row["policy"] != "baseline" and row["phase_role"] == phase_role
+                    )
+                    daemon = measured["dut_metrics"]["daemon"]
+                    if value is mock.sentinel.missing:
+                        daemon.pop("cpu_percent_one_core")
+                    else:
+                        daemon["cpu_percent_one_core"] = value
+                    self.assertTrue(measured["capacity_pass"])
+                    with self.assertRaises(release_validator.ValidationError):
+                        release_validator.validate_documents(config, report)
+
+    def test_burst_throughput_observation_is_independently_recomputed(self) -> None:
         config, report = independent_validation_fixture((0.0, 0.0, 20.0))
         summary = release_validator.validate_documents(
             config, report, require_passing=False
         )
         self.assertEqual(summary["regressed_group_count"], 0)
-        self.assertEqual(summary["regressed_burst_count"], 2)
+        self.assertEqual(summary["regressed_burst_count"], 0)
         candidate = json.loads(json.dumps(report, allow_nan=False))
         burst = next(
             row
             for row in candidate["results"]
             if row["policy"] != "baseline" and row["phase_role"] == "burst"
         )
-        burst.update(
-            {
-                "relative_performance_failure_reasons": [],
-                "relative_performance_pass": True,
-                "passed": True,
-            }
+        next(
+            item
+            for item in burst["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        ).update(
+            {"method": "single_paired_burst_threshold_gate"}
         )
         with self.assertRaisesRegex(
             release_validator.ValidationError,
-            "burst relative failure reasons",
+            "burst relative-performance evidence",
         ):
             release_validator.validate_documents(
                 config, candidate, require_passing=False
@@ -2182,13 +2266,13 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                     hardlink, maximum_bytes=1024, context="fixture"
                 )
 
-    def test_regressed_mean_and_failure_linkage_are_recomputed(self) -> None:
+    def test_high_variance_mean_is_observed_without_release_failure(self) -> None:
         config, report = independent_validation_fixture((0.0, 0.0, 31.0))
         summary = release_validator.validate_documents(
             config, report, require_passing=False
         )
-        self.assertEqual(summary["regressed_group_count"], 2)
-        self.assertEqual(summary["regressed_burst_count"], 2)
+        self.assertEqual(summary["regressed_group_count"], 0)
+        self.assertEqual(summary["regressed_burst_count"], 0)
         protected = [
             row for row in report["results"] if row["policy"] != "baseline"
         ]
@@ -2224,9 +2308,9 @@ class IndependentReleaseValidationTests(unittest.TestCase):
             ).update({"release_action": "observe"}),
             "failure linkage": lambda row: row.update(
                 {
-                    "relative_performance_failure_reasons": [],
-                    "relative_performance_pass": True,
-                    "passed": True,
+                    "relative_performance_failure_reasons": ["invented failure"],
+                    "relative_performance_pass": False,
+                    "passed": False,
                 }
             ),
         }
@@ -2244,6 +2328,25 @@ class IndependentReleaseValidationTests(unittest.TestCase):
                         config, candidate, require_passing=False
                     )
 
+    def test_confirmed_regression_and_failure_linkage_are_recomputed(self) -> None:
+        config, report = independent_validation_fixture((20.0, 20.0, 20.0))
+        summary = release_validator.validate_documents(
+            config, report, require_passing=False
+        )
+        self.assertEqual(summary["regressed_group_count"], 2)
+        self.assertEqual(summary["regressed_burst_count"], 0)
+        protected = next(
+            row for row in report["results"] if row["policy"] != "baseline"
+        )
+        evidence = next(
+            item
+            for item in protected["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        )
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertTrue(evidence["confirmed_regression"])
+        self.assertFalse(protected["relative_performance_pass"])
+
 
 class EvaluationTests(unittest.TestCase):
     @classmethod
@@ -2251,6 +2354,88 @@ class EvaluationTests(unittest.TestCase):
         cls.criteria = runner.validate_config(
             runner.load_json_object(PERF_ROOT / "config" / "ci-smoke.json")
         )["criteria"]
+
+    def test_ci_daemon_cpu_budget_is_phase_specific_and_inclusive(self) -> None:
+        for phase_role in ("warmup", "ramp", "steady", "burst"):
+            for cpu in (95.0, 95.799, 100.440, 150.0, 150.01):
+                with self.subTest(phase_role=phase_role, cpu=cpu):
+                    result = synthetic_result("network_only")
+                    result["phase_role"] = phase_role
+                    # The phase role, not this display label or measured CPU,
+                    # must determine which budget applies.
+                    result["phase"] = "burst" if phase_role != "burst" else "steady_1"
+                    result["dut_metrics"]["daemon"]["cpu_percent_one_core"] = cpu
+                    runner.evaluate_result(result, self.criteria)
+                    within_budget = cpu <= (150.0 if phase_role == "burst" else 95.0)
+                    self.assertTrue(result["valid"])
+                    self.assertTrue(result["safety_pass"])
+                    self.assertEqual(result["capacity_pass"], within_budget)
+                    if phase_role in {"steady", "burst"}:
+                        self.assertEqual(result["passed"], within_budget)
+
+    def test_production_daemon_cpu_budget_remains_strict_during_burst(self) -> None:
+        criteria = runner.validate_config(
+            runner.load_json_object(PERF_ROOT / "config" / "production-like.json")
+        )["criteria"]
+        for cpu, passes in ((90.0, True), (90.01, False), (100.0, False)):
+            with self.subTest(cpu=cpu):
+                result = synthetic_result("network_only")
+                result["phase_role"] = "burst"
+                result["workload"]["config"]["target_application_ops_per_second"] = 90.0
+                result["dut_metrics"]["daemon"]["cpu_percent_one_core"] = cpu
+                runner.evaluate_result(result, criteria)
+                self.assertEqual(result["capacity_pass"], passes)
+                self.assertEqual(result["passed"], passes)
+
+    def test_missing_or_malformed_daemon_cpu_invalidates_every_phase(self) -> None:
+        for phase_role in ("warmup", "ramp", "steady", "burst"):
+            for value in (
+                mock.sentinel.missing, None, True, False, -1.0,
+                float("nan"), float("inf"), "100",
+            ):
+                with self.subTest(phase_role=phase_role, cpu=value):
+                    result = synthetic_result("network_only")
+                    result["phase_role"] = phase_role
+                    daemon = result["dut_metrics"]["daemon"]
+                    if value is mock.sentinel.missing:
+                        daemon.pop("cpu_percent_one_core")
+                    else:
+                        daemon["cpu_percent_one_core"] = value
+                    runner.evaluate_result(result, self.criteria)
+                    self.assertFalse(result["valid"])
+                    self.assertFalse(result["capacity_pass"])
+                    self.assertIn("daemon CPU", " ".join(result["unreliable_reasons"]))
+                    if phase_role in {"steady", "burst"}:
+                        self.assertFalse(result["passed"])
+
+    def test_burst_cpu_headroom_preserves_other_blocking_gates(self) -> None:
+        mutations = {
+            "NFQUEUE drop": lambda row: row["dut_metrics"]["nfqueue"].update({"kernel_dropped": 1}),
+            "NFQUEUE error": lambda row: row["status_after"]["nfqueue"].update({"terminal_queue_error": 1}),
+            "NIC drop": lambda row: row["dut_metrics"]["network"].update({"rx_dropped": 1}),
+            "fail-open": lambda row: row.update({"identity_probe": {"fail_open": True, "attempts_completed": 1}}),
+            "latency": lambda row: row["workload"]["metrics"]["latency_ms"].update({
+                "p99": self.criteria["maximum_latency_p99_ms"] + 1,
+            }),
+            "RSS": lambda row: row["dut_metrics"]["daemon"].update({
+                "rss_bytes_peak": self.criteria["maximum_daemon_rss_bytes"] + 1,
+            }),
+            "target": lambda row: row["workload"]["metrics"].update({
+                "application_ops_per_second": 1.0,
+            }),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                result = synthetic_result("network_only")
+                result["phase_role"] = "burst"
+                result["dut_metrics"]["daemon"]["cpu_percent_one_core"] = 100.440
+                mutate(result)
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["passed"])
+                if defect in {"NFQUEUE drop", "NFQUEUE error", "NIC drop", "fail-open"}:
+                    self.assertFalse(result["safety_pass"])
+                else:
+                    self.assertFalse(result["capacity_pass"])
 
     def test_kernel_and_application_path_shapes_pass(self) -> None:
         for policy, transport in (
@@ -3223,6 +3408,32 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(evidence["release_action"], "observe")
         self.assertTrue(all(row["relative_performance_pass"] for row in measured_rows))
 
+    def test_high_variance_throughput_mean_requires_confidence(self) -> None:
+        results = []
+        measured_rows = []
+        for repetition, reduction in enumerate((0.0, 0.0, 31.0), start=1):
+            baseline = synthetic_result("baseline")
+            measured = synthetic_result("network_only")
+            identify_independent_pair(baseline, measured, repetition)
+            measured["workload"]["metrics"]["application_mbps"] = 12.0 * (
+                1.0 - reduction / 100.0
+            )
+            runner.evaluate_result(baseline, self.criteria)
+            runner.evaluate_result(measured, self.criteria)
+            results.extend((baseline, measured))
+            measured_rows.append(measured)
+        runner.add_baseline_comparisons(results, self.criteria)
+        evidence = next(
+            item
+            for item in measured_rows[0]["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        )
+        self.assertGreater(evidence["mean_percent"], 10.0)
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertFalse(evidence["confirmed_regression"])
+        self.assertEqual(evidence["release_action"], "fail")
+        self.assertTrue(all(row["relative_performance_pass"] for row in measured_rows))
+
     def test_production_cpu_mean_still_blocks_when_not_advisory(self) -> None:
         criteria = dict(self.criteria)
         criteria["cpu_latency_relative_regressions_are_advisory"] = False
@@ -3382,7 +3593,7 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertFalse(measured["valid"])
 
-    def test_single_burst_throughput_crossing_is_a_direct_gate(self) -> None:
+    def test_single_burst_throughput_crossing_is_observational(self) -> None:
         criteria = dict(self.criteria)
         criteria["require_burst_capacity"] = True
         baseline_steady = synthetic_result("baseline")
@@ -3398,14 +3609,14 @@ class EvaluationTests(unittest.TestCase):
         runner.add_baseline_comparisons(
             [baseline_steady, baseline, measured_steady, measured], criteria
         )
-        self.assertFalse(measured["relative_performance_pass"])
+        self.assertTrue(measured["relative_performance_pass"])
         self.assertTrue(measured["capacity_pass"])
         self.assertTrue(measured["safety_pass"])
-        self.assertFalse(measured["passed"])
+        self.assertTrue(measured["passed"])
         self.assertTrue(measured["relative_performance_observation_reasons"])
         self.assertTrue(
             all(
-                item["method"] == "single_paired_burst_threshold_gate"
+                item["method"] == "single_paired_burst_observation"
                 and item["confirmed_regression"] is False
                 for item in measured["relative_performance_evidence"]
             )
@@ -3415,7 +3626,7 @@ class EvaluationTests(unittest.TestCase):
             for item in measured["relative_performance_evidence"]
             if item["metric"] == "throughput_reduction_percent"
         )
-        self.assertEqual(throughput["release_action"], "fail")
+        self.assertEqual(throughput["release_action"], "observe")
         self.assertTrue(throughput["mean_exceeded_threshold"])
 
     def test_single_burst_cpu_crossing_remains_advisory_in_ci_smoke(self) -> None:

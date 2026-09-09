@@ -2,7 +2,7 @@
 
 # OpenShield architecture
 
-This document describes the OpenShield v0.2.4 policy model.
+This document describes the OpenShield v0.2.8 policy model.
 
 OpenShield is a Linux host firewall composed of two Rust binaries:
 
@@ -51,6 +51,13 @@ serialization. Group membership grants no control-plane authority.
 Authorization applies when the Unix connection is accepted; Unix fd passing can
 delegate an already-connected observation stream, so group access is not a
 non-delegable confidentiality boundary.
+
+`StatusV3` extends the status snapshot with bounded scalar learning-quota
+diagnostics: configured admission limits, current-rule saturation status, and a
+process-lifetime cumulative counter of quota-skipped observations, not unique
+missing rules. It exposes no per-UID or per-executable selector list. The TUI
+shows incomplete-learning warnings, including on a root request for Enforcing;
+diagnostics do not authorize traffic or veto a privileged mode change.
 
 Before loading state or invoking a firewall backend, every privileged daemon action takes
 a nonblocking exclusive `flock` on the verified root-owned regular `0600`
@@ -121,6 +128,65 @@ selected UUID. On Outbound, `g` opens the actions for the selected group row
 The daemon still independently enforces root-only control;
 authorized non-root `openshield` observers can navigate only the redacted,
 read-only projection.
+
+## Enforcement strategy and compatibility
+
+Enforcing has two explicit userspace strategies. Strict is the default and the
+exhaustive-owner discovery described below. Root selects them through
+`m` → `3. Enforcing` → `3.1 Fast` / `3.2 Strict`; Fast requires a
+confirmation of its weaker guarantee. There is no `S` shortcut. Learning and
+BlockAll use the unchanged strict path regardless of the remembered choice.
+
+Fast retains only positive UID/TGID/TID/start-time owner hints: one process-wide
+cache of at most 256 TGIDs, with a three-minute inactivity lifetime. The
+exhaustive, race-checked path creates a hint; a Fast hit renews only its owner
+after fresh checks around the current capture.
+Successful Learning attribution warms the cache; the following direct
+Learning-to-Fast generation transition preserves it. Fast's exhaustive fallback
+can also seed it, while Strict Enforcing and unrelated generation changes clear
+it. Every queued attribution request has fresh socket resolution (`SOCK_DIAG`
+for TCP/UDP, the existing procfs lookup for ICMP/ICMPv6), and
+fresh fd ownership, UID, PID/start-time, executable path/file-version and
+policy-required argv/cgroup checks. Identity metadata is captured twice with
+the existing race checks; both owner passes cover only hinted TGIDs. Dead,
+replaced, expired, or unusable candidates are omitted; ordinary misses preserve
+unrelated live hints before using the Strict path. A fallback which actually
+detects ambiguity clears the reduced scope. Independently successful exhaustive results may reseed their
+owners, except when another failed target observed the same TGID and makes that
+owner unsafe.
+No packet verdict or authorization result is cached. Current rule matching,
+action precedence, revocation, deadlines, and flow generation remain mandatory.
+Backend compilation, NFQUEUE flags, and established-TCP conntrack fast paths do
+not change; this is not a new L1/L2/L3 level, kernel extension, or queue bypass.
+
+Only in Fast, an automatic learned `Accept` may match a later process instance
+by the same canonical executable path, complete file identity, and UID without
+requiring its captured argv/cgroup to be identical. Endpoint selectors remain
+exact. Strict, manual rules, and every `Drop`/`Reject` retain full selector
+matching. This avoids treating volatile browser child arguments as a different
+application while preserving file-version pinning and administrator intent.
+
+The narrower search is a real assurance reduction: a newly shared socket owner
+outside the hinted TGIDs can be missed, including after `fork` or
+`SCM_RIGHTS` transfer to another same-UID process. A successful local recheck
+need not reveal global ambiguity that Strict would reject. The three-minute inactivity TTL
+bounds hint retention, not an owner-discovery deadline: a Strict lookup of a
+different socket can seed the same process again. Fast is opt-in, not security-equivalent to Strict or a faithful copy of
+OpenSnitch's procmon caches. No measured performance gain is asserted here.
+
+`ControlRequest::SetEnforcement` carries an explicit strategy and expected
+revision. It atomically selects Enforcing, advances revision and flow generation,
+and retains the existing `ModeChanged` event shape. Legacy
+`SetMode(Enforcing)` always selects Strict; other modes remember the strategy
+without applying Fast. `StatusV4` adds `enforcement_strategy` to V3; older
+status responses and `Snapshot` remain unchanged. Reconstructing mutable
+state from a legacy snapshot therefore defaults to Strict.
+
+Persisted `State` omits `enforcement_strategy` for Strict, defaults a missing
+field to Strict, and writes `"fast"` for Fast. Unknown values are rejected.
+Older daemons reject the new field; root must select and persist Strict with
+the current daemon before attempting a downgrade. This prerequisite does not
+replace the protected-console, state-backup, and compatibility precautions below.
 
 ## Application attribution
 
@@ -316,10 +382,12 @@ must be reviewed before switching to Enforcing. The
 separately checks request/response learning, denied unknown executables, and the
 unavoidable one-way UDP observation limit.
 
+The exhaustive scan implementation below describes Strict; the reduced Fast
+owner-search scope and its limits are specified above.
 Within a batch, metadata capture is grouped by exact TGID, TID, procfs task path,
 socket UID, and capture requirements. Each socket descriptor is checked before
 and after the shared metadata read; every owning TID must agree. A failed
-descriptor does not invalidate an independently verified neighbour. Both complete
+descriptor does not invalidate an independently verified neighbour. In Strict, both complete
 owner snapshots remain mandatory. Per-socket results are keyed by inode, socket
 UID, and capture requirements and are discarded at the end of the batch. Duplicate requests
 for one socket must reach consensus on mandatory identity: PID, process start
@@ -327,8 +395,8 @@ time, executable path, complete file version, and filesystem UID. The optional
 argv and cgroup fields are still captured whenever the matching policy requires
 them. The typed procfs timeout marker survives batched error propagation and is
 recorded by the NFQUEUE runtime counters. A later batch starts again with
-per-packet `SOCK_DIAG`; there is no cross-batch process-identity or authorization
-cache, so otherwise-unmatched UDP and ICMP packets continue to require fresh
+per-packet `SOCK_DIAG`; Strict has no cross-batch process-identity or authorization
+cache. Fast retains only the bounded owner hints described above. Otherwise-unmatched UDP and ICMP packets continue to require fresh
 attribution.
 
 `application_timing.rs` records fixed-size, best-effort wall-time aggregates for
@@ -709,9 +777,11 @@ counting both endpoint rules and group templates. A new attributable endpoint is
 stored as an enabled `Accept` rule. If its exact `(optional cgroup path, executable path)`
 group has no template, the same transaction first creates the disabled,
 network-unconstrained `Accept` template described above. Automatic
-insertion also stops at 512 learned rules per filesystem UID and 256 per pair of
-filesystem UID and full executable file-version identity. These are admission
-budgets, not absolute state invariants. They use the numeric filesystem UID;
+insertion also stops at the configured learned endpoint-rule quotas, defaulting
+to 4,096 per filesystem UID and 1,024 per pair of filesystem UID and full
+executable file-version identity. Disabled learned rules remain counted, and
+rules for older executable versions remain charged to their UID. These are
+admission budgets, not absolute state invariants. They use the numeric filesystem UID;
 distinct subordinate UIDs count independently and can distribute learning until
 the global budget is reached. The engine keeps a second immutable
 `ApplicationLearningAdmissionIndex` and rebuilds it together with the packet
@@ -737,6 +807,20 @@ candidate rather than widening an existing learned selector; a cgroup/path
 change also selects a different template group. Operators must therefore conduct
 Learning in a controlled window and review exact endpoint rules and broad,
 disabled templates before Enforcing.
+
+The optional fixed-path root configuration
+`/etc/openshield/learning-limits.json` has the shape
+`{"per_uid":4096,"per_application":1024}`. Missing configuration uses these
+defaults. Values must satisfy `1 <= per_application <= per_uid <= 7500`;
+the independent 7,500 automatic-rule, 10,000 total-rule, and 8 MiB limits do not
+change. The file and parent directories must be root-owned, safely permissioned,
+and nonsymlinks. Configuration is read at daemon startup only, after bootstrap
+`BlockAll`; invalid content or unsafe metadata fails startup rather than
+falling back silently. Packages do not install or overwrite this optional file.
+Upgrading preserves the rule set, but endpoints previously missed at a quota
+must be observed again in Learning. Quota diagnostics do not establish complete
+learning and increasing the limits does not remove process-attribution CPU or
+latency costs.
 
 Application Learning uses a serialized two-phase persistence transaction.
 Under the `Engine` mutex the worker validates the base state, builds the
@@ -815,15 +899,20 @@ evidence. A production maximum requires three successful steady repetitions.
 
 Relative performance uses those independent adjacent pristine AB/BA pairs.
 Every window delta and threshold crossing is preserved as evidence. The
-v0.2.4 CI thresholds remain 10% for throughput, PPS, CPU, and latency. The
-arithmetic mean of three independent paired steady deltas blocks release for
-throughput and PPS when it exceeds the threshold. The release-smoke setting
+v0.2.8 CI relative thresholds remain 10% for throughput, PPS, CPU, and latency. The
+one-sided 95% Student-t lower confidence bound over three independent paired
+steady deltas blocks release for throughput and PPS when it exceeds the
+threshold. A mean-only crossing remains visible without turning shared-runner
+variance into a release failure. The release-smoke setting
 `cpu_latency_relative_regressions_are_advisory: true` records CPU and latency
 crossings as warnings; the production-like profile retains blocking checks for
-all four dimensions. A one-sided 95% Student-t lower confidence bound records
-stronger confirmation but cannot override a blocking mean threshold. A single burst has no
+all four dimensions. A single burst has no
 repeated-sample confidence claim, so its relative crossing is diagnostic only;
-its validity, configured capacity bounds, and safety remain mandatory. Safety
+its validity, configured capacity bounds, and safety remain mandatory. The
+absolute daemon CPU bounds are phase-specific: CI permits 95% of one core
+outside bursts and 150% during bursts; the production-like profile uses 90%
+for both. The runner and independent report validator enforce these configured
+bounds. RSS, latency, throughput/PPS, and safety checks are unchanged. Safety
 signals such as loss, retransmits, NIC or NFQUEUE
 drops/errors, and fail-open behavior fail immediately and are not subject to
 the statistical relative decision. Host `/proc/softirqs` counters are not
@@ -900,7 +989,7 @@ authorized non-root observer, all application metadata and identifying rule
 names are redacted by the daemon. UID 0 can read the full rule, including
 bounded command-line selectors. Runtime attribution reads bounded procfs
 identity metadata and a bounded queued-packet prefix, but never the process
-environment; version 0.2.4 does not provide a per-packet capture feed.
+environment; version 0.2.8 does not provide a per-packet capture feed.
 
 ## Failure policy
 

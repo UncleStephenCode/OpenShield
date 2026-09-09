@@ -1,14 +1,14 @@
 use ipnet::IpNet;
 use openshield_core::{
     ApplicationPath, ApplicationSelector, CgroupPath, CommandArgument, CommandLineMatch,
-    CommandLineSelector, Direction, Event, EventKind, ExecutableFileId, FirewallCounters,
-    InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_ARGUMENTS,
-    MAX_COMMAND_LINE_BYTES, Mode, PortRange, Rule, RuleAction, RuleName, RuleOrigin, RuleSpec,
-    Snapshot, TransportProtocol,
+    CommandLineSelector, Direction, EnforcementStrategy, Event, EventKind, ExecutableFileId,
+    FirewallCounters, InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES,
+    MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Mode, PortRange, Rule, RuleAction, RuleName,
+    RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
 };
 use openshield_protocol::{
-    ControlRequest, FirewallBackendKind, OutboundGroupAction, OutboundGroupSelector,
-    RuntimeCompatibility,
+    ControlRequest, FirewallBackendKind, LearningStatus, OutboundGroupAction,
+    OutboundGroupSelector, RuntimeCompatibility,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -842,6 +842,10 @@ pub enum Overlay {
     ModePicker {
         selected: Mode,
     },
+    EnforcementPicker {
+        selected: EnforcementStrategy,
+    },
+    ConfirmFast,
     ConfirmBlockAll,
     Editor(Box<RuleForm>),
     ConfirmDelete {
@@ -872,6 +876,8 @@ pub struct App {
     rule_ids: HashSet<Uuid>,
     pub backend: Option<FirewallBackendKind>,
     pub runtime_compatibility: RuntimeCompatibility,
+    pub learning_status: Option<LearningStatus>,
+    pub enforcement_strategy: Option<EnforcementStrategy>,
     pub counters: Option<FirewallCounters>,
     pub events: VecDeque<Event>,
     selected_outbound_group: usize,
@@ -904,6 +910,8 @@ impl App {
             rule_ids: HashSet::new(),
             backend: None,
             runtime_compatibility: RuntimeCompatibility::default(),
+            learning_status: None,
+            enforcement_strategy: None,
             counters: None,
             events: VecDeque::with_capacity(MAX_VISIBLE_EVENTS),
             selected_outbound_group: 0,
@@ -952,6 +960,8 @@ impl App {
         self.snapshot = Some(snapshot);
         self.backend = Some(backend);
         self.runtime_compatibility = runtime_compatibility;
+        self.learning_status = None;
+        self.enforcement_strategy = None;
         self.clamp_rule_selection();
     }
 
@@ -974,6 +984,8 @@ impl App {
         self.snapshot = Some(snapshot);
         self.backend = Some(backend);
         self.runtime_compatibility = runtime_compatibility;
+        self.learning_status = None;
+        self.enforcement_strategy = None;
         self.counters = None;
         self.last_counters_at = None;
         self.events.clear();
@@ -990,6 +1002,8 @@ impl App {
         self.rule_ids.clear();
         self.backend = None;
         self.runtime_compatibility = RuntimeCompatibility::default();
+        self.learning_status = None;
+        self.enforcement_strategy = None;
         self.counters = None;
         self.last_counters_at = None;
         self.reset_rule_selections();
@@ -998,6 +1012,39 @@ impl App {
             self.overlay = Overlay::None;
             self.notice = Some(self.i18n.tr("notice.connection_lost").to_owned());
         }
+    }
+
+    pub fn set_learning_status(&mut self, revision: u64, learning: Option<LearningStatus>) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.revision == revision)
+        {
+            self.learning_status = learning;
+        }
+    }
+
+    pub fn set_enforcement_strategy(
+        &mut self,
+        revision: u64,
+        strategy: Option<EnforcementStrategy>,
+    ) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.revision == revision)
+        {
+            self.enforcement_strategy = strategy;
+        }
+    }
+
+    pub fn learning_needs_attention(&self) -> bool {
+        self.learning_status.is_some_and(|learning| {
+            let total = self.snapshot.as_ref().map_or(0, |snapshot| {
+                u32::try_from(snapshot.rules.len()).unwrap_or(u32::MAX)
+            });
+            learning.needs_attention(total)
+        })
     }
 
     #[cfg(test)]
@@ -1079,6 +1126,8 @@ impl App {
                 // invalidates it; delayed or duplicate events must not erase
                 // a newer StatusV2 attestation.
                 self.runtime_compatibility = RuntimeCompatibility::default();
+                self.learning_status = None;
+                self.enforcement_strategy = None;
                 match &event.kind {
                     EventKind::ModeChanged { current, .. } => snapshot.mode = *current,
                     EventKind::RuleCreated { rule } => {
@@ -1193,6 +1242,13 @@ impl App {
         if mode == Mode::BlockAll {
             self.overlay = Overlay::ConfirmBlockAll;
             None
+        } else if mode == Mode::Enforcing {
+            self.overlay = Overlay::EnforcementPicker {
+                selected: self
+                    .enforcement_strategy
+                    .unwrap_or(EnforcementStrategy::Strict),
+            };
+            None
         } else {
             self.overlay = Overlay::None;
             self.pending_revision = None;
@@ -1201,6 +1257,83 @@ impl App {
                 mode,
             })
         }
+    }
+
+    pub fn back_to_mode_picker(&mut self) {
+        if matches!(
+            self.overlay,
+            Overlay::EnforcementPicker { .. } | Overlay::ConfirmFast
+        ) {
+            self.overlay = Overlay::ModePicker {
+                selected: Mode::Enforcing,
+            };
+        }
+    }
+
+    pub fn request_enforcement(&mut self, strategy: EnforcementStrategy) -> Option<ControlRequest> {
+        if !matches!(self.overlay, Overlay::EnforcementPicker { .. }) {
+            return None;
+        }
+        if !self.require_write_access() {
+            self.close_overlay();
+            return None;
+        }
+        if strategy == EnforcementStrategy::Fast {
+            if self.enforcement_strategy.is_none() {
+                self.notice = Some(self.i18n.tr("enforcement.unavailable").to_owned());
+                return None;
+            }
+            self.overlay = Overlay::ConfirmFast;
+            None
+        } else {
+            self.enforcement_request(strategy)
+        }
+    }
+
+    pub fn confirm_fast(&mut self, confirmed: bool) -> Option<ControlRequest> {
+        if !matches!(self.overlay, Overlay::ConfirmFast) {
+            return None;
+        }
+        if !self.require_write_access() {
+            self.close_overlay();
+            return None;
+        }
+        if !confirmed {
+            self.overlay = Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict,
+            };
+            return None;
+        }
+        if self.enforcement_strategy.is_none() {
+            self.notice = Some(self.i18n.tr("enforcement.unavailable").to_owned());
+            self.overlay = Overlay::EnforcementPicker {
+                selected: EnforcementStrategy::Strict,
+            };
+            return None;
+        }
+        self.enforcement_request(EnforcementStrategy::Fast)
+    }
+
+    fn enforcement_request(&mut self, strategy: EnforcementStrategy) -> Option<ControlRequest> {
+        let Some(expected_revision) = self.pending_revision.take() else {
+            self.notice = Some(self.i18n.tr("notice.base_revision_missing").to_owned());
+            self.close_overlay();
+            return None;
+        };
+        self.overlay = Overlay::None;
+        Some(if self.enforcement_strategy.is_some() {
+            ControlRequest::SetEnforcement {
+                expected_revision,
+                strategy,
+            }
+        } else {
+            // Legacy daemons have only the strict implementation. Never
+            // describe a legacy SetMode acknowledgement as successful Fast.
+            ControlRequest::SetMode {
+                expected_revision,
+                mode: Mode::Enforcing,
+            }
+        })
     }
 
     pub fn confirm_block_all(&mut self, confirmed: bool) -> Option<ControlRequest> {
@@ -1765,6 +1898,131 @@ mod tests {
     use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 
     use super::*;
+
+    #[test]
+    fn learning_status_is_revision_bound_and_cleared_on_disconnect_or_restart() {
+        let mut app = App::new(false, I18n::test_english());
+        let snapshot = Snapshot {
+            revision: 7,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        };
+        app.set_snapshot(snapshot.clone());
+        let learning = LearningStatus {
+            per_uid_limit: 2_048,
+            per_application_limit: 1_024,
+            automatic_rule_limit: 4_000,
+            total_rule_limit: 4_096,
+            automatic_rules: 0,
+            saturated_uids: 0,
+            saturated_applications: 0,
+            quota_skipped_observations: 3,
+        };
+        app.set_learning_status(6, Some(learning));
+        assert_eq!(app.learning_status, None);
+        app.set_learning_status(7, Some(learning));
+        assert!(app.learning_needs_attention());
+        app.set_learning_status(7, None);
+        assert_eq!(
+            app.learning_status, None,
+            "legacy status must be unknown, not zero"
+        );
+        app.set_learning_status(7, Some(learning));
+        app.set_restarted_snapshot(snapshot.clone());
+        assert_eq!(app.learning_status, None);
+        app.set_learning_status(7, Some(learning));
+        app.set_disconnected("test disconnect".to_owned());
+        assert_eq!(app.learning_status, None);
+        app.set_learning_status(7, Some(learning));
+        assert_eq!(app.learning_status, None);
+    }
+
+    #[test]
+    fn enforcement_intent_keeps_original_revision_and_rechecks_capability_and_access() {
+        let mut app = App::new(false, I18n::test_english());
+        let snapshot = Snapshot {
+            revision: 7,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        };
+        app.set_snapshot(snapshot.clone());
+        app.set_enforcement_strategy(6, Some(EnforcementStrategy::Fast));
+        assert_eq!(app.enforcement_strategy, None);
+        app.set_enforcement_strategy(7, Some(EnforcementStrategy::Strict));
+        app.open_mode_picker();
+        assert!(app.request_mode(Mode::Enforcing).is_none());
+        assert!(app.request_enforcement(EnforcementStrategy::Fast).is_none());
+        assert_eq!(app.overlay, Overlay::ConfirmFast);
+        app.set_snapshot(Snapshot {
+            revision: 8,
+            ..snapshot.clone()
+        });
+        assert_eq!(app.enforcement_strategy, None);
+        app.set_enforcement_strategy(8, Some(EnforcementStrategy::Strict));
+        assert_eq!(
+            app.confirm_fast(true),
+            Some(ControlRequest::SetEnforcement {
+                expected_revision: 7,
+                strategy: EnforcementStrategy::Fast,
+            }),
+            "confirmation must not silently use a newer revision"
+        );
+
+        app.open_mode_picker();
+        app.request_mode(Mode::Enforcing);
+        app.request_enforcement(EnforcementStrategy::Fast);
+        app.set_enforcement_strategy(8, None);
+        assert!(
+            app.confirm_fast(true).is_none(),
+            "lost V4 capability must not become legacy Fast"
+        );
+        app.set_enforcement_strategy(8, Some(EnforcementStrategy::Strict));
+        app.request_enforcement(EnforcementStrategy::Fast);
+        app.read_only = true;
+        assert!(app.confirm_fast(true).is_none());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.pending_revision, None);
+
+        app.read_only = false;
+        app.open_mode_picker();
+        app.request_mode(Mode::Enforcing);
+        app.request_enforcement(EnforcementStrategy::Fast);
+        app.set_disconnected("test".to_owned());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.enforcement_strategy, None);
+        assert!(app.confirm_fast(true).is_none());
+        app.set_restarted_snapshot(snapshot);
+        assert_eq!(app.enforcement_strategy, None);
+    }
+
+    #[test]
+    fn enforcement_picker_defaults_to_strict_or_observed_strategy() {
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(Snapshot {
+            revision: 7,
+            flow_generation: 1,
+            mode: Mode::Enforcing,
+            rules: Vec::new(),
+        });
+        for observed in [
+            None,
+            Some(EnforcementStrategy::Strict),
+            Some(EnforcementStrategy::Fast),
+        ] {
+            app.set_enforcement_strategy(7, observed);
+            app.open_mode_picker();
+            app.request_mode(Mode::Enforcing);
+            assert_eq!(
+                app.overlay,
+                Overlay::EnforcementPicker {
+                    selected: observed.unwrap_or(EnforcementStrategy::Strict)
+                }
+            );
+            app.close_overlay();
+        }
+    }
 
     #[test]
     fn argument_editor_round_trip_preserves_controls_and_literal_escapes()

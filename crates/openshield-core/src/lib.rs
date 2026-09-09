@@ -8,6 +8,7 @@
 
 mod application;
 mod iptables;
+mod learning_limits;
 mod model;
 mod nftables;
 mod state;
@@ -25,8 +26,9 @@ pub use iptables::{
     IPTABLES_OUTPUT_CHAIN, IPTABLES_OWNERSHIP_COMMENT, IptablesCompiler, IptablesPolicy,
     owned_chains, owned_mangle_chains,
 };
+pub use learning_limits::{LearningLimits, LearningLimitsError, LearningQuotaSummary};
 pub use model::{
-    CounterValue, Direction, FirewallCounters, InterfaceName, LearnedEndpoint,
+    CounterValue, Direction, EnforcementStrategy, FirewallCounters, InterfaceName, LearnedEndpoint,
     MAX_INTERFACE_NAME_BYTES, MAX_RULE_NAME_BYTES, Mode, PortRange, Rule, RuleAction, RuleName,
     RuleOrigin, RuleSpec, TransportProtocol, ValidationError,
 };
@@ -41,7 +43,7 @@ pub use nftables::{
 };
 pub use state::{
     ApplicationInterception, ApplicationLearningAdmission, ApplicationLearningAdmissionIndex,
-    CoreError, Event, EventKind, LearnOutcome, MAX_FLOW_GENERATION, MAX_RULES, MAX_STATE_BYTES,
-    Snapshot, State,
+    CoreError, Event, EventKind, LearnOutcome, MAX_AUTOMATIC_LEARNED_RULES, MAX_FLOW_GENERATION,
+    MAX_RULES, MAX_STATE_BYTES, Snapshot, State,
 };
 pub use storage::{AtomicStateStore, StateStore, StorageError};

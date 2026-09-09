@@ -14,12 +14,13 @@ case "$backend" in nftables|iptables) ;; *) exit 2 ;; esac
 mount -o remount,rw /sys/fs/cgroup || {
     echo 'BLOCKED: the private cgroup subtree cannot be made writable' >&2; exit 77;
 }
-attempt=1
-while ! zypper --non-interactive refresh repo-oss; do
-    [ "$attempt" -lt 3 ] || exit 1
-    sleep "$((attempt * 5))"
-    attempt=$((attempt + 1))
-done
+# Tumbleweed repository metadata is updated in place. A pinned container can
+# therefore observe a repomd.xml whose referenced files disappear while the
+# mirror is rotating. Use the shared fail-closed helper: it validates the
+# official origins, upgrades them to HTTPS, forces fresh metadata on retries,
+# and alternates the two official openSUSE endpoints.
+[ -f /opt/zypper-refresh.sh ] && [ ! -L /opt/zypper-refresh.sh ] || exit 1
+sh /opt/zypper-refresh.sh repo-oss
 packages='systemd python3 iptables shadow util-linux procps iputils'
 [ "$backend" != nftables ] || packages="$packages nftables"
 # shellcheck disable=SC2086

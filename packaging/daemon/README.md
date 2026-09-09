@@ -43,6 +43,12 @@ evidence.
 
 ## Runtime objects
 
+Optional administrator configuration `/etc/openshield/learning-limits.json`
+is read-only and requires no new `ReadWritePaths` exception. Packages do not
+install or overwrite it. It is validated after startup quarantine; unsafe or
+invalid configuration prevents policy activation. See the
+[packaging configuration contract](../README.md#local-learning-limit-configuration).
+
 The service creates or verifies:
 
 - `/run/openshield`, pre-created by tmpfiles as `root:root` and `0755`;

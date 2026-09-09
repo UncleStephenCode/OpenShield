@@ -35,6 +35,46 @@
     active and stops startup. A live read-only emergency quarantine is reported
     as `EmergencyBlockAll`, not as a healthy operator-selected `BlockAll`.
 
+## Explicit Fast-strategy exception
+
+Strict is the default. Root can explicitly select Fast in the Enforcing submenu
+after acknowledging a weaker socket-owner discovery guarantee. Fast keeps one
+process-wide cache of at most 256 positive UID/TGID/TID/start-time hints for
+three minutes of inactivity. A successful exhaustive Strict attribution creates
+a hint; a successful Fast capture renews only its freshly revalidated owner.
+Each queued attribution request retains fresh socket resolution (`SOCK_DIAG`
+for TCP/UDP, procfs for ICMP/ICMPv6), fd/UID/start-time/executable checks,
+required argv/cgroup capture, and current rule/action/generation checks. Both
+owner passes are limited to hinted TGIDs. Dead, replaced, expired, or unusable candidates are omitted;
+ordinary misses retain unrelated live hints across the Strict fallback. A
+fallback which actually detects ambiguous ownership clears the reduced scope.
+There is no verdict cache, new queue bypass, or relaxation of kernel rules.
+
+Fast has one additional, explicit policy exception: an automatic learned
+`Accept` ignores its captured argv/cgroup when a later process has the same
+canonical executable path, full executable-file identity, UID, and endpoint.
+An attacker running that exact executable as that UID can therefore share its
+learned endpoints across process instances. Strict avoids this exception.
+Manual rules and all `Drop`/`Reject` rules never use it.
+
+A previously uncached process sharing the same socket through inheritance,
+`fork`, or `SCM_RIGHTS` can remain invisible to Fast, even for the same UID.
+The three-minute inactivity TTL limits hint retention, not a guaranteed detection window;
+a successful Strict lookup of another socket can seed the same process again.
+Thus Fast does not offer Strict's global matching-UID
+ambiguity detection. In the goals above, rejection of ambiguous identity means
+ambiguity actually detected by the selected strategy, not proof that Fast has
+discovered every holder. Strict remains the choice for exhaustive owner search.
+Learning and BlockAll are unchanged and do not use this exception.
+
+`StatusV4` reports the remembered strategy without process identifiers.
+Strategy changes require root and a revision-checked transaction that advances
+the flow generation. Missing persisted strategy defaults to Strict; selecting
+legacy Enforcing resets it to Strict. Before downgrading to an older daemon,
+root must persist Strict so that the new Fast-only state field is omitted.
+Fast neither establishes actual-sender identity nor promises measured
+CPU/latency gains.
+
 ## Attacker model
 
 The design assumes an attacker may:
@@ -130,7 +170,7 @@ are broader than firewall administration alone.
   Another bounded worker persists successful observations. Queue
   1337 permits only a successful matching decision and conservatively drops an
   unresolved deny candidate, except for a kernel-UID mismatch deferred to
-  best-effort observation. Attribution handles parsed TCP, UDP, ICMP echo, and
+  best-effort observation. The Strict path handles parsed TCP, UDP, ICMP echo, and
   ICMPv6 echo traffic in batches of no more than 32 ready items and never
   waits to fill a batch. Every packet independently maps its kernel UID and
   network tuple to a socket inode through `SOCK_DIAG`. One bounded external
@@ -144,7 +184,7 @@ are broader than firewall administration alone.
   same inode, socket UID, and capture requirements. Requests sharing a socket
   must agree on PID, process start time, executable path and complete file
   version, and filesystem UID. The typed timeout marker is preserved for
-  NFQUEUE accounting. There is no cross-batch process-identity or
+  NFQUEUE accounting. In Strict there is no cross-batch process-identity or
   authorization-result cache; a later UDP/ICMP batch starts with new per-packet
   `SOCK_DIAG` lookups and fresh owner snapshots. The resolver scans a task's fd table only when
   its filesystem UID equals the kernel socket UID; matching holders are grouped
@@ -237,8 +277,10 @@ are broader than firewall administration alone.
 - Application learning uses a separate bounded 512-item queue and persists no
   more than 256 automatic rules per batch. Automatic insertion stops when
   learned endpoint rules plus templates reach 7,500 globally, or endpoint
-  rules reach 512 per filesystem UID or 256 per pair
-  of filesystem UID and complete executable file version. These are admission
+  rules reach the configured quotas: by default 4,096 per filesystem UID or
+  1,024 per pair of filesystem UID and complete executable file version.
+  Disabled learned rules count, and older file versions still count toward the
+  UID quota. These are admission
   budgets rather than validation invariants for legacy or root-edited state.
   Distinct subordinate UIDs count separately, so one operator-controlled UID
   range can distribute activity until the global budget. The 10,000 total-rule
@@ -265,6 +307,18 @@ are broader than firewall administration alone.
   `Conflict`. Root `BlockAll` instead installs the kernel deny immediately and
   is serialized last. Unsafe storage or base-state outcomes enter fail-closed
   quarantine rather than publishing an uncommitted candidate.
+- Learning quotas can be set only through the fixed optional root-owned
+  `/etc/openshield/learning-limits.json`, with
+  `1 <= per_application <= per_uid <= 7500`. Missing configuration uses
+  defaults 1,024/4,096 respectively. The file and parent directories must be
+  root-owned, safely permissioned, and nonsymlinks. Parsing and metadata
+  validation occur at startup after bootstrap `BlockAll`; invalid or unsafe
+  configuration fails startup. Global count and state-byte limits are unchanged.
+  `StatusV3` exposes bounded scalar quota diagnostics, without selector lists;
+  the TUI warns about incomplete learning, including on a root request for
+  Enforcing. This is an advisory warning, not a new permission or a veto on
+  authorized mode changes. Missed endpoints must be observed again in Learning;
+  no warning is proof of complete attribution or persistence.
 - Rule activation and action are separate. A disabled rule is inert. In either
   normal mode, enabled outbound rules may accept, silently drop, or actively
   reject. `Learning` admits unmatched traffic and creates learned `Accept`
@@ -411,7 +465,7 @@ are broader than firewall administration alone.
   host can still attribute executable path, full file version, filesystem UID, and
   argv after validating bounded v1 memberships, but reports no cgroup identity;
   an explicit cgroup-path rule therefore fails closed.
-- At initial attribution, stable shared, inherited, or `SCM_RIGHTS`-passed
+- At initial Strict attribution, stable shared, inherited, or `SCM_RIGHTS`-passed
   descriptors can make procfs ownership differ from the process that actually
   sent the packet. Multiple matching-UID TGIDs are denied. A task whose
   filesystem UID differs from the kernel socket UID is excluded before its fd
@@ -420,6 +474,10 @@ are broader than firewall administration alone.
   recipient is invisible to this fallback and the original holder can be
   attributed. Kernel-LSM sender attribution is not implemented; procfs ownership
   is not proof of the actual sender.
+- Fast can additionally miss a new matching-UID shared-socket holder outside
+  its cached TGIDs, without a guaranteed discovery deadline. Fresh checks of the known
+  holder do not close this gap; the explicit Fast confirmation accepts it.
+  This is a security tradeoff, not an equivalent replacement for Strict.
 - Process identity is resolved for the first queued packet of an established TCP
   connection rather than every subsequent TCP packet. A later exec,
   filesystem-UID/cgroup change, or descriptor transfer can continue that
@@ -429,7 +487,7 @@ are broader than firewall administration alone.
 - The active mode-specific bounded NFQUEUE consumer performs procfs work that is worst-case
   proportional to process/task enumeration plus the descriptor tables of tasks
   whose filesystem UID matches the socket UID. One directory walk inspects at
-  most 4,096 fd entries per matching-UID task and fails if proof requires a later
+  most 16,384 fd entries per matching-UID task and fails if proof requires a later
   entry. Since v0.1.32, a batch performs two owner snapshots, each admitting at most
   131,072 owner records globally across all of its targets. A single 2-second
   deadline bounds both scans and every intervening lookup and capture for queue
@@ -462,8 +520,9 @@ are broader than firewall administration alone.
   packet and indexes enabled rules by complete executable file version. A lookup
   scans only the policy-ordered bucket for the observed version, rather than all
   application rules. Matching within that bucket remains linear; a root-edited or
-  legacy state can concentrate many rules under one pin despite the 256-rule
-  automatic-insertion budget.
+  legacy state can concentrate many rules under one pin regardless of the
+  configurable per-UID/file-version automatic-insertion budget. That budget
+  defaults to 1,024 and is not an absolute bound on a pin shared across UIDs.
   The Learning admission index prevents already-known, saturated, and paused
   observations from filling the persistence queue, but it runs only after the
   mandatory process attribution. A stream of new eligible candidates can still
@@ -523,11 +582,13 @@ are broader than firewall administration alone.
 - Learning creates application-and-endpoint rules, not trust in remote content.
   A learned server or local executable can later become malicious, so learned
   entries should be reviewed. Any attributable local process can deliberately
-  contact many endpoints and consume its 256-rule application quota or a
-  filesystem UID's 512-rule quota. Distributed activity can still consume the
+  contact many endpoints and consume its configured application or UID quota
+  (by default 1,024 and 4,096 respectively). Distributed activity can still consume the
   7,500-rule learned capacity or 8 MiB state quota during a Learning window.
   The 2,500-slot manual reserve is count-only. These limits preserve bounds but
   can cause learning to pause and do not remove rule-poisoning risk.
+  Increasing these budgets expands the admission window and does not reduce
+  process-attribution CPU cost or latency.
 - Root can still consume the complete 10,000-rule count through privileged
   manual mutations. This is inside the administrative trust boundary but can
   cause an operator-created availability limit.

@@ -22,15 +22,24 @@ use nix::sys::socket::{
     recvfrom, sendto, socket,
 };
 use openshield_core::{
-    ApplicationIdentity, ApplicationPath, CgroupPath, CommandArgument, ExecutableFileId,
-    InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule, RuleAction, RuleSpec,
-    Snapshot, TransportProtocol,
+    ApplicationIdentity, ApplicationPath, CgroupPath, CommandArgument, EnforcementStrategy,
+    ExecutableFileId, InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule,
+    RuleAction, RuleSpec, Snapshot, TransportProtocol,
 };
 
 use crate::application_timing::{TimingScope, TimingStage, record_enumeration};
 
+#[path = "application_fast.rs"]
+mod fast;
+
 const MAX_PROC_ENTRIES: usize = 131_072;
-const MAX_FDS_PER_TASK: usize = 4_096;
+// Contemporary browsers, desktop portals and proxy processes can legitimately
+// keep more than 4,096 descriptors open. The old limit made one such process
+// poison an otherwise complete UID-wide owner snapshot, so every application
+// packet in that batch was denied. Keep a fixed anti-exhaustion bound, but put
+// it above normal desktop workloads; the wall-clock attribution deadline still
+// caps the cost of walking a hostile descriptor table and failures stay closed.
+const MAX_FDS_PER_TASK: usize = 16_384;
 const FD_DIRECTORY_BUFFER_BYTES: usize = 4_096;
 // "socket:[" + a decimal u64 + "]" occupies at most 29 bytes. One reusable
 // larger buffer distinguishes every valid inode link from truncated text.
@@ -237,6 +246,7 @@ pub fn matching_application_rule<'a>(
 /// evaluated in policy order so matching semantics remain unchanged.
 #[derive(Clone, Debug)]
 pub struct ApplicationDecisionPolicy {
+    enforcement_strategy: EnforcementStrategy,
     snapshot: Snapshot,
     rules_by_executable: HashMap<ExecutableFileId, Vec<usize>>,
     network_accept_rules: Vec<usize>,
@@ -268,10 +278,22 @@ impl ApplicationDecisionPolicy {
             }
         }
         Self {
+            enforcement_strategy: EnforcementStrategy::Strict,
             snapshot,
             rules_by_executable,
             network_accept_rules,
         }
+    }
+
+    #[must_use]
+    pub fn with_enforcement_strategy(mut self, strategy: EnforcementStrategy) -> Self {
+        self.enforcement_strategy = strategy;
+        self
+    }
+
+    #[must_use]
+    pub const fn enforcement_strategy(&self) -> EnforcementStrategy {
+        self.enforcement_strategy
     }
 
     #[must_use]
@@ -280,15 +302,29 @@ impl ApplicationDecisionPolicy {
         connection: &OutboundConnection,
         identity: &ApplicationIdentity,
     ) -> Option<&Rule> {
-        let application_match = self
+        let candidates = self
             .rules_by_executable
             .get(&identity.executable_file)
             .into_iter()
             .flatten()
-            .filter_map(|index| self.snapshot.rules.get(*index))
+            .filter_map(|index| self.snapshot.rules.get(*index));
+        let application_match = candidates
+            .clone()
             .filter(|rule| application_rule_matches(rule, connection, identity))
             .min_by_key(|rule| (rule_action_priority(rule.spec.action), rule.id));
-        application_match.or_else(|| self.matching_network_accept(connection))
+        application_match
+            .or_else(|| {
+                (self.enforcement_strategy == EnforcementStrategy::Fast)
+                    .then(|| {
+                        candidates
+                            .filter(|rule| {
+                                fast_learned_accept_rule_matches(rule, connection, identity)
+                            })
+                            .min_by_key(|rule| rule.id)
+                    })
+                    .flatten()
+            })
+            .or_else(|| self.matching_network_accept(connection))
     }
 
     /// Finds only an explicit application-bound deny. Learning uses this
@@ -347,8 +383,14 @@ impl ApplicationDecisionPolicy {
                 continue;
             };
             candidate_found = true;
-            requirements.command_line |= selector.command_line.is_some();
-            requirements.cgroups |= selector.cgroup.is_some();
+            let stable_fast_learning_accept = self.enforcement_strategy
+                == EnforcementStrategy::Fast
+                && rule.spec.origin == openshield_core::RuleOrigin::Learned
+                && rule.spec.action == RuleAction::Accept;
+            if !stable_fast_learning_accept {
+                requirements.command_line |= selector.command_line.is_some();
+                requirements.cgroups |= selector.cgroup.is_some();
+            }
         }
         candidate_found.then_some(requirements)
     }
@@ -435,6 +477,39 @@ fn application_rule_matches(
             .is_some_and(|selector| selector.matches(identity))
 }
 
+/// Fast's OpenSnitch-like fallback is deliberately limited to automatic
+/// learned Accept rules. The current socket still has to resolve to the same
+/// filesystem UID, canonical executable path and immutable executable-file
+/// identity. Volatile argv/cgroup values from one browser or service process
+/// instance do not prevent a later instance of that exact executable from
+/// using the learned endpoint. Manual rules and every Drop/Reject rule retain
+/// the complete selector in both strategies.
+fn fast_learned_accept_rule_matches(
+    rule: &Rule,
+    connection: &OutboundConnection,
+    identity: &ApplicationIdentity,
+) -> bool {
+    if rule.spec.origin != openshield_core::RuleOrigin::Learned
+        || rule.spec.action != RuleAction::Accept
+        || !application_rule_network_and_uid_matches(rule, connection)
+    {
+        return false;
+    }
+    rule.spec.application.as_ref().is_some_and(|selector| {
+        !selector.metadata_redacted
+            && selector
+                .executable
+                .as_ref()
+                .is_some_and(|expected| expected == &identity.executable)
+            && selector
+                .executable_file
+                .is_some_and(|expected| expected == identity.executable_file)
+            && selector
+                .uid
+                .is_some_and(|expected| expected == identity.uid)
+    })
+}
+
 const fn rule_action_priority(action: RuleAction) -> u8 {
     match action {
         RuleAction::Drop => 0,
@@ -485,6 +560,7 @@ fn outbound_network_selectors_match(rule: &Rule, connection: &OutboundConnection
 #[derive(Debug)]
 pub struct ProcfsResolver {
     root: PathBuf,
+    fast_owners: fast::SharedOwnerCache,
     sock_diag: RefCell<Option<SockDiagSocket>>,
     /// Synthetic procfs roots cannot answer netlink queries. Keeping this
     /// switch test-only makes a production TCP/UDP downgrade unrepresentable.
@@ -520,6 +596,7 @@ struct SocketOwnerKey {
 struct OwnerSnapshot {
     unique: BTreeMap<SocketOwnerKey, Vec<OwnerTask>>,
     failures: BTreeMap<SocketOwnerKey, String>,
+    observed_processes: BTreeMap<SocketOwnerKey, BTreeSet<u32>>,
 }
 
 // Borrow only positive descriptor names from this batch's first snapshot.
@@ -589,6 +666,7 @@ struct OwnerTaskGroup {
 #[derive(Debug, Default)]
 struct OwnerScanAccumulator {
     owners: BTreeMap<SocketOwnerKey, BTreeMap<u32, Vec<OwnerTask>>>,
+    observed_processes: BTreeMap<SocketOwnerKey, BTreeSet<u32>>,
     ambiguous_targets: BTreeSet<SocketOwnerKey>,
     owner_records: usize,
 }
@@ -676,6 +754,7 @@ impl ProcfsResolver {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("/proc"),
+            fast_owners: fast::production_owner_cache(),
             sock_diag: RefCell::new(None),
             #[cfg(test)]
             use_procfs_socket_lookup: false,
@@ -688,6 +767,19 @@ impl ProcfsResolver {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            fast_owners: fast::private_owner_cache(),
+            sock_diag: RefCell::new(None),
+            use_procfs_socket_lookup: true,
+            daemon_process_id: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn at_with_fast_owners(root: impl Into<PathBuf>, fast_owners: fast::SharedOwnerCache) -> Self {
+        Self {
+            root: root.into(),
+            fast_owners,
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: true,
             daemon_process_id: None,
@@ -699,6 +791,7 @@ impl ProcfsResolver {
     pub(crate) fn at_with_daemon_process(root: impl Into<PathBuf>, daemon_process_id: u32) -> Self {
         Self {
             root: root.into(),
+            fast_owners: fast::private_owner_cache(),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: true,
             daemon_process_id: Some(daemon_process_id),
@@ -751,10 +844,15 @@ impl ProcfsResolver {
     pub(crate) fn resolve_batch_for_learning(
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        generation: u32,
     ) -> Vec<Result<ApplicationIdentity>> {
-        self.resolve_batch_for_enforcement_until(
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
+            cache.prepare_learning(generation, Instant::now());
+        }
+        self.resolve_batch_strict_until(
             requests,
             Instant::now() + LEARNING_PROC_SCAN_DEADLINE,
+            true,
         )
     }
 
@@ -762,6 +860,18 @@ impl ProcfsResolver {
         &self,
         requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
         deadline: Instant,
+    ) -> Vec<Result<ApplicationIdentity>> {
+        if let Ok(mut cache) = self.fast_owners.try_lock() {
+            cache.clear();
+        }
+        self.resolve_batch_strict_until(requests, deadline, false)
+    }
+
+    fn resolve_batch_strict_until(
+        &self,
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        deadline: Instant,
+        seed_fast_hints: bool,
     ) -> Vec<Result<ApplicationIdentity>> {
         if requests.is_empty() {
             return Vec::new();
@@ -848,6 +958,9 @@ impl ProcfsResolver {
         self.revalidate_batch_owners(&keys, &before, deadline, &mut errors, &mut identities);
 
         let results = batch_resolution_results(errors, identities);
+        if seed_fast_hints && let Ok(mut cache) = self.fast_owners.try_lock() {
+            cache.seed(&before, &keys, &results, Instant::now());
+        }
         batch_timing.finish(results.iter().filter(|result| result.is_err()).count());
         results
     }
@@ -1389,6 +1502,7 @@ impl ProcfsResolver {
             &daemon_owned,
             &accumulated.ambiguous_targets,
             accumulated.owners,
+            accumulated.observed_processes,
         )
     }
 
@@ -1414,8 +1528,12 @@ impl ProcfsResolver {
         daemon_owned: &BTreeSet<SocketOwnerKey>,
         ambiguous_targets: &BTreeSet<SocketOwnerKey>,
         mut owners: BTreeMap<SocketOwnerKey, BTreeMap<u32, Vec<OwnerTask>>>,
+        observed_processes: BTreeMap<SocketOwnerKey, BTreeSet<u32>>,
     ) -> Result<OwnerSnapshot> {
-        let mut snapshot = OwnerSnapshot::default();
+        let mut snapshot = OwnerSnapshot {
+            observed_processes,
+            ..OwnerSnapshot::default()
+        };
         for target in targets {
             if daemon_owned.contains(target) {
                 snapshot.failures.insert(
@@ -1871,6 +1989,10 @@ impl OwnerScanAccumulator {
         owner: OwnerTask,
         maximum_records: usize,
     ) -> Result<()> {
+        self.observed_processes
+            .entry(key)
+            .or_default()
+            .insert(owner.process_id);
         if self.ambiguous_targets.contains(&key) {
             return Ok(());
         }
@@ -3384,7 +3506,7 @@ mod tests {
         Ok(())
     }
 
-    fn create_task_fixture(
+    pub(super) fn create_task_fixture(
         root: &Path,
         process_id: u32,
         task_id: u32,
@@ -3416,7 +3538,7 @@ mod tests {
         Ok(process)
     }
 
-    fn complete_identity_fixture(task: &Path, pid: u32) -> Result<(), Box<dyn Error>> {
+    pub(super) fn complete_identity_fixture(task: &Path, pid: u32) -> Result<(), Box<dyn Error>> {
         let executable = task
             .parent()
             .and_then(Path::parent)
@@ -3435,7 +3557,7 @@ mod tests {
         Ok(())
     }
 
-    fn loopback_connection(
+    pub(super) fn loopback_connection(
         protocol: TransportProtocol,
         source_address: IpAddr,
         source_port: u16,
@@ -3454,7 +3576,7 @@ mod tests {
         })
     }
 
-    fn write_udp_socket_table(
+    pub(super) fn write_udp_socket_table(
         root: &Path,
         sockets: &[(u16, u16, u32, u64)],
     ) -> Result<(), Box<dyn Error>> {
@@ -4242,6 +4364,7 @@ mod tests {
         )?;
         let resolver = ProcfsResolver {
             root: PathBuf::from("/proc"),
+            fast_owners: fast::private_owner_cache(),
             sock_diag: RefCell::new(None),
             use_procfs_socket_lookup: false,
             daemon_process_id: None,
@@ -4494,6 +4617,123 @@ mod tests {
             policy
                 .enforcement_capture_requirements(&wrong_uid)
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fast_relaxes_only_volatile_fields_of_learned_accept_rules() -> Result<(), Box<dyn Error>> {
+        let interface = InterfaceName::new("eth0")?;
+        let executable = ApplicationPath::new("/usr/bin/browser")?;
+        let executable_file = ExecutableFileId {
+            device: 8,
+            inode: 19,
+            size: 20,
+            ctime_seconds: 21,
+            ctime_nanoseconds: 22,
+        };
+        let learned_arguments = CommandLineSelector::new(
+            CommandLineMatch::Exact,
+            vec![CommandArgument::new("browser --content-pid=1")?],
+        )?;
+        let mut learned = RuleSpec::new(
+            RuleName::new("learned browser endpoint")?,
+            Direction::Outbound,
+            TransportProtocol::Udp,
+            Some("203.0.113.9/32".parse()?),
+            Some(PortRange::single(443)?),
+            Some(interface.clone()),
+            RuleOrigin::Learned,
+            true,
+        )?;
+        learned.application = Some(ApplicationSelector::new(
+            Some(executable.clone()),
+            Some(executable_file),
+            Some(learned_arguments),
+            Some(1_000),
+            Some(CgroupPath::new("/user.slice/browser-old.scope")?),
+        )?);
+        let learned_spec = learned.clone();
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        state.create_rule(learned)?;
+        let connection = OutboundConnection {
+            source_address: "192.0.2.1".parse()?,
+            source_port: Some(50_000),
+            destination_address: "203.0.113.9".parse()?,
+            destination_port: Some(443),
+            protocol: TransportProtocol::Udp,
+            output_interface: interface,
+            socket_uid: 1_000,
+        };
+        let replacement = ApplicationIdentity {
+            pid: 22,
+            process_start_time_ticks: 23,
+            executable: executable.clone(),
+            executable_file,
+            command_line: vec![CommandArgument::new("browser --content-pid=2")?],
+            uid: 1_000,
+            cgroups: vec![CgroupPath::new("/user.slice/browser-new.scope")?],
+        };
+
+        let strict = ApplicationDecisionPolicy::new(state.snapshot());
+        assert!(strict.matching_rule(&connection, &replacement).is_none());
+        assert_eq!(
+            strict.enforcement_capture_requirements(&connection),
+            Some(IdentityCaptureRequirements::full())
+        );
+        let fast = strict
+            .clone()
+            .with_enforcement_strategy(EnforcementStrategy::Fast);
+        assert_eq!(
+            fast.matching_rule(&connection, &replacement)
+                .map(|rule| rule.spec.action),
+            Some(RuleAction::Accept)
+        );
+        assert_eq!(
+            fast.enforcement_capture_requirements(&connection),
+            Some(IdentityCaptureRequirements::minimal())
+        );
+
+        let mut replaced_binary = replacement.clone();
+        replaced_binary.executable_file.inode += 1;
+        assert!(fast.matching_rule(&connection, &replaced_binary).is_none());
+        let mut other_path = replacement.clone();
+        other_path.executable = ApplicationPath::new("/usr/bin/not-browser")?;
+        assert!(fast.matching_rule(&connection, &other_path).is_none());
+        let mut other_uid = replacement.clone();
+        other_uid.uid += 1;
+        assert!(fast.matching_rule(&connection, &other_uid).is_none());
+
+        let mut manual_state = State::new();
+        manual_state.set_mode(Mode::Enforcing)?;
+        let mut manual = learned_spec.clone();
+        manual.origin = RuleOrigin::Manual;
+        manual_state.create_rule(manual)?;
+        let manual_fast = ApplicationDecisionPolicy::new(manual_state.snapshot())
+            .with_enforcement_strategy(EnforcementStrategy::Fast);
+        assert!(
+            manual_fast
+                .matching_rule(&connection, &replacement)
+                .is_none()
+        );
+        assert_eq!(
+            manual_fast.enforcement_capture_requirements(&connection),
+            Some(IdentityCaptureRequirements::full())
+        );
+
+        let mut drop_state = State::new();
+        drop_state.set_mode(Mode::Enforcing)?;
+        let mut drop_rule = learned_spec;
+        drop_rule.action = RuleAction::Drop;
+        drop_state.create_rule(drop_rule)?;
+        let drop_fast = ApplicationDecisionPolicy::new(drop_state.snapshot())
+            .with_enforcement_strategy(EnforcementStrategy::Fast);
+        assert!(drop_fast.matching_rule(&connection, &replacement).is_none());
+        assert_eq!(
+            drop_fast.enforcement_capture_requirements(&connection),
+            Some(IdentityCaptureRequirements::full())
         );
         Ok(())
     }
@@ -6530,7 +6770,7 @@ mod tests {
         let requests = [(&connection, IdentityCaptureRequirements::full()); 2];
         let resolver = ProcfsResolver::at(directory.path());
         let initial = resolver
-            .resolve_batch_for_learning(&requests)
+            .resolve_batch_for_learning(&requests, 1)
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         assert!(initial.iter().all(|identity| identity.pid == 100));
@@ -6539,7 +6779,7 @@ mod tests {
         symlink("socket:[77]", second_owner.join("fd/9"))?;
         assert!(
             resolver
-                .resolve_batch_for_learning(&requests)
+                .resolve_batch_for_learning(&requests, 1)
                 .into_iter()
                 .all(|result| result
                     .err()
@@ -6548,7 +6788,7 @@ mod tests {
         let oversized = vec![requests[0]; MAX_ATTRIBUTION_BATCH_SIZE + 1];
         assert!(
             resolver
-                .resolve_batch_for_learning(&oversized)
+                .resolve_batch_for_learning(&oversized, 1)
                 .into_iter()
                 .all(|result| result
                     .err()

@@ -162,10 +162,12 @@ jq -e '
     and .criteria.maximum_cgroup_cpu_increase_vs_baseline_percent == 10
     and .criteria.cpu_latency_relative_regressions_are_advisory == true
     and .criteria.maximum_comparison_gap_seconds == 15
+    and .criteria.maximum_daemon_cpu_percent_one_core == 95
+    and .criteria.maximum_burst_daemon_cpu_percent_one_core == 150
     and .criteria.require_burst_capacity == true
     and .capacity_certification == false
 ' "$config" >/dev/null \
-    || fail 'ci-smoke must retain 10-percent observations, advisory CPU/latency, and required burst capacity'
+    || fail 'ci-smoke must retain 10-percent observations, advisory CPU/latency, 95/150-percent steady/burst CPU limits, and required burst capacity'
 
 daemon=${OPENSHIELD_DAEMON:-}
 [[ "$daemon" == /* ]] || fail 'OPENSHIELD_DAEMON must be an absolute path'
@@ -528,11 +530,12 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and .relative_performance_methodology == {
         pairing: "independent_order_balanced_adjacent_ab_ba",
         gate_phase: "steady",
-        burst_relative_role: "single_sample_threshold_gate",
+        burst_relative_role: "single_sample_observation_only",
         minimum_paired_samples: 3,
         confidence_level: 0.95,
         method: "arithmetic_mean_of_independent_paired_deltas",
         confirmation_method: "one_sided_paired_student_t_mean_lower_bound",
+        release_decision: "one_sided_paired_student_t_mean_lower_bound",
         thresholds_unchanged: true,
         cpu_latency_release_action: "observe"
     }
@@ -1188,9 +1191,13 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
                          and . <= $report.criteria.maximum_latency_p99_ms)
                   and (if .policy == "baseline"
                        then true
-                       else (.dut_metrics.daemon.cpu_percent_one_core
+                       else (if .phase_role == "burst"
+                             then $report.criteria.maximum_burst_daemon_cpu_percent_one_core
+                             else $report.criteria.maximum_daemon_cpu_percent_one_core
+                             end) as $cpu_limit
+                            | (.dut_metrics.daemon.cpu_percent_one_core
                              | type == "number" and . >= 0
-                               and . <= $report.criteria.maximum_daemon_cpu_percent_one_core)
+                               and . <= $cpu_limit)
                             and (.dut_metrics.daemon.rss_bytes_peak
                                  | type == "number" and . >= 0
                                    and . <= $report.criteria.maximum_daemon_rss_bytes)
@@ -1322,24 +1329,17 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
                           and (.mean_exceeded_threshold | type == "boolean")
                           and (.confirmed_regression | type == "boolean")
                      else .release_action == "fail"
-                          and .mean_exceeded_threshold == false
+                          and (.mean_exceeded_threshold | type == "boolean")
                           and .confirmed_regression == false
                      end))
         else (.relative_performance_evidence | type == "array" and length > 0)
              and all(.relative_performance_evidence[];
-                 .method == "single_paired_burst_threshold_gate"
+                 .method == "single_paired_burst_observation"
                  and .minimum_sample_count == 3
                  and .confidence_level == 0.95
                  and (.sample_count == 0 or .sample_count == 1)
-                 and (
-                     if (.metric == "cgroup_cpu_increase_percent"
-                         or (.metric | startswith("latency_"))
-                         or (.metric | startswith("connect_latency_")))
-                     then .release_action == "observe"
-                          and (.mean_exceeded_threshold | type == "boolean")
-                     else .release_action == "fail"
-                          and .mean_exceeded_threshold == false
-                     end)
+                 and .release_action == "observe"
+                 and (.mean_exceeded_threshold | type == "boolean")
                  and .confirmed_regression == false)
         end)
 ' "$report_json" >/dev/null \

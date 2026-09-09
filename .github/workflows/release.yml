@@ -286,6 +286,7 @@ jobs:
                 tests/perf/test_metrics.py \
                 tests/perf/workloads/test_workloads.py \
                 tests/e2e/test_continuous_attribution.py \
+                tests/e2e/test_enforcement_strategy.py \
                 tests/e2e/test_tcp_session.py \
                 tests/e2e/test_learning_sockets.py \
                 tests/e2e/test_ipc_client.py \
@@ -674,6 +675,12 @@ jobs:
           name: ${{ matrix.package_artifact_name }}
           path: ${{ runner.temp }}/openshield-e2e-package-${{ matrix.evidence_id }}
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ matrix.family == 'tumbleweed' && matrix.platform == 'linux/amd64' }}
+        with:
+          name: binary-tumbleweed-amd64
+          path: ${{ runner.temp }}/openshield-strategy-input-${{ matrix.evidence_id }}
+
       - name: Run isolated firewall E2E
         id: firewall_e2e
         shell: bash
@@ -701,6 +708,55 @@ jobs:
             fi
           fi
           exit "$e2e_status"
+
+      - name: Prepare exact daemon for the Fast enforcement regression
+        if: ${{ matrix.family == 'tumbleweed' && matrix.platform == 'linux/amd64' }}
+        shell: bash
+        env:
+          INPUT_DIRECTORY: ${{ runner.temp }}/openshield-strategy-input-${{ matrix.evidence_id }}
+          PREPARED_DIRECTORY: ${{ runner.temp }}/openshield-strategy-binary-${{ matrix.evidence_id }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' daemon_files < <(
+            find "$INPUT_DIRECTORY" -mindepth 1 -maxdepth 1 \
+              -type f -name openshield-daemon -print0
+          )
+          [[ "${#daemon_files[@]}" -eq 1 && ! -L "${daemon_files[0]}" ]] || {
+            echo '::error::The Tumbleweed x86_64 artifact does not contain one safe daemon'
+            exit 1
+          }
+          install -d -m 0700 "$PREPARED_DIRECTORY"
+          install -m 0755 "${daemon_files[0]}" \
+            "$PREPARED_DIRECTORY/openshield-daemon"
+          actual_version=$("$PREPARED_DIRECTORY/openshield-daemon" --version)
+          [[ "$actual_version" == "openshield-daemon $VERSION" ]] || {
+            echo "::error::Unexpected enforcement-regression daemon version: $actual_version"
+            exit 1
+          }
+          sha256sum "$PREPARED_DIRECTORY/openshield-daemon"
+
+      - name: Run Learning to Fast Enforcing process-churn regression
+        id: enforcement_strategy_e2e
+        if: ${{ matrix.family == 'tumbleweed' && matrix.platform == 'linux/amd64' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          BACKEND: ${{ matrix.backend }}
+          DAEMON: ${{ runner.temp }}/openshield-strategy-binary-${{ matrix.evidence_id }}/openshield-daemon
+          OPENSHIELD_E2E_CLIENT_IMAGE: ${{ matrix.image }}
+          OPENSHIELD_E2E_ISOLATED_VM: "1"
+          OPENSHIELD_E2E_PEER_IMAGE: ${{ env.E2E_SERVER_IMAGE }}
+        run: sh tests/e2e/enforcement-strategy.sh "$BACKEND" "$DAEMON"
+
+      - name: Preserve Fast enforcement regression evidence
+        if: ${{ always() && steps.enforcement_strategy_e2e.outcome != 'skipped' && steps.enforcement_strategy_e2e.outcome != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: enforcement-strategy-${{ matrix.evidence_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/openshield-enforcement-strategy-evidence.*/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Run packaged systemd sandbox regression
         id: systemd_sandbox

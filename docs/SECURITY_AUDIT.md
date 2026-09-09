@@ -152,6 +152,54 @@ The normative boundary is defined by the
   Verdict delivery is nonblocking, and a terminal send error requests emergency
   `BlockAll` instead of indefinitely retaining the policy lock.
 
+### Explicit Strict/Fast enforcement strategy
+
+Strict remains the default. Root may choose Fast through `m` → `3. Enforcing`
+→ `3.1 Fast` / `3.2 Strict`; Fast has an explicit risk confirmation, not an
+`S` shortcut. The implementation retains one process-wide cache of up to 256
+positive owner UID/TGID/TID/start-time hints with a three-minute inactivity
+lifetime. The exhaustive, race-checked path creates each hint; a Fast hit renews
+only an owner freshly checked on both sides of the current capture. Successful Learning attribution warms this cache and a
+direct Learning-to-Fast generation transition preserves it. Fast's exhaustive
+fallback can also seed it; Strict Enforcing and unrelated generation changes
+clear it.
+Socket resolution for each queued attribution request
+(`SOCK_DIAG` for TCP/UDP, procfs for ICMP/ICMPv6),
+fd/UID/process-start/executable-version checks and required
+argv/cgroup capture stay fresh. Both owner passes search only hinted TGIDs.
+Dead, replaced, expired, or unusable candidates are omitted, and ordinary misses
+retain unrelated live hints across the Strict fallback. A fallback which actually
+detects ambiguous ownership clears the reduced scope. Independently successful exhaustive results may reseed an owner, but
+not when a failed target observed the same TGID.
+Rule matching, actions, revocation, and current generation remain mandatory.
+There is no cached authorization verdict or change to NFQUEUE bypass flags,
+backend rules, or conntrack acceleration.
+
+Fast deliberately treats argv/cgroup captured on an automatic learned
+`Accept` as volatile process-instance metadata. Such an allow still requires
+the exact endpoint, canonical executable path, complete executable-file
+identity, and UID. Strict, manual rules, and all `Drop`/`Reject` selectors keep
+full-field matching. Unit and real-socket E2E regressions verify both the
+relaxed learned allow and the non-relaxation of explicit denies and revocation.
+
+Fast deliberately weakens exhaustive-owner guarantees. A new same-UID holder
+of a shared, inherited, or `SCM_RIGHTS`-transferred socket outside the hints
+can be missed; checking the known process again does not detect every competing
+holder. Hint TTL is not a discovery deadline: a Strict lookup of another socket
+can seed that process again. It must not be described as security-equivalent to
+Strict. The local OpenSnitch `daemon/procmon/find.go` and `cache.go` at
+revision `a1353848ba1b660320e90cefea782c3fba272c00` informed the search/cache
+idea, not an identical implementation. Performance gains require separate
+measurements and are not asserted by this change.
+
+Learning and BlockAll do not use Fast, even when it is remembered. The new
+`SetEnforcement` control uses root authorization and expected revision;
+successful strategy selection advances revision and flow generation.
+`StatusV4` adds the remembered strategy without changing older status or
+event shapes. Strict omits the state field, missing state data defaults to
+Strict, and older daemons reject a state that explicitly stores Fast. Root
+must persist Strict with the current daemon before a downgrade.
+
 ### Application identity and learning
 
 - An outbound persisted application selector requires a canonical absolute
@@ -165,7 +213,7 @@ The normative boundary is defined by the
   five version fields to remain stable. It fills an omitted pin and rejects a
   stale supplied pin. Older two-field persisted application identities are
   rejected rather than silently repinned; network-only state is unaffected.
-- Attribution maps the queued packet tuple and kernel UID to one socket inode
+- Strict attribution maps the queued packet tuple and kernel UID to one socket inode
   and one stable process identity. Every attribution attempt that reaches owner
   resolution receives a fresh bounded enumeration of external PID/TID entries;
   no userspace cross-packet identity or authorization-result cache was introduced.
@@ -209,7 +257,7 @@ The normative boundary is defined by the
   entries. Truncated links cannot satisfy the socket-inode parser. Scan-local
   descriptor hints skip a full walk only after every target inode for that UID
   is revalidated; fallback preserves a verified preferred descriptor for sockets
-  with duplicate fds. Both complete owner snapshots, thread/UID checks,
+  with duplicate fds. In Strict, both complete owner snapshots, thread/UID checks,
   executable pins, race revalidation, and all work bounds remain mandatory.
   This adds no PID authorization cache, eBPF tier, kernel module, `CAP_BPF`, or
   MOK/boot configuration requirement. Selector-mismatch diagnostics report
@@ -268,8 +316,9 @@ The normative boundary is defined by the
   specification and pin. A bounded learning queue, batch-size limit, and
   deduplication cap bound the work. Automatic insertion stops when
   exact learned rules plus templates reach 7,500 globally, or exact learned
-  rules reach 512 per filesystem UID or 256 per pair of filesystem UID and
-  complete executable file version. These are
+  rules reach configured quotas: by default 4,096 per filesystem UID or 1,024
+  per pair of filesystem UID and complete executable file version. Disabled
+  learned rules and older executable versions remain charged to their UID. These are
   admission budgets, not validation invariants for legacy or root-edited state;
   distinct subordinate UIDs count separately. The total limit remains 10,000
   rules, normally reserving 2,500 count slots for privileged manual rules; the
@@ -508,17 +557,21 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The CI observation thresholds remain 10%. Under the current v0.2.1
+  The CI observation thresholds remain 10%. Under the current v0.2.8
   field-evaluation policy, the authenticated criterion
   `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
-  means to `observe`; throughput and PPS means retain the blocking `fail`
-  action. The production-like profile sets the criterion to `false` and keeps
-  all relative means blocking. A one-sided 95% Student-t lower confidence bound
-  records stronger confirmation without changing that action. A single
-  burst has no confidence claim, but throughput/PPS threshold crossings block
-  directly and CPU/latency follows the profile action; absolute CPU/RSS and p99
+  means to `observe`; throughput and PPS retain the blocking `fail` action when
+  a one-sided 95% Student-t lower confidence bound confirms the regression.
+  The production-like profile sets the criterion to `false` and applies that
+  confirmation decision to every relative metric. Mean-only crossings remain
+  authenticated observations. A single burst has no repeated-sample confidence
+  claim, so its relative crossings are also observations; absolute CPU/RSS and p99
   latency, burst validity, configured
-  capacity bounds, and safety remain mandatory. Loss, retransmits, NIC or
+  capacity bounds, and safety remain mandatory. The CI daemon CPU ceiling is
+  95% of one core outside bursts and 150% during bursts; the production-like
+  profile uses 90% for both. Both phase-specific ceilings are checked against
+  primary measurements by the independent validator. RSS, latency,
+  throughput/PPS, and safety limits are unchanged. Loss, retransmits, NIC or
   NFQUEUE drops/errors, and fail-open behavior are immediate failures rather
   than statistically aggregated relative decisions. The CI smoke has three short steady repetitions
   and is path/safety evidence, not a maximum-capacity result; the production
@@ -603,6 +656,16 @@ Commands and exact interpretation are documented in
   privileged mutation or daemon restart, while the active Learning traffic
   policy remains. The 2,500-slot manual count reserve does not reserve bytes.
   Learned rules require review before Enforcing.
+  Since v0.2.5, root can configure the per-UID and per-UID/file-version quotas
+  in optional `/etc/openshield/learning-limits.json`, within
+  `1 <= per_application <= per_uid <= 7500`. The fixed path and its parents
+  are checked for safe root ownership, permissions, and absence of symlinks
+  after bootstrap `BlockAll`; invalid content or metadata fails startup.
+  Packages do not overwrite this local configuration. `StatusV3` and TUI
+  warnings make quota exhaustion visible without granting traffic or vetoing
+  root's Enforcing request. Existing rules survive upgrades; observations
+  previously missed at a quota must be repeated in Learning. Larger quotas do
+  not remove the resource-exhaustion or incomplete-attribution risks.
 - An authorized root operator can still fill the 10,000-rule total with manual
   mutations. Root is inside the administrative trust boundary, but this remains
   an operational availability limit.
@@ -612,7 +675,7 @@ Commands and exact interpretation are documented in
   `Learning`, the same pressure can lose observations and therefore leave the
   later `Enforcing` rule set incomplete, but unmatched traffic continues under
   the declared default allow. In particular, the
-  one bounded directory walk inspects at most 4,096 fd entries for a task whose
+  one bounded directory walk inspects at most 16,384 fd entries for a task whose
   filesystem UID matches the socket UID and denies attribution if proof would
   require a later entry; global enumeration admits at most 131,072 proc/task
   entries.
@@ -628,8 +691,9 @@ Commands and exact interpretation are documented in
   not the worst-case scan size.
   Intra-batch metadata grouping is keyed by TGID/TID, task path, socket UID, and
   capture requirements. Per-socket FD checks, mandatory-identity consensus,
-  and unchanged ownership remain required; nothing is
-  cached across batches. These optimizations do not alter worst-case complexity. A
+  and unchanged ownership remain required; in Strict, nothing is
+  cached across batches. Fast's separate bounded owner hints and their weaker
+  discovery guarantee are described above. These optimizations do not alter worst-case complexity. A
   sustained packet stream or hostile procfs cardinality can still saturate the
   active consumer and deny legitimate application-bound traffic in `Enforcing`.
   The
@@ -637,7 +701,9 @@ Commands and exact interpretation are documented in
   and indexes enabled rules by complete executable file version. A lookup scans
   only the policy-ordered bucket for the observed version. Matching within that
   bucket remains linear, and a legacy or root-edited state can concentrate many
-  rules under one pin despite the 256-rule automatic-insertion budget.
+  rules under one pin regardless of the configurable per-UID/file-version
+  automatic-insertion budget (1,024 by default), which is not a bound on a pin
+  shared across UIDs.
   The Learning admission index prevents already-known, saturated, or paused
   observations from filling the persistence queue, but classification follows
   procfs attribution attempt. New eligible candidates can still fill the
@@ -672,7 +738,7 @@ Commands and exact interpretation are documented in
   code attestation.
 - argv and cgroup are mutable metadata. On cgroup v1, application attribution
   remains available, but exact cgroup-path selectors cannot match.
-- Stable shared, inherited, or `SCM_RIGHTS`-passed descriptors are denied when
+- In Strict, stable shared, inherited, or `SCM_RIGHTS`-passed descriptors are denied when
   they create ambiguity among matching-UID TGIDs, but procfs fallback is not
   proof of which process performed the actual send. A cross-UID recipient is
   skipped before fd inspection; without an original matching-UID holder the
@@ -680,6 +746,10 @@ Commands and exact interpretation are documented in
   invisible and the original holder can be attributed. After an established TCP flow is authorized,
   identity is not recaptured for every packet; a later exec or fd transfer can
   retain the connection until reconnection or policy-generation change.
+- Fast additionally permits a gap in matching-UID ambiguity discovery: an
+  uncached new shared-socket holder has no guaranteed discovery deadline.
+  Current rules still apply to the freshly checked known holder,
+  which is not equivalent to establishing the actual sender.
 - `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` materially expand the impact of a
   daemon compromise. The syscall deny list does not prevent ordinary I/O to a
   successfully opened `/proc/pid/mem` or every traversal through procfs magic

@@ -27,11 +27,12 @@ class ZypperRefreshTests(unittest.TestCase):
         self.bin.mkdir()
         self.write_stub("zypper", """#!/bin/sh
 set -eu
+printf '%s\\n' "$*" >> "$STUB_DIRECTORY/zypper.log"
+case " $* " in *' clean '*) exit 0 ;; esac
 count=0
 if [ -f "$STUB_DIRECTORY/count" ]; then read -r count < "$STUB_DIRECTORY/count"; fi
 count=$((count + 1))
 printf '%s\\n' "$count" > "$STUB_DIRECTORY/count"
-printf '%s\\n' "$*" >> "$STUB_DIRECTORY/zypper.log"
 cp "$STUB_REPOSITORY" "$STUB_DIRECTORY/snapshot-$count"
 status=$(sed -n "${count}p" "$STUB_DIRECTORY/statuses")
 [ -n "$status" ] || exit 99
@@ -112,25 +113,34 @@ printf '%s\\n' "$*" >> "$STUB_DIRECTORY/sleep.log"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.repository.read_text(), original.replace("http://", "https://"))
 
+    def test_official_downloadcontent_origin_is_supported(self):
+        original = self.repository_text("https://downloadcontent.opensuse.org")
+        self.repository.write_text(original)
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.repository.read_text(), original)
+
     def test_retries_switch_origins_and_force_fresh_metadata(self):
         result = self.run_helper((4, 4, 0))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.log("sleep"), ["5", "10"])
         self.assertEqual(self.log("zypper"), [
             "--non-interactive refresh openSUSE:repo-oss",
+            "--non-interactive clean --all openSUSE:repo-oss",
             "--non-interactive refresh --force openSUSE:repo-oss",
+            "--non-interactive clean --all openSUSE:repo-oss",
             "--non-interactive refresh --force openSUSE:repo-oss",
         ])
-        for attempt, origin in enumerate(("cdn.opensuse.org", "download.opensuse.org", "cdn.opensuse.org"), 1):
+        for attempt, origin in enumerate(("cdn.opensuse.org", "downloadcontent.opensuse.org", "cdn.opensuse.org"), 1):
             snapshot = (self.directory / ("snapshot-" + str(attempt))).read_text()
             expected = self.original.replace("http://cdn.opensuse.org", "https://" + origin)
             self.assertEqual(snapshot, expected)
 
-    def test_retryable_failure_stops_after_three_attempts(self):
-        result = self.run_helper((4, 4, 4, 0))
+    def test_retryable_failure_stops_after_five_attempts(self):
+        result = self.run_helper((4, 4, 4, 4, 4, 0))
         self.assertEqual(result.returncode, 4, result.stderr)
-        self.assertEqual(len(self.log("zypper")), 3)
-        self.assertEqual(self.log("sleep"), ["5", "10"])
+        self.assertEqual(len(self.log("zypper")), 9)
+        self.assertEqual(self.log("sleep"), ["5", "10", "15", "20"])
 
     def test_nonretryable_signature_failure_is_returned_without_retry(self):
         result = self.run_helper((106, 0), error="Signature verification failed")
@@ -146,7 +156,7 @@ printf '%s\\n' "$*" >> "$STUB_DIRECTORY/sleep.log"
         self.assertEqual(self.log("sleep"), [])
 
     def test_tls_failure_is_not_accepted_or_bypassed(self):
-        result = self.run_helper((4, 4, 4), error="SSL certificate verification failed")
+        result = self.run_helper((4, 4, 4, 4, 4), error="SSL certificate verification failed")
         self.assertEqual(result.returncode, 4, result.stderr)
         self.assertIn("SSL certificate verification failed", result.stderr)
         for command in self.log("zypper"):
@@ -159,6 +169,7 @@ printf '%s\\n' "$*" >> "$STUB_DIRECTORY/sleep.log"
         for url in (
             "http://untrusted.example/repo",
             "http://cdn.opensuse.org.evil/repo",
+            "https://downloadcontent.opensuse.org.evil/repo",
             "ftp://cdn.opensuse.org/repo",
             "https://cdn.opensuse.org/repo?ssl_verify=no",
             "https://cdn.opensuse.org/repo#fragment",

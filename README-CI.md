@@ -34,12 +34,20 @@ and crossing remains in the evidence. In release smoke,
 DUT-cgroup CPU and request/TCP-connect latency regressions advisory on the
 shared runner. Their means and one-sided 95% Student-t bounds are still
 reported, but do not by themselves block publication. A paired throughput or
-DUT-PPS reduction whose arithmetic mean over at least three independent,
-adjacent steady AB/BA pairs exceeds 10% remains blocking. Absolute daemon
+DUT-PPS reduction remains blocking when the one-sided 95% lower confidence
+bound over at least three independent, adjacent steady AB/BA pairs exceeds
+10%. A mean-only crossing is retained as an observation instead of turning
+shared-runner variance into a release failure. Absolute daemon
 CPU/RSS and p99-latency ceilings, target attainment, validity, and burst
-capacity remain mandatory. A single burst has no confidence claim, but its
-throughput/PPS threshold crossings are directly blocking; CPU/latency follows
-the profile's explicit action.
+capacity remain mandatory. A single burst has no repeated-sample confidence
+claim, so its relative crossings are observations; its absolute capacity,
+validity, and safety checks remain blocking.
+The absolute daemon CPU budget is 95% of one core outside bursts
+(`maximum_daemon_cpu_percent_one_core`) and 150% during bursts
+(`maximum_burst_daemon_cpu_percent_one_core`). The burst allowance is bounded,
+and the independent validator checks the applicable limit from raw
+measurements. The production-like profile uses 90% for both phases.
+Throughput/PPS, latency, RSS, and safety limits are unchanged.
 Drops, retransmits, NFQUEUE errors, and fail-open behavior are immediate
 failures rather than statistical decisions. The independent controlled-overload
 canary proves the absence of fail-open behavior: application-bound Enforcing

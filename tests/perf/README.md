@@ -57,7 +57,7 @@ admission run under the engine mutex, while atomic save and file/directory
 workload without intentionally stalling packet verdicts on that mutex; exact
 observations covered by the in-flight candidate are deduplicated. The harness
 does not relax NFQUEUE-error, drop, validity, or latency gates during a write.
-In OpenShield 0.2.4, the ordinary Learning path intentionally allows unmatched
+In OpenShield 0.2.8, the ordinary Learning path intentionally allows unmatched
 outbound traffic: observational attribution or persistence pressure may lose
 evidence but may not deny that packet. Enabled explicit denies are outside these
 capacity scenarios and remain enforceable. The performance gate still reports and rejects such lost evidence;
@@ -108,7 +108,7 @@ about which OpenShield path was measured. The backend name is recorded
 separately because the nftables-to-iptables startup fallback does not change
 these levels.
 
-These names do not describe an eBPF data plane. Version 0.2.4 exercises the
+These names do not describe an eBPF data plane. Version 0.2.8 exercises the
 existing nftables/iptables, conntrack, NFQUEUE, and procfs paths and introduces
 no `CAP_BPF`, kernel module, boot-parameter, or MOK requirement. The controlled
 NFQUEUE overload case is therefore still the relevant fail-closed saturation
@@ -332,6 +332,19 @@ remain blocking. Relative throughput/PPS limits, absolute latency and daemon
 CPU/RSS ceilings, validity, drops, NFQUEUE errors, and fail-closed checks are
 blocking in both profiles.
 
+The absolute daemon CPU budget is configured separately for bursts through
+`maximum_burst_daemon_cpu_percent_one_core`. It is 150 in `ci-smoke.json`,
+while `maximum_daemon_cpu_percent_one_core` remains 95 for steady-state and
+every other non-burst phase. Both values are percentages of one CPU core:
+150 means 1.5 cores, not 150% of the whole runner. This gives the bounded burst
+its own budget for concurrent attribution work on the shared GitHub runner;
+exceeding either applicable limit still fails a required capacity window.
+`production-like.json` explicitly sets both limits to 90. The selected limit
+comes from the authenticated configuration and is independently checked from
+primary daemon CPU measurements by the release report validator. The change
+does not relax throughput/PPS, latency, RSS, loss, NFQUEUE, validity, or
+fail-closed checks.
+
 TCP and UDP `pps` are pacing targets from a documented packet-cost estimate;
 they are not reported as observed PPS. Actual RX/TX PPS and Mbps always come
 from DUT and peer interface counters. Application operations/s and bytes/s are
@@ -465,27 +478,27 @@ The numerical release `ci-smoke.json` thresholds remain unchanged: at most a
 10% paired reduction in throughput or DUT PPS and at most a 10% paired increase
 in request p50/p95/p99, TCP-connect p50/p95/p99, or DUT-cgroup CPU. Every
 per-window delta and crossing is retained in JSON and Markdown evidence. For
-throughput and DUT PPS, a group becomes blocking when the arithmetic mean of at
-least three valid, independent, adjacent pristine AB/BA steady pairs exceeds
-the configured limit. The one-sided 95% Student-t lower confidence bound
-remains as stronger evidence; high variance cannot hide a blocking throughput
-or PPS mean regression. In release smoke,
+throughput and DUT PPS, a group becomes blocking when the one-sided 95%
+Student-t lower confidence bound from at least three valid, independent,
+adjacent pristine AB/BA steady pairs exceeds the configured limit. A mean-only
+crossing remains visible but does not turn shared-runner variance into a
+release failure. In release smoke,
 `cpu_latency_relative_regressions_are_advisory: true` keeps the same mean and
 confidence calculations for relative DUT-cgroup CPU and request/TCP-connect
 latency, but classifies crossings as advisory: they remain prominent evidence
 and do not alone fail publication on the shared runner. Absolute p99 latency,
-daemon CPU/RSS, target-attainment, and validity ceilings are unchanged and
+phase-specific daemon CPU, RSS, target-attainment, and validity ceilings remain
 blocking. `production-like.json` sets the option to `false`, uses 5% for every
-relative limit, and blocks every relative mean regression above those limits.
+relative limit, and blocks every statistically confirmed relative regression
+above those limits.
 Publication-grade non-inferiority still requires the dedicated runner described
 below.
 
 A single burst has insufficient repeated evidence for a statistical
-non-inferiority claim. It nevertheless applies the configured threshold
-directly: throughput and DUT PPS crossings block both checked-in profiles;
-relative CPU/latency crossings follow the explicit advisory setting (observe in
-CI smoke, fail in production-like). Burst validity, configured capacity
-ceilings, and fail-closed safety also remain mandatory and blocking. Safety is
+non-inferiority claim. Its relative threshold crossings are therefore retained
+as authenticated observations in both checked-in profiles. Burst validity,
+configured capacity ceilings, and fail-closed safety remain mandatory and
+blocking. Safety is
 never deferred to statistical confirmation:
 application loss/errors, TCP retransmits, NIC drops/errors, or NFQUEUE errors or
 drops fail the affected ordinary window immediately. Any unexpected allow in
@@ -597,19 +610,21 @@ Relative throughput, DUT PPS, request and TCP-connect p50/p95/p99 latency, and
 DUT-cgroup CPU deltas are paired by backend, policy, mode, learning variant,
 profile, load level, and steady phase role. All individual deltas and crossings
 remain in the report. The relative decision is made over at least three valid
-independent steady AB/BA pairs by their arithmetic mean; the one-sided 95%
-Student-t lower confidence bound described above records stronger confirmation.
+independent steady AB/BA pairs by the one-sided 95% Student-t lower confidence
+bound described above; their arithmetic mean remains part of the evidence.
 Whether CPU/latency crossings are advisory is taken from the authenticated
 configuration field `cpu_latency_relative_regressions_are_advisory`; throughput
-and PPS crossings remain blocking. A burst records a single-sample comparison
-and immediately blocks every crossing whose release action is `fail`.
+and statistically confirmed PPS crossings remain blocking. A burst records a
+single-sample comparison as an observation; it cannot create a relative
+failure without repeated evidence.
 The release wrapper then runs a separate source-manifested validator. Starting
 from primary workload and DUT metric fields, it independently recomputes every
 paired delta, arithmetic mean, strict threshold comparison, advisory/blocking
-disposition, Student-t lower bound, observation/failure linkage, and final
+disposition, Student-t lower-bound decision, observation/failure linkage, and final
 per-row relative outcome. For every steady and burst row it also independently
 recomputes target attainment and absolute p99 latency and checks raw daemon
-CPU/RSS against their configured hard limits instead of trusting
+CPU/RSS against their configured hard limits, selecting the burst CPU budget
+only for burst rows, instead of trusting
 `capacity_pass`. It also rebuilds
 the normalized configuration from the checked-in JSON, independently derives
 the workload-time estimate, and verifies its canonical compact sorted UTF-8

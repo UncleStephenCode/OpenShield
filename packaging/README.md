@@ -67,6 +67,20 @@ versions or perform an in-place downgrade after v0.2.1 has written state.
 Upgrade or rollback from a protected console with kernel `BlockAll` active, a
 reviewed state backup, and a distribution-tested procedure.
 
+## Local learning-limit configuration
+
+The daemon optionally reads `/etc/openshield/learning-limits.json` at startup.
+It is an administrator-managed file, not a package payload: installation and
+upgrades must not create or overwrite it. Without it, v0.2.8 uses
+`{"per_uid":4096,"per_application":1024}`. Root may supply both integer fields
+with `1 <= per_application <= per_uid <= 7500`. Use root-owned nonsymlink
+parent directories with no group/other write permissions and a root-owned
+regular file with mode `0600`. The daemon reads the file after installing
+bootstrap `BlockAll`; malformed or unsafe configuration prevents startup.
+Restart from a protected console after reviewing a configuration change.
+Existing state is preserved, but previously missed endpoints must be observed
+again in Learning. See [the quota documentation](../README.md#learning-quotas-in-v025).
+
 ## Release-package matrix
 
 The authoritative release workflow builds 43 architecture/family binaries and
